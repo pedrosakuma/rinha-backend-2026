@@ -7,8 +7,19 @@ builder.WebHost.ConfigureKestrel(options =>
 {
     options.AddServerHeader = false;
     options.AllowSynchronousIO = false;
-    var port = int.Parse(Environment.GetEnvironmentVariable("PORT") ?? "9999");
-    options.ListenAnyIP(port);
+    var udsPath = Environment.GetEnvironmentVariable("UDS_PATH");
+    if (!string.IsNullOrEmpty(udsPath))
+    {
+        // J11a: listen on a Unix Domain Socket so the LB upstream is local FS, not TCP loopback.
+        // Saves ~30-50us per request (no TCP/IP stack, no port allocation, no Nagle delays).
+        if (File.Exists(udsPath)) File.Delete(udsPath);
+        options.ListenUnixSocket(udsPath);
+    }
+    else
+    {
+        var port = int.Parse(Environment.GetEnvironmentVariable("PORT") ?? "9999");
+        options.ListenAnyIP(port);
+    }
 });
 
 builder.Services.ConfigureHttpJsonOptions(o =>
@@ -105,6 +116,19 @@ app.Lifetime.ApplicationStarted.Register(() =>
              : "scalar (very slow)";
     var ivf = dataset.HasIvf ? $" IVF: {dataset.NumCells} cells." : "";
     Console.WriteLine($"Ready. Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}. SIMD: {simd}.{ivf}");
+    // J11a: chmod the UDS so nginx (different user) can connect.
+    var uds = Environment.GetEnvironmentVariable("UDS_PATH");
+    if (!string.IsNullOrEmpty(uds) && File.Exists(uds))
+    {
+        try
+        {
+            File.SetUnixFileMode(uds,
+                UnixFileMode.UserRead  | UnixFileMode.UserWrite  |
+                UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
+                UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"chmod uds failed: {ex.Message}"); }
+    }
 });
 
 app.Run();
