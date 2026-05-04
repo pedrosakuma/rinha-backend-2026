@@ -26,6 +26,7 @@ RUN dotnet /preprocessor/Rinha.Preprocessor.dll \
         /work/references.json.gz \
         /work/references.bin \
         /work/labels.bin \
+        /work/references_q8.bin \
  && rm /work/references.json.gz
 
 ############################
@@ -44,6 +45,7 @@ ENV DOTNET_EnableDiagnostics=0 \
     PORT=9999 \
     VECTORS_PATH=/data/references.bin \
     LABELS_PATH=/data/labels.bin \
+    VECTORS_Q8_PATH=/data/references_q8.bin \
     MCC_RISK_PATH=/app/resources/mcc_risk.json \
     NORMALIZATION_PATH=/app/resources/normalization.json
 COPY --from=build /publish/api /app/
@@ -51,5 +53,6 @@ COPY resources/mcc_risk.json /app/resources/mcc_risk.json
 COPY resources/normalization.json /app/resources/normalization.json
 COPY --from=dataprep /work/references.bin /data/references.bin
 COPY --from=dataprep /work/labels.bin /data/labels.bin
+COPY --from=dataprep /work/references_q8.bin /data/references_q8.bin
 EXPOSE 9999
 ENTRYPOINT ["dotnet", "/app/Rinha.Api.dll"]

@@ -18,12 +18,13 @@ builder.Services.ConfigureHttpJsonOptions(o =>
 
 var vectorsPath = Environment.GetEnvironmentVariable("VECTORS_PATH") ?? "/data/references.bin";
 var labelsPath = Environment.GetEnvironmentVariable("LABELS_PATH") ?? "/data/labels.bin";
+var vectorsQ8Path = Environment.GetEnvironmentVariable("VECTORS_Q8_PATH"); // optional
 var mccRiskPath = Environment.GetEnvironmentVariable("MCC_RISK_PATH") ?? "/app/resources/mcc_risk.json";
 var normalizationPath = Environment.GetEnvironmentVariable("NORMALIZATION_PATH") ?? "/app/resources/normalization.json";
 
 var normalization = NormalizationConstants.Load(normalizationPath);
 var mccRisk = MccRiskTable.Load(mccRiskPath);
-var dataset = Dataset.Open(vectorsPath, labelsPath);
+var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path);
 var vectorizer = new Vectorizer(normalization, mccRisk);
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);

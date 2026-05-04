@@ -3,19 +3,21 @@ using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Text.Json;
 
-if (args.Length != 3)
+if (args.Length < 3 || args.Length > 4)
 {
-    Console.Error.WriteLine("Usage: Rinha.Preprocessor <references.json.gz> <out-vectors.bin> <out-labels.bin>");
+    Console.Error.WriteLine("Usage: Rinha.Preprocessor <references.json.gz> <out-vectors.bin> <out-labels.bin> [<out-vectors-q8.bin>]");
     return 1;
 }
 
 var inputPath = args[0];
 var vectorsPath = args[1];
 var labelsPath = args[2];
+var vectorsQ8Path = args.Length == 4 ? args[3] : null;
 
 const int Dimensions = 14;
 const int PaddedDimensions = 16; // align to Vector256<float> (8 lanes)
 const int RowBytes = PaddedDimensions * sizeof(float);
+const int Q8RowBytes = PaddedDimensions; // 1 byte per dim, padded to 16
 
 if (!File.Exists(inputPath))
 {
@@ -25,6 +27,8 @@ if (!File.Exists(inputPath))
 
 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(vectorsPath))!);
 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(labelsPath))!);
+if (vectorsQ8Path is not null)
+    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(vectorsQ8Path))!);
 
 var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -34,19 +38,32 @@ await using var bufferedGz = new BufferedStream(gz, 1 << 20);
 
 await using var vectorsOut = new FileStream(vectorsPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
 await using var labelsOut = new FileStream(labelsPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
+FileStream? q8Out = vectorsQ8Path is null
+    ? null
+    : new FileStream(vectorsQ8Path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
 
-long count = StreamConvert(bufferedGz, vectorsOut, labelsOut);
+long count;
+try
+{
+    count = StreamConvert(bufferedGz, vectorsOut, labelsOut, q8Out);
+}
+finally
+{
+    if (q8Out is not null) await q8Out.DisposeAsync();
+}
 
 await vectorsOut.FlushAsync();
 await labelsOut.FlushAsync();
 
 sw.Stop();
 Console.Error.WriteLine($"Done: {count:N0} vectors in {sw.Elapsed}.");
-Console.Error.WriteLine($"Vectors: {vectorsPath} ({new FileInfo(vectorsPath).Length:N0} bytes)");
-Console.Error.WriteLine($"Labels:  {labelsPath} ({new FileInfo(labelsPath).Length:N0} bytes)");
+Console.Error.WriteLine($"Vectors:    {vectorsPath} ({new FileInfo(vectorsPath).Length:N0} bytes)");
+Console.Error.WriteLine($"Labels:     {labelsPath} ({new FileInfo(labelsPath).Length:N0} bytes)");
+if (vectorsQ8Path is not null)
+    Console.Error.WriteLine($"Vectors q8: {vectorsQ8Path} ({new FileInfo(vectorsQ8Path).Length:N0} bytes)");
 return 0;
 
-static long StreamConvert(Stream input, Stream vectorsOut, Stream labelsOut)
+static long StreamConvert(Stream input, Stream vectorsOut, Stream labelsOut, Stream? q8Out)
 {
     const int InitialBufferSize = 1 << 20;
     var buffer = ArrayPool<byte>.Shared.Rent(InitialBufferSize);
@@ -73,6 +90,7 @@ static long StreamConvert(Stream input, Stream vectorsOut, Stream labelsOut)
         byte? currentLabel = null;
         bool haveVector = false;
         var rowBuf = new byte[RowBytes];
+        var q8Buf  = new byte[Q8RowBytes]; // sbyte semantically; written as bytes
 
         while (parserState != -1)
         {
@@ -120,6 +138,20 @@ static long StreamConvert(Stream input, Stream vectorsOut, Stream labelsOut)
                             for (int i = 0; i < Dimensions; i++)
                                 BinaryPrimitives.WriteSingleLittleEndian(rowBuf.AsSpan(i * sizeof(float), sizeof(float)), vec[i]);
                             vectorsOut.Write(rowBuf, 0, RowBytes);
+                            if (q8Out is not null)
+                            {
+                                // Quantize to int8: round(f * 127), clamp to [-128, 127].
+                                // f ∈ [0,1] → [0,127]; sentinel f = -1 → -127 (natural mapping).
+                                Array.Clear(q8Buf, 0, Q8RowBytes);
+                                for (int i = 0; i < Dimensions; i++)
+                                {
+                                    int q = (int)MathF.Round(vec[i] * 127f);
+                                    if (q > 127) q = 127;
+                                    else if (q < -128) q = -128;
+                                    q8Buf[i] = (byte)(sbyte)q;
+                                }
+                                q8Out.Write(q8Buf, 0, Q8RowBytes);
+                            }
                             labelsOut.WriteByte(currentLabel.Value);
                             count++;
                             if (count % 500_000 == 0) Console.Error.WriteLine($"...processed {count:N0}");
