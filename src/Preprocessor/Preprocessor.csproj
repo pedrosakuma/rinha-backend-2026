@@ -10,4 +10,6 @@
     <AssemblyName>Rinha.Preprocessor</AssemblyName>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+  </ItemGroup>
 </Project>
