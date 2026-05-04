@@ -17,6 +17,7 @@ services:
       IVF_NPROBE: "${IVF_NPROBE:-96}"
       IVF_RERANK: "${IVF_RERANK:-64}"
       Q8_RERANK: "${Q8_RERANK:-32}"
+      IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
     networks: [app]
     deploy:
       resources:

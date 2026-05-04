@@ -28,8 +28,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly int _kPrime;
     private readonly int _dimFilter;  // -1 = off; 0..13 = enable single-dim LB pruning
     private readonly int _dimFilter2; // optional 2nd dim added to LB
+    private readonly bool _earlyStop; // class-aware early-stop (J5)
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1)
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -38,6 +39,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
         _kPrime = Math.Clamp(kPrime, K, 1024);
         _dimFilter = dimFilter is >= 0 and < Dataset.Dimensions ? dimFilter : -1;
         _dimFilter2 = dimFilter2 is >= 0 and < Dataset.Dimensions && dimFilter2 != _dimFilter ? dimFilter2 : -1;
+        _earlyStop = earlyStop;
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -108,32 +110,94 @@ public sealed unsafe class IvfScorer : IFraudScorer
         for (int i = 0; i < _kPrime; i++) { candDist[i] = int.MaxValue; candIdx[i] = -1; }
         int q8Worst = int.MaxValue;
 
+        Span<float> bestDist = stackalloc float[K];
+        Span<int>   bestIdx  = stackalloc int[K];
+        for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+        bool earlyStopped = false;
+
         var offsets = _dataset.CellOffsetsPtr;
+        var labels = _dataset.LabelsPtr;
         fixed (sbyte* qPtr = qQ8)
         {
             if (Avx2.IsSupported)
             {
                 if (_dimFilter >= 0)
+                {
                     ScanCellsQ8Avx2DimFilter(qPtr, cells, offsets, candDist, candIdx, ref q8Worst, _dimFilter, _dimFilter2);
+                }
+                else if (_earlyStop)
+                {
+                    // Class-aware early-stop: process cells up to a checkpoint; if top-K
+                    // is class-unanimous AND worst float dist < next-cell centroid dist,
+                    // skip remaining cells (binary "approved" outcome locked).
+                    // Checkpoint at 75%: smaller savings on easy queries, but cheaper
+                    // overhead on the ~3% ambiguous tail (which dominates p99 under
+                    // saturation).
+                    int checkpoint = (_nProbe * 3) / 4;
+                    if (checkpoint >= 1 && _nProbe > checkpoint)
+                    {
+                        ScanCellsQ8Avx2Range(qPtr, cells, 0, checkpoint, offsets, candDist, candIdx, ref q8Worst);
+
+                        // Partial rerank using current candDist/candIdx → bestDist/bestIdx.
+                        RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+                        int frauds = 0, valid = 0;
+                        for (int i = 0; i < K; i++)
+                        {
+                            if (bestIdx[i] < 0) continue;
+                            valid++;
+                            if (labels[bestIdx[i]] != 0) frauds++;
+                        }
+                        bool unanimous = (valid == K) && (frauds == 0 || frauds == K);
+                        bool marginOk = unanimous && bestDist[K - 1] < cellsDist[checkpoint];
+                        if (marginOk)
+                        {
+                            earlyStopped = true;
+                        }
+                        else
+                        {
+                            ScanCellsQ8Avx2Range(qPtr, cells, checkpoint, _nProbe, offsets, candDist, candIdx, ref q8Worst);
+                        }
+                    }
+                    else
+                    {
+                        ScanCellsQ8Avx2(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
+                    }
+                }
                 else
+                {
                     ScanCellsQ8Avx2(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
+                }
             }
             else
                 ScanCellsQ8Scalar(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
         }
 
-        // 5) Float recheck of top-K' → top-K.
-        Span<float> bestDist = stackalloc float[K];
-        Span<int>   bestIdx  = stackalloc int[K];
-        for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
-        float worst = float.PositiveInfinity;
+        // 5) Float recheck of top-K' → top-K (skipped if already done by early-stop).
+        if (!earlyStopped)
+        {
+            for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+            RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+        }
 
+        // 6) Fraud ratio over exact top-K.
+        int totalFrauds = 0;
+        for (int i = 0; i < K; i++)
+            if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) totalFrauds++;
+        return totalFrauds / (float)K;
+    }
+
+    private void RerankFloat(
+        ReadOnlySpan<float> paddedQuery,
+        ReadOnlySpan<int> candDist, ReadOnlySpan<int> candIdx,
+        Span<float> bestDist, Span<int> bestIdx)
+    {
+        float worst = bestDist[K - 1];
         fixed (float* qfPtr = paddedQuery)
         {
             var q0 = Vector256.Load(qfPtr);
             var q1 = Vector256.Load(qfPtr + 8);
             var vectors = _dataset.VectorsPtr;
-            for (int c = 0; c < _kPrime; c++)
+            for (int c = 0; c < candIdx.Length; c++)
             {
                 int idx = candIdx[c];
                 if (idx < 0) break;
@@ -151,17 +215,15 @@ public sealed unsafe class IvfScorer : IFraudScorer
                 }
             }
         }
-
-        // 6) Fraud ratio over exact top-K.
-        var labels = _dataset.LabelsPtr;
-        int frauds = 0;
-        for (int i = 0; i < K; i++)
-            if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) frauds++;
-        return frauds / (float)K;
     }
 
     private void ScanCellsQ8Avx2(
         sbyte* qPtr, ReadOnlySpan<int> cells, int* offsets,
+        Span<int> candDist, Span<int> candIdx, ref int worstRef)
+        => ScanCellsQ8Avx2Range(qPtr, cells, 0, cells.Length, offsets, candDist, candIdx, ref worstRef);
+
+    private void ScanCellsQ8Avx2Range(
+        sbyte* qPtr, ReadOnlySpan<int> cells, int ciStart, int ciEnd, int* offsets,
         Span<int> candDist, Span<int> candIdx, ref int worstRef)
     {
         var qLow = Vector128.Load(qPtr);
@@ -169,7 +231,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
         var sbase = _dataset.Q8VectorsPtr;
         int worst = worstRef;
 
-        for (int ci = 0; ci < cells.Length; ci++)
+        for (int ci = ciStart; ci < ciEnd; ci++)
         {
             int c = cells[ci];
             if (c < 0) break;
