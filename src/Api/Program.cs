@@ -42,7 +42,10 @@ app.MapPost("/fraud-score", (FraudRequest request) =>
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
-    Console.WriteLine($"Ready. Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}.");
+    var simd = System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated ? "AVX2"
+             : System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated ? "SSE-only (slow)"
+             : "scalar (very slow)";
+    Console.WriteLine($"Ready. Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}. SIMD: {simd}.");
 });
 
 app.Run();

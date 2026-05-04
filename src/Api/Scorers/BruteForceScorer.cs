@@ -28,18 +28,32 @@ public sealed unsafe class BruteForceScorer : IFraudScorer
         paddedQuery[14] = 0f;
         paddedQuery[15] = 0f;
 
-        Vector256<float> q0, q1;
-        fixed (float* qPtr = paddedQuery)
-        {
-            q0 = Vector256.Load(qPtr);
-            q1 = Vector256.Load(qPtr + 8);
-        }
-
         Span<float> bestDist = stackalloc float[K];
         Span<int> bestIdx = stackalloc int[K];
         for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
-        float worst = float.PositiveInfinity;
 
+        fixed (float* qPtr = paddedQuery)
+        {
+            if (Vector256.IsHardwareAccelerated)
+                ScanAvx2(qPtr, bestDist, bestIdx);
+            else
+                ScanScalar(qPtr, bestDist, bestIdx);
+        }
+
+        var labels = _dataset.LabelsPtr;
+        int frauds = 0;
+        for (int i = 0; i < K; i++)
+        {
+            if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) frauds++;
+        }
+        return frauds / (float)K;
+    }
+
+    private void ScanAvx2(float* qPtr, Span<float> bestDist, Span<int> bestIdx)
+    {
+        var q0 = Vector256.Load(qPtr);
+        var q1 = Vector256.Load(qPtr + 8);
+        float worst = float.PositiveInfinity;
         var vectors = _dataset.VectorsPtr;
         int count = _dataset.Count;
 
@@ -58,14 +72,31 @@ public sealed unsafe class BruteForceScorer : IFraudScorer
                 worst = bestDist[K - 1];
             }
         }
+    }
 
-        var labels = _dataset.LabelsPtr;
-        int frauds = 0;
-        for (int i = 0; i < K; i++)
+    // Defensive fallback for environments without AVX2 (Vector256 would otherwise
+    // emulate in software, which is dramatically slower than scalar).
+    private void ScanScalar(float* qPtr, Span<float> bestDist, Span<int> bestIdx)
+    {
+        float worst = float.PositiveInfinity;
+        var vectors = _dataset.VectorsPtr;
+        int count = _dataset.Count;
+
+        for (int i = 0; i < count; i++)
         {
-            if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) frauds++;
+            float* row = vectors + (long)i * PaddedDimensions;
+            float dist = 0f;
+            for (int d = 0; d < Dataset.Dimensions; d++)
+            {
+                float diff = row[d] - qPtr[d];
+                dist += diff * diff;
+            }
+            if (dist < worst)
+            {
+                InsertTopK(bestDist, bestIdx, dist, i);
+                worst = bestDist[K - 1];
+            }
         }
-        return frauds / (float)K;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
