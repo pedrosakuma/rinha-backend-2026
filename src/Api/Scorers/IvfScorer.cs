@@ -194,6 +194,15 @@ public sealed unsafe class IvfScorer : IFraudScorer
     }
 
     /// <summary>
+    /// REJECTED experiment (J3b): 2-row unrolled scan tentava processar 2 Q8 rows
+    /// por iter via Vector256.Load(32B) + WidenLower/Upper para ganhar ILP.
+    /// Bench mostrou regressão: p50 +10%, p99 +22%, final -85.
+    /// Hipótese: o per-row branch (worst check) já é o gargalo dominante; dobrar o
+    /// throughput de SIMD não ajuda quando insertion no top-K' precisa serializar.
+    /// Código removido — ver plan.md "J3b" para análise completa.
+    /// </summary>
+
+    /// <summary>
     /// Same as ScanCellsQ8Avx2 but with single-dim early-skip. For each row we first compute
     /// (r[D] - q[D])² as a strict lower bound on full Q8 dist; if it already exceeds the
     /// current top-K' worst, we skip the SIMD multiply entirely. Net win iff prune_rate &gt; ~50%.
