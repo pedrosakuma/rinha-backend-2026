@@ -35,13 +35,62 @@ var app = builder.Build();
 
 app.MapGet("/ready", () => Results.Ok());
 
-app.MapPost("/fraud-score", (FraudRequest request) =>
+var profile = Environment.GetEnvironmentVariable("PROFILE_TIMING") == "1";
+if (profile)
 {
-    Span<float> query = stackalloc float[Dataset.Dimensions];
-    vectorizer.Vectorize(request, query);
-    var score = scorer.Score(query);
-    return Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
-});
+    long n = 0, vSum = 0, sSum = 0, jSum = 0;
+    long vMax = 0, sMax = 0, jMax = 0;
+    var lockObj = new object();
+    const int Window = 5000;
+    app.MapPost("/fraud-score", (FraudRequest request) =>
+    {
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        Span<float> query = stackalloc float[Dataset.Dimensions];
+        vectorizer.Vectorize(request, query);
+        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var score = scorer.Score(query);
+        long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var resp = Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
+        long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        long v = t1 - t0, s = t2 - t1, j = t3 - t2;
+        bool flush = false;
+        lock (lockObj)
+        {
+            n++;
+            vSum += v; sSum += s; jSum += j;
+            if (v > vMax) vMax = v;
+            if (s > sMax) sMax = s;
+            if (j > jMax) jMax = j;
+            if (n >= Window) flush = true;
+        }
+        if (flush)
+        {
+            long N, vS, sS, jS, vM, sM, jM;
+            lock (lockObj)
+            {
+                N = n; vS = vSum; sS = sSum; jS = jSum; vM = vMax; sM = sMax; jM = jMax;
+                n = 0; vSum = sSum = jSum = 0; vMax = sMax = jMax = 0;
+            }
+            double f = 1e6 / System.Diagnostics.Stopwatch.Frequency;
+            Console.WriteLine(
+                $"[timing N={N}] vec={vS*f/N:F1}us(max {vM*f:F1}) " +
+                $"score={sS*f/N:F1}us(max {sM*f:F1}) " +
+                $"json={jS*f/N:F1}us(max {jM*f:F1})");
+        }
+        return resp;
+    });
+}
+else
+{
+    app.MapPost("/fraud-score", (FraudRequest request) =>
+    {
+        Span<float> query = stackalloc float[Dataset.Dimensions];
+        vectorizer.Vectorize(request, query);
+        var score = scorer.Score(query);
+        return Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
+    });
+}
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
