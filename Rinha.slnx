@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Api/Api.csproj" />
+    <Project Path="src/Bench/Bench.csproj" />
+    <Project Path="src/Preprocessor/Preprocessor.csproj" />
+  </Folder>
+</Solution>

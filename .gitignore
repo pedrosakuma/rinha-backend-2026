@@ -1,0 +1,11 @@
+bin/
+obj/
+out/
+data/*.bin
+resources/references.json.gz
+bench/k6/test-data.json
+bench/results/
+*.user
+.vs/
+.vscode/
+.idea/
