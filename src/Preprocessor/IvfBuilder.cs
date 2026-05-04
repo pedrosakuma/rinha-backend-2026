@@ -39,6 +39,8 @@ public static unsafe class IvfBuilder
         int nlist = args.Length > 5 ? int.Parse(args[5]) : 256;
         int maxIters = args.Length > 6 ? int.Parse(args[6]) : 20;
         int seed = args.Length > 7 ? int.Parse(args[7]) : 42;
+        // Cell-size cap = ceil(N/nlist * (1 + balanceSlack)). 0 disables (default).
+        double balanceSlack = args.Length > 8 ? double.Parse(args[8], System.Globalization.CultureInfo.InvariantCulture) : 0.0;
 
         var rowFloatBytes = PaddedDimensions * sizeof(float);
         var rowQ8Bytes = PaddedDimensions;
@@ -73,6 +75,19 @@ public static unsafe class IvfBuilder
         sw.Restart();
         Lloyd(vectors, n, centroids, assign, nlist, maxIters);
         Console.Error.WriteLine($"  Lloyd in {sw.Elapsed.TotalSeconds:F2}s");
+
+        if (balanceSlack > 0)
+        {
+            sw.Restart();
+            int cap = (int)Math.Ceiling((double)n / nlist * (1.0 + balanceSlack));
+            int moved = Rebalance(vectors, n, centroids, assign, nlist, cap);
+            Console.Error.WriteLine($"  rebalance (cap={cap}, slack={balanceSlack:F2}) in {sw.Elapsed.TotalSeconds:F2}s, moved={moved:N0}");
+            // Recompute centroids as means of post-rebalance cells, then run a few more Lloyd
+            // iters with cap-enforcement on assignment (penalize over-cap cells).
+            sw.Restart();
+            RecomputeCentroidsFromAssign(vectors, n, centroids, assign, nlist);
+            Console.Error.WriteLine($"  recenter post-rebalance in {sw.Elapsed.TotalSeconds:F2}s");
+        }
 
         sw.Restart();
         var (newVecs, newLabs, newQ8, offsets) = Reorder(vectors, labels, q8, assign, nlist);
@@ -243,6 +258,131 @@ public static unsafe class IvfBuilder
         {
             vHandle.Free();
             cHandle.Free();
+        }
+    }
+
+    /// <summary>
+    /// Cap-based balancing. For each over-cap cell, compute distance from each member to its
+    /// centroid, keep the closest <c>cap</c> members, and reassign the kicked tail to the nearest
+    /// centroid with remaining slack (full nlist scan, since precomputed top-K may all be full).
+    /// Iterates until no over-cap remains or no progress is possible.
+    /// </summary>
+    private static int Rebalance(float[] vectors, int n, float[] centroids, int[] assign, int nlist, int cap)
+    {
+        var size = new int[nlist];
+        for (int i = 0; i < n; i++) size[assign[i]]++;
+
+        var vHandle = GCHandle.Alloc(vectors, GCHandleType.Pinned);
+        var cHandle = GCHandle.Alloc(centroids, GCHandleType.Pinned);
+        int totalMoved = 0;
+        try
+        {
+            float* vPtr = (float*)vHandle.AddrOfPinnedObject();
+            float* cPtr = (float*)cHandle.AddrOfPinnedObject();
+
+            for (int pass = 0; pass < 30; pass++)
+            {
+                int over = 0;
+                for (int c = 0; c < nlist; c++) if (size[c] > cap) over++;
+                if (over == 0) break;
+
+                int movedThisPass = 0;
+                int curMaxBefore = 0;
+                for (int c = 0; c < nlist; c++) if (size[c] > curMaxBefore) curMaxBefore = size[c];
+
+                for (int c = 0; c < nlist; c++)
+                {
+                    if (size[c] <= cap) continue;
+                    int excess = size[c] - cap;
+
+                    // Gather all members of cell c with their dist to c.
+                    var members = new (int idx, float dist)[size[c]];
+                    int mi = 0;
+                    float* cp = cPtr + (long)c * PaddedDimensions;
+                    var k0 = Vector256.Load(cp);
+                    var k1 = Vector256.Load(cp + 8);
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (assign[i] != c) continue;
+                        float* row = vPtr + (long)i * PaddedDimensions;
+                        var r0 = Vector256.Load(row);
+                        var r1 = Vector256.Load(row + 8);
+                        var d0 = k0 - r0;
+                        var d1 = k1 - r1;
+                        var s = (d0 * d0) + (d1 * d1);
+                        members[mi++] = (i, Vector256.Sum(s));
+                    }
+                    // Sort ascending by dist; keep first cap, kick the rest.
+                    Array.Sort(members, (a, b) => a.dist.CompareTo(b.dist));
+
+                    // Walk kicked tail (furthest) and find nearest centroid with slack.
+                    for (int t = members.Length - 1; t >= cap && excess > 0; t--)
+                    {
+                        int i = members[t].idx;
+                        float* row = vPtr + (long)i * PaddedDimensions;
+                        var r0 = Vector256.Load(row);
+                        var r1 = Vector256.Load(row + 8);
+                        int bestC = -1;
+                        float bestD = float.PositiveInfinity;
+                        for (int alt = 0; alt < nlist; alt++)
+                        {
+                            if (alt == c) continue;
+                            if (size[alt] >= cap) continue;
+                            float* ap = cPtr + (long)alt * PaddedDimensions;
+                            var a0 = Vector256.Load(ap);
+                            var a1 = Vector256.Load(ap + 8);
+                            var dd0 = a0 - r0;
+                            var dd1 = a1 - r1;
+                            var ss = (dd0 * dd0) + (dd1 * dd1);
+                            float dist = Vector256.Sum(ss);
+                            if (dist < bestD) { bestD = dist; bestC = alt; }
+                        }
+                        if (bestC < 0) break;
+                        assign[i] = bestC;
+                        size[c]--;
+                        size[bestC]++;
+                        excess--;
+                        movedThisPass++;
+                    }
+                }
+
+                int curMax = 0;
+                for (int c = 0; c < nlist; c++) if (size[c] > curMax) curMax = size[c];
+                Console.Error.WriteLine($"    pass {pass + 1}: over={over} moved={movedThisPass:N0} max={curMaxBefore}->{curMax}");
+                totalMoved += movedThisPass;
+                if (movedThisPass == 0) break;
+            }
+        }
+        finally
+        {
+            cHandle.Free(); vHandle.Free();
+        }
+        return totalMoved;
+    }
+
+    /// <summary>
+    /// Re-set each centroid to the mean of its current assigned points. Used after rebalancing
+    /// so the centroids reflect the post-balance cell composition (otherwise they still point to
+    /// the original Lloyd clusters and IVF cell selection misses force-moved points at query time).
+    /// </summary>
+    private static void RecomputeCentroidsFromAssign(float[] vectors, int n, float[] centroids, int[] assign, int nlist)
+    {
+        var sums = new double[(long)nlist * PaddedDimensions];
+        var counts = new int[nlist];
+        for (int i = 0; i < n; i++)
+        {
+            int c = assign[i];
+            counts[c]++;
+            long src = (long)i * PaddedDimensions;
+            long dst = (long)c * PaddedDimensions;
+            for (int d = 0; d < PaddedDimensions; d++) sums[dst + d] += vectors[src + d];
+        }
+        for (int c = 0; c < nlist; c++)
+        {
+            if (counts[c] == 0) continue;
+            long dst = (long)c * PaddedDimensions;
+            float inv = 1.0f / counts[c];
+            for (int d = 0; d < PaddedDimensions; d++) centroids[dst + d] = (float)(sums[dst + d] * inv);
         }
     }
 

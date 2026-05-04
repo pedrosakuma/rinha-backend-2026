@@ -19,6 +19,10 @@ RUN dotnet publish src/Api/Api.csproj -c Release -o /publish/api --no-restore /p
 # 2. Run the preprocessor (output baked into the next stage)
 ############################
 FROM mcr.microsoft.com/dotnet/runtime:${DOTNET_VERSION}-noble AS dataprep
+ARG IVF_NLIST_BUILD=256
+ARG IVF_BAL_SLACK_BUILD=0
+ENV IVF_NLIST_BUILD=${IVF_NLIST_BUILD}
+ENV IVF_BAL_SLACK_BUILD=${IVF_BAL_SLACK_BUILD}
 WORKDIR /work
 COPY --from=build /publish/preprocessor /preprocessor
 COPY resources/references.json.gz /work/references.json.gz
@@ -33,7 +37,7 @@ RUN dotnet /preprocessor/Rinha.Preprocessor.dll \
         /work/references_q8.bin \
         /work/ivf_centroids.bin \
         /work/ivf_offsets.bin \
-        256 15 42 \
+        ${IVF_NLIST_BUILD:-256} 15 42 ${IVF_BAL_SLACK_BUILD:-0.0} \
  && dotnet /preprocessor/Rinha.Preprocessor.dll --pq \
         /work/references.bin \
         /work/pq_codebooks.bin \
