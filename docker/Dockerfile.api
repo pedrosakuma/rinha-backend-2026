@@ -34,6 +34,11 @@ RUN dotnet /preprocessor/Rinha.Preprocessor.dll \
         /work/ivf_centroids.bin \
         /work/ivf_offsets.bin \
         256 15 42 \
+ && dotnet /preprocessor/Rinha.Preprocessor.dll --pq \
+        /work/references.bin \
+        /work/pq_codebooks.bin \
+        /work/pq_codes.bin \
+        7 256 12 42 \
  && rm /work/references.json.gz
 
 ############################
@@ -55,6 +60,10 @@ ENV DOTNET_EnableDiagnostics=0 \
     VECTORS_Q8_PATH=/data/references_q8.bin \
     IVF_CENTROIDS_PATH=/data/ivf_centroids.bin \
     IVF_OFFSETS_PATH=/data/ivf_offsets.bin \
+    PQ_CODEBOOKS_PATH=/data/pq_codebooks.bin \
+    PQ_CODES_PATH=/data/pq_codes.bin \
+    PQ_M=7 \
+    PQ_KSUB=256 \
     MCC_RISK_PATH=/app/resources/mcc_risk.json \
     NORMALIZATION_PATH=/app/resources/normalization.json
 COPY --from=build /publish/api /app/
@@ -65,5 +74,7 @@ COPY --from=dataprep /work/labels.bin /data/labels.bin
 COPY --from=dataprep /work/references_q8.bin /data/references_q8.bin
 COPY --from=dataprep /work/ivf_centroids.bin /data/ivf_centroids.bin
 COPY --from=dataprep /work/ivf_offsets.bin /data/ivf_offsets.bin
+COPY --from=dataprep /work/pq_codebooks.bin /data/pq_codebooks.bin
+COPY --from=dataprep /work/pq_codes.bin /data/pq_codes.bin
 EXPOSE 9999
 ENTRYPOINT ["dotnet", "/app/Rinha.Api.dll"]
