@@ -26,14 +26,18 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly Dataset _dataset;
     private readonly int _nProbe;
     private readonly int _kPrime;
+    private readonly int _dimFilter;  // -1 = off; 0..13 = enable single-dim LB pruning
+    private readonly int _dimFilter2; // optional 2nd dim added to LB
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32)
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
         _dataset = dataset;
         _nProbe = Math.Clamp(nProbe, 1, dataset.NumCells);
         _kPrime = Math.Clamp(kPrime, K, 1024);
+        _dimFilter = dimFilter is >= 0 and < Dataset.Dimensions ? dimFilter : -1;
+        _dimFilter2 = dimFilter2 is >= 0 and < Dataset.Dimensions && dimFilter2 != _dimFilter ? dimFilter2 : -1;
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -108,7 +112,12 @@ public sealed unsafe class IvfScorer : IFraudScorer
         fixed (sbyte* qPtr = qQ8)
         {
             if (Avx2.IsSupported)
-                ScanCellsQ8Avx2(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
+            {
+                if (_dimFilter >= 0)
+                    ScanCellsQ8Avx2DimFilter(qPtr, cells, offsets, candDist, candIdx, ref q8Worst, _dimFilter, _dimFilter2);
+                else
+                    ScanCellsQ8Avx2(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
+            }
             else
                 ScanCellsQ8Scalar(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
         }
@@ -178,6 +187,75 @@ public sealed unsafe class IvfScorer : IFraudScorer
                 {
                     InsertTopKInt(candDist, candIdx, dist, i);
                     worst = candDist[candDist.Length - 1];
+                }
+            }
+        }
+        worstRef = worst;
+    }
+
+    /// <summary>
+    /// Same as ScanCellsQ8Avx2 but with single-dim early-skip. For each row we first compute
+    /// (r[D] - q[D])² as a strict lower bound on full Q8 dist; if it already exceeds the
+    /// current top-K' worst, we skip the SIMD multiply entirely. Net win iff prune_rate &gt; ~50%.
+    /// </summary>
+    private void ScanCellsQ8Avx2DimFilter(
+        sbyte* qPtr, ReadOnlySpan<int> cells, int* offsets,
+        Span<int> candDist, Span<int> candIdx, ref int worstRef, int dimFilter, int dimFilter2)
+    {
+        var qLow = Vector128.Load(qPtr);
+        var qWide = Vector256.WidenLower(qLow.ToVector256());
+        var sbase = _dataset.Q8VectorsPtr;
+        int worst = worstRef;
+        int qd = qPtr[dimFilter];
+        int qd2 = dimFilter2 >= 0 ? qPtr[dimFilter2] : 0;
+
+        for (int ci = 0; ci < cells.Length; ci++)
+        {
+            int c = cells[ci];
+            if (c < 0) break;
+            int start = offsets[c];
+            int end = offsets[c + 1];
+            if (dimFilter2 >= 0)
+            {
+                for (int i = start; i < end; i++)
+                {
+                    sbyte* row = sbase + (long)i * PaddedDimensions;
+                    int d1 = row[dimFilter] - qd;
+                    int d2 = row[dimFilter2] - qd2;
+                    int lb = d1 * d1 + d2 * d2;
+                    if (lb >= worst) continue;
+
+                    var r128 = Vector128.Load(row);
+                    var rWide = Vector256.WidenLower(r128.ToVector256());
+                    var diff = rWide - qWide;
+                    var prod = Avx2.MultiplyAddAdjacent(diff, diff);
+                    int dist = Vector256.Sum(prod);
+                    if (dist < worst)
+                    {
+                        InsertTopKInt(candDist, candIdx, dist, i);
+                        worst = candDist[candDist.Length - 1];
+                    }
+                }
+            }
+            else
+            {
+                for (int i = start; i < end; i++)
+                {
+                    sbyte* row = sbase + (long)i * PaddedDimensions;
+                    int d1 = row[dimFilter] - qd;
+                    int lb = d1 * d1;
+                    if (lb >= worst) continue;
+
+                    var r128 = Vector128.Load(row);
+                    var rWide = Vector256.WidenLower(r128.ToVector256());
+                    var diff = rWide - qWide;
+                    var prod = Avx2.MultiplyAddAdjacent(diff, diff);
+                    int dist = Vector256.Sum(prod);
+                    if (dist < worst)
+                    {
+                        InsertTopKInt(candDist, candIdx, dist, i);
+                        worst = candDist[candDist.Length - 1];
+                    }
                 }
             }
         }
