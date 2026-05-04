@@ -13,6 +13,9 @@ services:
     image: rinha-backend-2026-api:latest
     environment:
       PORT: "9999"
+      DOTNET_GCHeapCount: "1"
+      DOTNET_gcServer: "1"
+      DOTNET_GCConserveMemory: "0"
       SCORER: "${SCORER:-ivf}"
       IVF_NPROBE: "${IVF_NPROBE:-96}"
       IVF_RERANK: "${IVF_RERANK:-64}"

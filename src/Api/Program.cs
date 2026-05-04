@@ -1,24 +1,34 @@
 using Rinha.Api;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
 builder.Logging.ClearProviders();
+
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.AddServerHeader = false;
     options.AllowSynchronousIO = false;
+    // J4: tight limits — body is ~400 bytes; cap to skip large-body code paths.
+    options.Limits.MaxRequestBodySize = 8 * 1024;
+    options.Limits.MaxRequestHeadersTotalSize = 4 * 1024;
+    options.Limits.MaxRequestLineSize = 1 * 1024;
+    options.Limits.MaxConcurrentUpgradedConnections = 0;
+    options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(5);
+    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(5);
+
     var udsPath = Environment.GetEnvironmentVariable("UDS_PATH");
     if (!string.IsNullOrEmpty(udsPath))
     {
         // J11a: listen on a Unix Domain Socket so the LB upstream is local FS, not TCP loopback.
         // Saves ~30-50us per request (no TCP/IP stack, no port allocation, no Nagle delays).
         if (File.Exists(udsPath)) File.Delete(udsPath);
-        options.ListenUnixSocket(udsPath);
+        options.ListenUnixSocket(udsPath, lo => lo.Protocols = HttpProtocols.Http1);
     }
     else
     {
         var port = int.Parse(Environment.GetEnvironmentVariable("PORT") ?? "9999");
-        options.ListenAnyIP(port);
+        options.ListenAnyIP(port, lo => lo.Protocols = HttpProtocols.Http1);
     }
 });
 
