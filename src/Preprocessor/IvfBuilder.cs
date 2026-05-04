@@ -27,7 +27,7 @@ public static unsafe class IvfBuilder
         {
             Console.Error.WriteLine(
                 "Usage: Rinha.Preprocessor --ivf <vectors.bin> <labels.bin> <vectors_q8.bin> " +
-                "<ivf-centroids.bin> <ivf-offsets.bin> [nlist=256] [maxIters=20] [seed=42]");
+                "<ivf-centroids.bin> <ivf-offsets.bin> [<bbox-min.bin> <bbox-max.bin>] [nlist=256] [maxIters=20] [seed=42]");
             return 1;
         }
 
@@ -36,11 +36,22 @@ public static unsafe class IvfBuilder
         var q8Path = args[2];
         var centroidsPath = args[3];
         var offsetsPath = args[4];
-        int nlist = args.Length > 5 ? int.Parse(args[5]) : 256;
-        int maxIters = args.Length > 6 ? int.Parse(args[6]) : 20;
-        int seed = args.Length > 7 ? int.Parse(args[7]) : 42;
+        // Optional bbox paths (J6: bbox lower-bound exact repair).
+        // If provided, must come BEFORE positional numeric args. Detect by ".bin" suffix.
+        string? bboxMinPath = null, bboxMaxPath = null;
+        int positional = 5;
+        if (args.Length > 5 && args[5].EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
+            && args.Length > 6 && args[6].EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+        {
+            bboxMinPath = args[5];
+            bboxMaxPath = args[6];
+            positional = 7;
+        }
+        int nlist = args.Length > positional ? int.Parse(args[positional]) : 256;
+        int maxIters = args.Length > positional + 1 ? int.Parse(args[positional + 1]) : 20;
+        int seed = args.Length > positional + 2 ? int.Parse(args[positional + 2]) : 42;
         // Cell-size cap = ceil(N/nlist * (1 + balanceSlack)). 0 disables (default).
-        double balanceSlack = args.Length > 8 ? double.Parse(args[8], System.Globalization.CultureInfo.InvariantCulture) : 0.0;
+        double balanceSlack = args.Length > positional + 3 ? double.Parse(args[positional + 3], System.Globalization.CultureInfo.InvariantCulture) : 0.0;
 
         var rowFloatBytes = PaddedDimensions * sizeof(float);
         var rowQ8Bytes = PaddedDimensions;
@@ -100,6 +111,16 @@ public static unsafe class IvfBuilder
         WriteAll(centroidsPath, MemoryMarshal.AsBytes(centroids.AsSpan()));
         WriteOffsets(offsetsPath, offsets);
         Console.Error.WriteLine($"  wrote in {sw.Elapsed.TotalSeconds:F2}s");
+
+        // J6: per-cluster bbox (min/max per dim) for exact lower-bound repair.
+        if (bboxMinPath is not null && bboxMaxPath is not null)
+        {
+            sw.Restart();
+            var (bboxMin, bboxMax) = ComputeBboxes(newVecs, offsets, nlist);
+            WriteAll(bboxMinPath, MemoryMarshal.AsBytes(bboxMin.AsSpan()));
+            WriteAll(bboxMaxPath, MemoryMarshal.AsBytes(bboxMax.AsSpan()));
+            Console.Error.WriteLine($"  bbox in {sw.Elapsed.TotalSeconds:F2}s ({nlist}x{PaddedDimensions} floats each)");
+        }
 
         // Stats
         int empty = 0, maxCell = 0;
@@ -411,6 +432,43 @@ public static unsafe class IvfBuilder
         }
 
         return (newVecs, newLabs, newQ8, offsets);
+    }
+
+    private static (float[] bboxMin, float[] bboxMax) ComputeBboxes(float[] vecs, int[] offsets, int nlist)
+    {
+        long stride = PaddedDimensions;
+        var bMin = new float[(long)nlist * PaddedDimensions];
+        var bMax = new float[(long)nlist * PaddedDimensions];
+        // Initialize each cluster's bbox: min=+inf, max=-inf for active dims; padded dims = 0.
+        for (int c = 0; c < nlist; c++)
+        {
+            for (int j = 0; j < Dimensions; j++)
+            {
+                bMin[(long)c * stride + j] = float.PositiveInfinity;
+                bMax[(long)c * stride + j] = float.NegativeInfinity;
+            }
+        }
+        for (int c = 0; c < nlist; c++)
+        {
+            int s = offsets[c], e = offsets[c + 1];
+            if (e <= s)
+            {
+                // Empty cluster: leave +inf/-inf so any LB query returns +inf → never scanned.
+                continue;
+            }
+            for (int i = s; i < e; i++)
+            {
+                long row = (long)i * stride;
+                for (int j = 0; j < Dimensions; j++)
+                {
+                    float v = vecs[row + j];
+                    long bi = (long)c * stride + j;
+                    if (v < bMin[bi]) bMin[bi] = v;
+                    if (v > bMax[bi]) bMax[bi] = v;
+                }
+            }
+        }
+        return (bMin, bMax);
     }
 
     private static void ReadAll(string path, Span<byte> buffer)

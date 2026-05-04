@@ -21,6 +21,8 @@ var labelsPath = Environment.GetEnvironmentVariable("LABELS_PATH") ?? "/data/lab
 var vectorsQ8Path = Environment.GetEnvironmentVariable("VECTORS_Q8_PATH"); // optional
 var ivfCentroidsPath = Environment.GetEnvironmentVariable("IVF_CENTROIDS_PATH");
 var ivfOffsetsPath = Environment.GetEnvironmentVariable("IVF_OFFSETS_PATH");
+var ivfBboxMinPath = Environment.GetEnvironmentVariable("IVF_BBOX_MIN_PATH");
+var ivfBboxMaxPath = Environment.GetEnvironmentVariable("IVF_BBOX_MAX_PATH");
 var pqCodebooksPath = Environment.GetEnvironmentVariable("PQ_CODEBOOKS_PATH");
 var pqCodesPath = Environment.GetEnvironmentVariable("PQ_CODES_PATH");
 var pqM = int.TryParse(Environment.GetEnvironmentVariable("PQ_M"), out var _pqM) ? _pqM : 7;
@@ -30,7 +32,7 @@ var normalizationPath = Environment.GetEnvironmentVariable("NORMALIZATION_PATH")
 
 var normalization = NormalizationConstants.Load(normalizationPath);
 var mccRisk = MccRiskTable.Load(mccRiskPath);
-var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, ivfCentroidsPath, ivfOffsetsPath, pqCodebooksPath, pqCodesPath, pqM, pqKsub);
+var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, ivfCentroidsPath, ivfOffsetsPath, ivfBboxMinPath, ivfBboxMaxPath, pqCodebooksPath, pqCodesPath, pqM, pqKsub);
 var vectorizer = new Vectorizer(normalization, mccRisk);
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);

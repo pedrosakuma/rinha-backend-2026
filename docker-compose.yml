@@ -18,6 +18,8 @@ services:
       IVF_RERANK: "${IVF_RERANK:-64}"
       Q8_RERANK: "${Q8_RERANK:-32}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
+      IVF_EARLY_STOP_PCT: "${IVF_EARLY_STOP_PCT:-75}"
+      IVF_BBOX_REPAIR: "${IVF_BBOX_REPAIR:-0}"
     networks: [app]
     deploy:
       resources:

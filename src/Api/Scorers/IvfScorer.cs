@@ -29,8 +29,10 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly int _dimFilter;  // -1 = off; 0..13 = enable single-dim LB pruning
     private readonly int _dimFilter2; // optional 2nd dim added to LB
     private readonly bool _earlyStop; // class-aware early-stop (J5)
+    private readonly int _earlyStopPct; // checkpoint % of nProbe (default 75)
+    private readonly bool _bboxRepair; // J6: bbox LB exact repair
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false)
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -40,6 +42,8 @@ public sealed unsafe class IvfScorer : IFraudScorer
         _dimFilter = dimFilter is >= 0 and < Dataset.Dimensions ? dimFilter : -1;
         _dimFilter2 = dimFilter2 is >= 0 and < Dataset.Dimensions && dimFilter2 != _dimFilter ? dimFilter2 : -1;
         _earlyStop = earlyStop;
+        _earlyStopPct = Math.Clamp(earlyStopPct, 10, 95);
+        _bboxRepair = bboxRepair && dataset.HasIvfBbox;
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -133,7 +137,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                     // Checkpoint at 75%: smaller savings on easy queries, but cheaper
                     // overhead on the ~3% ambiguous tail (which dominates p99 under
                     // saturation).
-                    int checkpoint = (_nProbe * 3) / 4;
+                    int checkpoint = (_nProbe * _earlyStopPct) / 100;
                     if (checkpoint >= 1 && _nProbe > checkpoint)
                     {
                         ScanCellsQ8Avx2Range(qPtr, cells, 0, checkpoint, offsets, candDist, candIdx, ref q8Worst);
@@ -179,11 +183,75 @@ public sealed unsafe class IvfScorer : IFraudScorer
             RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
         }
 
+        // 5.5) J6: bbox lower-bound exact repair. For each non-seed cluster, compute float
+        // LB = Σ max(0, max(min[c,j]-q[j], q[j]-max[c,j]))². If LB ≤ worst float dist, the
+        // cluster MAY contain a vector beating the current top-K, so we Q8-scan it; else skip.
+        // Preserves exact recall (LB is admissible). Skipped when class-aware early-stop fired
+        // (decision already locked by margin proof).
+        if (_bboxRepair && !earlyStopped)
+        {
+            int nlistLocal = _dataset.NumCells;
+            Span<bool> isSeed = stackalloc bool[nlistLocal];
+            for (int i = 0; i < cells.Length; i++)
+            {
+                int c = cells[i];
+                if (c >= 0) isSeed[c] = true;
+            }
+
+            Span<int> repairCells = stackalloc int[nlistLocal];
+            int repairCount = 0;
+            float worstD = bestDist[K - 1];
+            fixed (float* qfPtr = paddedQuery)
+            {
+                for (int c = 0; c < nlistLocal; c++)
+                {
+                    if (isSeed[c]) continue;
+                    if (BboxLowerBoundSquared(qfPtr, c) <= worstD)
+                    {
+                        repairCells[repairCount++] = c;
+                    }
+                }
+            }
+
+            if (repairCount > 0)
+            {
+                fixed (sbyte* qPtr = qQ8)
+                {
+                    ScanCellsQ8Avx2Range(qPtr, repairCells, 0, repairCount, offsets, candDist, candIdx, ref q8Worst);
+                }
+                for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+                RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+            }
+        }
+
         // 6) Fraud ratio over exact top-K.
         int totalFrauds = 0;
         for (int i = 0; i < K; i++)
             if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) totalFrauds++;
         return totalFrauds / (float)K;
+    }
+
+    /// <summary>
+    /// Float lower bound on squared L2 distance from query to any point in cluster <paramref name="c"/>,
+    /// using the per-cell bounding box (min/max per dim). Admissible: returns ≤ true min distance,
+    /// so safe for prune-only decisions ("if LB > worst_d → cluster cannot improve top-K").
+    /// AVX2: two 256-bit loads × (max(0, max(min-q, q-max)))² per 8 dims.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private float BboxLowerBoundSquared(float* qPtr, int c)
+    {
+        float* mn = _dataset.IvfBboxMinPtr + (long)c * PaddedDimensions;
+        float* mx = _dataset.IvfBboxMaxPtr + (long)c * PaddedDimensions;
+        var q0 = Vector256.Load(qPtr);
+        var q1 = Vector256.Load(qPtr + 8);
+        var mn0 = Vector256.Load(mn);
+        var mn1 = Vector256.Load(mn + 8);
+        var mx0 = Vector256.Load(mx);
+        var mx1 = Vector256.Load(mx + 8);
+        var d0 = Vector256.Max(Vector256.Max(mn0 - q0, q0 - mx0), Vector256<float>.Zero);
+        var d1 = Vector256.Max(Vector256.Max(mn1 - q1, q1 - mx1), Vector256<float>.Zero);
+        var s = (d0 * d0) + (d1 * d1);
+        return Vector256.Sum(s);
     }
 
     private void RerankFloat(

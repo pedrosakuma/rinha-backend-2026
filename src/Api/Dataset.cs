@@ -26,6 +26,10 @@ public sealed unsafe class Dataset : IDisposable
     private readonly MemoryMappedViewAccessor? _centroidsView;
     private readonly MemoryMappedFile? _offsetsMmf;
     private readonly MemoryMappedViewAccessor? _offsetsView;
+    private readonly MemoryMappedFile? _bboxMinMmf;
+    private readonly MemoryMappedViewAccessor? _bboxMinView;
+    private readonly MemoryMappedFile? _bboxMaxMmf;
+    private readonly MemoryMappedViewAccessor? _bboxMaxView;
     private readonly MemoryMappedFile? _pqCodebooksMmf;
     private readonly MemoryMappedViewAccessor? _pqCodebooksView;
     private readonly MemoryMappedFile? _pqCodesMmf;
@@ -35,6 +39,8 @@ public sealed unsafe class Dataset : IDisposable
     private readonly sbyte* _q8Ptr;
     private readonly float* _centroidsPtr;
     private readonly int* _offsetsPtr;
+    private readonly float* _bboxMinPtr;
+    private readonly float* _bboxMaxPtr;
     private readonly float* _pqCodebooksPtr;
     private readonly byte* _pqCodesPtr;
 
@@ -44,6 +50,7 @@ public sealed unsafe class Dataset : IDisposable
     public int PqKsub { get; }
     public bool HasQ8 => _q8Ptr != null;
     public bool HasIvf => _centroidsPtr != null && _offsetsPtr != null;
+    public bool HasIvfBbox => _bboxMinPtr != null && _bboxMaxPtr != null;
     public bool HasPq => _pqCodebooksPtr != null && _pqCodesPtr != null;
 
     private Dataset(
@@ -52,6 +59,8 @@ public sealed unsafe class Dataset : IDisposable
         MemoryMappedFile? q8Mmf, MemoryMappedViewAccessor? q8View,
         MemoryMappedFile? centroidsMmf, MemoryMappedViewAccessor? centroidsView,
         MemoryMappedFile? offsetsMmf, MemoryMappedViewAccessor? offsetsView,
+        MemoryMappedFile? bboxMinMmf, MemoryMappedViewAccessor? bboxMinView,
+        MemoryMappedFile? bboxMaxMmf, MemoryMappedViewAccessor? bboxMaxView,
         MemoryMappedFile? pqCodebooksMmf, MemoryMappedViewAccessor? pqCodebooksView,
         MemoryMappedFile? pqCodesMmf, MemoryMappedViewAccessor? pqCodesView,
         int count, int numCells, int pqM, int pqKsub)
@@ -66,6 +75,10 @@ public sealed unsafe class Dataset : IDisposable
         _centroidsView = centroidsView;
         _offsetsMmf = offsetsMmf;
         _offsetsView = offsetsView;
+        _bboxMinMmf = bboxMinMmf;
+        _bboxMinView = bboxMinView;
+        _bboxMaxMmf = bboxMaxMmf;
+        _bboxMaxView = bboxMaxView;
         _pqCodebooksMmf = pqCodebooksMmf;
         _pqCodebooksView = pqCodebooksView;
         _pqCodesMmf = pqCodesMmf;
@@ -104,6 +117,20 @@ public sealed unsafe class Dataset : IDisposable
             _offsetsPtr = (int*)oBase;
         }
 
+        if (_bboxMinView is not null)
+        {
+            byte* bMinBase = null;
+            _bboxMinView.SafeMemoryMappedViewHandle.AcquirePointer(ref bMinBase);
+            _bboxMinPtr = (float*)bMinBase;
+        }
+
+        if (_bboxMaxView is not null)
+        {
+            byte* bMaxBase = null;
+            _bboxMaxView.SafeMemoryMappedViewHandle.AcquirePointer(ref bMaxBase);
+            _bboxMaxPtr = (float*)bMaxBase;
+        }
+
         if (_pqCodebooksView is not null)
         {
             byte* cbBase = null;
@@ -125,6 +152,8 @@ public sealed unsafe class Dataset : IDisposable
         string? vectorsQ8Path = null,
         string? ivfCentroidsPath = null,
         string? ivfOffsetsPath = null,
+        string? ivfBboxMinPath = null,
+        string? ivfBboxMaxPath = null,
         string? pqCodebooksPath = null,
         string? pqCodesPath = null,
         int pqM = 7,
@@ -183,6 +212,25 @@ public sealed unsafe class Dataset : IDisposable
             offsetsView = offsetsMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         }
 
+        MemoryMappedFile? bboxMinMmf = null;
+        MemoryMappedViewAccessor? bboxMinView = null;
+        MemoryMappedFile? bboxMaxMmf = null;
+        MemoryMappedViewAccessor? bboxMaxView = null;
+        if (numCells > 0
+            && !string.IsNullOrEmpty(ivfBboxMinPath) && File.Exists(ivfBboxMinPath)
+            && !string.IsNullOrEmpty(ivfBboxMaxPath) && File.Exists(ivfBboxMaxPath))
+        {
+            long expected = (long)numCells * PaddedDimensions * sizeof(float);
+            long mLen = new FileInfo(ivfBboxMinPath).Length;
+            long xLen = new FileInfo(ivfBboxMaxPath).Length;
+            if (mLen != expected) throw new InvalidDataException($"BboxMin size {mLen} != expected {expected}");
+            if (xLen != expected) throw new InvalidDataException($"BboxMax size {xLen} != expected {expected}");
+            bboxMinMmf = MemoryMappedFile.CreateFromFile(ivfBboxMinPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            bboxMinView = bboxMinMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            bboxMaxMmf = MemoryMappedFile.CreateFromFile(ivfBboxMaxPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            bboxMaxView = bboxMaxMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        }
+
         MemoryMappedFile? pqCodebooksMmf = null;
         MemoryMappedViewAccessor? pqCodebooksView = null;
         MemoryMappedFile? pqCodesMmf = null;
@@ -208,6 +256,7 @@ public sealed unsafe class Dataset : IDisposable
         return new Dataset(
             vectorsMmf, vectorsView, labelsMmf, labelsView,
             q8Mmf, q8View, centroidsMmf, centroidsView, offsetsMmf, offsetsView,
+            bboxMinMmf, bboxMinView, bboxMaxMmf, bboxMaxView,
             pqCodebooksMmf, pqCodebooksView, pqCodesMmf, pqCodesView,
             (int)count, numCells, pqM, pqKsub);
     }
@@ -254,6 +303,18 @@ public sealed unsafe class Dataset : IDisposable
         get => _offsetsPtr;
     }
 
+    public float* IvfBboxMinPtr
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _bboxMinPtr;
+    }
+
+    public float* IvfBboxMaxPtr
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _bboxMaxPtr;
+    }
+
     public void Dispose()
     {
         try { _vectorsView.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
@@ -261,6 +322,8 @@ public sealed unsafe class Dataset : IDisposable
         try { _q8View?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _centroidsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _offsetsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        try { _bboxMinView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        try { _bboxMaxView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _pqCodebooksView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _pqCodesView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         _vectorsView.Dispose();
@@ -273,6 +336,10 @@ public sealed unsafe class Dataset : IDisposable
         _centroidsMmf?.Dispose();
         _offsetsView?.Dispose();
         _offsetsMmf?.Dispose();
+        _bboxMinView?.Dispose();
+        _bboxMinMmf?.Dispose();
+        _bboxMaxView?.Dispose();
+        _bboxMaxMmf?.Dispose();
         _pqCodebooksView?.Dispose();
         _pqCodebooksMmf?.Dispose();
         _pqCodesView?.Dispose();
