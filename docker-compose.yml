@@ -13,7 +13,10 @@ services:
     image: rinha-backend-2026-api:latest
     environment:
       PORT: "9999"
-      SCORER: "${SCORER:-brute}"
+      SCORER: "${SCORER:-ivf}"
+      IVF_NPROBE: "${IVF_NPROBE:-96}"
+      IVF_RERANK: "${IVF_RERANK:-64}"
+      Q8_RERANK: "${Q8_RERANK:-32}"
     networks: [app]
     deploy:
       resources:

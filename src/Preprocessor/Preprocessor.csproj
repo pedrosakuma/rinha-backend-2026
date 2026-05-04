@@ -8,5 +8,6 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <RootNamespace>Rinha.Preprocessor</RootNamespace>
     <AssemblyName>Rinha.Preprocessor</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 </Project>

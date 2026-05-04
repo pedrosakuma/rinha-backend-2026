@@ -15,7 +15,10 @@ public static class ScorerFactory
         "brute" or ""        => new Rinha.Api.Scorers.BruteForceScorer(dataset),
         "fma"                => new Rinha.Api.Scorers.FmaBruteForceScorer(dataset),
         "q8"                 => new Rinha.Api.Scorers.Q8RecheckScorer(dataset, ParseInt(Environment.GetEnvironmentVariable("Q8_RERANK"), 32)),
-        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, fma, q8")
+        "ivf"                => new Rinha.Api.Scorers.IvfScorer(dataset,
+                                    ParseInt(Environment.GetEnvironmentVariable("IVF_NPROBE"), 16),
+                                    ParseInt(Environment.GetEnvironmentVariable("IVF_RERANK"), 32)),
+        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, fma, q8, ivf")
     };
 
     private static int ParseInt(string? s, int defaultValue)

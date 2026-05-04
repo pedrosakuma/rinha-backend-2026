@@ -2,6 +2,10 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Text.Json;
+using Rinha.Preprocessor;
+
+if (args.Length > 0 && args[0] == "--ivf")
+    return IvfBuilder.Run(args[1..]);
 
 if (args.Length < 3 || args.Length > 4)
 {

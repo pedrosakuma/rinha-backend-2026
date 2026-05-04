@@ -19,12 +19,14 @@ builder.Services.ConfigureHttpJsonOptions(o =>
 var vectorsPath = Environment.GetEnvironmentVariable("VECTORS_PATH") ?? "/data/references.bin";
 var labelsPath = Environment.GetEnvironmentVariable("LABELS_PATH") ?? "/data/labels.bin";
 var vectorsQ8Path = Environment.GetEnvironmentVariable("VECTORS_Q8_PATH"); // optional
+var ivfCentroidsPath = Environment.GetEnvironmentVariable("IVF_CENTROIDS_PATH");
+var ivfOffsetsPath = Environment.GetEnvironmentVariable("IVF_OFFSETS_PATH");
 var mccRiskPath = Environment.GetEnvironmentVariable("MCC_RISK_PATH") ?? "/app/resources/mcc_risk.json";
 var normalizationPath = Environment.GetEnvironmentVariable("NORMALIZATION_PATH") ?? "/app/resources/normalization.json";
 
 var normalization = NormalizationConstants.Load(normalizationPath);
 var mccRisk = MccRiskTable.Load(mccRiskPath);
-var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path);
+var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, ivfCentroidsPath, ivfOffsetsPath);
 var vectorizer = new Vectorizer(normalization, mccRisk);
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
@@ -46,7 +48,8 @@ app.Lifetime.ApplicationStarted.Register(() =>
     var simd = System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated ? "AVX2"
              : System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated ? "SSE-only (slow)"
              : "scalar (very slow)";
-    Console.WriteLine($"Ready. Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}. SIMD: {simd}.");
+    var ivf = dataset.HasIvf ? $" IVF: {dataset.NumCells} cells." : "";
+    Console.WriteLine($"Ready. Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}. SIMD: {simd}.{ivf}");
 });
 
 app.Run();

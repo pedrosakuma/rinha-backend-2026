@@ -18,7 +18,7 @@ public class ScorerBenchmarks
     private IFraudScorer _scorer = default!;
     private float[] _query = default!;
 
-    [Params("brute")]
+    [Params("brute", "q8")]
     public string Scorer { get; set; } = "brute";
 
     [GlobalSetup]
@@ -27,7 +27,8 @@ public class ScorerBenchmarks
         var root = FindRepoRoot();
         var vec = Path.Combine(root, "data", "references.bin");
         var lab = Path.Combine(root, "data", "labels.bin");
-        _dataset = Dataset.Open(vec, lab);
+        var q8  = Path.Combine(root, "data", "references_q8.bin");
+        _dataset = Dataset.Open(vec, lab, File.Exists(q8) ? q8 : null);
         _scorer = ScorerFactory.Create(Scorer, _dataset);
 
         // Representative query (first example payload, hand-vectorized).
