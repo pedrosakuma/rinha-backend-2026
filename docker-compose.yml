@@ -13,6 +13,7 @@ services:
     image: rinha-backend-2026-api:latest
     environment:
       PORT: "9999"
+      SCORER: "${SCORER:-brute}"
     networks: [app]
     deploy:
       resources:

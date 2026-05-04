@@ -13,6 +13,7 @@ public static class ScorerFactory
     public static IFraudScorer Create(string name, Dataset dataset) => name.ToLowerInvariant() switch
     {
         "brute" or ""        => new Rinha.Api.Scorers.BruteForceScorer(dataset),
-        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute")
+        "fma"                => new Rinha.Api.Scorers.FmaBruteForceScorer(dataset),
+        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, fma")
     };
 }
