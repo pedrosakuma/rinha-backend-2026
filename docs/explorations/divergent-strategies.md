@@ -349,3 +349,57 @@ slack=0.1 (max cell capped at 12891) | 2.41 | 5.46 | 2666 (fp=27,fn=3) | **4923*
    not attempted in this session.
 
 PROFILE_TIMING=1 per-mode telemetry retained. nlist remained 256, slack remained 0.
+
+## J18: Heavy-cell geometric split (REJECTED — paradox wins again, but **this time detection survived**)
+
+Hypothesis from J17: if cell-variance reduction harms detection because k-means
+rebalance moves points across natural boundaries, then a **post-hoc geometric
+split** that only subdivides oversized cells (without moving any point across
+the original natural boundary) should reduce p99 without recall loss.
+
+### Implementation (`src/Preprocessor/IvfBuilder.cs`)
+
+`HeavySplit()`: after Lloyd convergence, identify cells > `IVF_HEAVY_SPLIT_MAX`,
+run a local 2-way (or k-way) k-means on each oversized cell's members for 12
+iters, append the new sub-centroids to the centroids array, update assignments.
+Plumbed via `IVF_HEAVY_SPLIT_MAX` build arg in `docker/Dockerfile.api`.
+
+Two thresholds tested. Cell distributions:
+
+threshold | nlist | mean | max | p99 | splits
+---|---|---|---|---|---
+none (baseline) | 256 | 11718 | 43874 | 37250 | —
+35000 | 262 | 11450 | 34715 | 31664 | 6
+25000 | 282 | 10638 | 24960 | 24290 | 26
+
+### Bench results
+
+variant | RPS | p50 | p99 | p99_score | det | fp/fn | final
+---|---|---|---|---|---|---|---
+baseline | 301 | 3.04 | **6.47** | 2189 | 2819 | 0/3 | **5009**
+split max=25k | **329** (+9%) | 4.66 | **16.10** | 1793 | 2819 | 0/3 | **4613** (−396)
+split max=35k | 156 (timeouts) | 5.38 | 16.58 | 1780 | 2819 | 0/3 | 4600 (−409)
+
+### The paradox is now mathematically airtight
+
+- **Detection identical** to baseline (`det=2819, fp=0, fn=3` everywhere). The
+  geometric split preserved natural clusters perfectly — proving the J17
+  recall-loss hypothesis was correct: rebalance hurts, geometric split does not.
+- **Per-query throughput improved** (rows-avg dropped 978k → 830k, ~15% less work
+  per query in steady state).
+- **k6 noticed**: actual_rps climbed 301 → 329 (+9%). That extra concurrency
+  saturated the 0.45 + 0.45 = 0.9 cpu budget. Tail exploded 6.47 → 16.10 ms.
+- Net: **−396 pts, all in p99_score** (2189 → 1793).
+
+### Lesson
+
+There is no way to *win* by reducing mean latency on this benchmark, period.
+`ramping-arrival-rate` with `preAllocatedVUs=100, maxVUs=250` always converts
+mean savings into more concurrency, and at this CPU budget the conversion is
+always a net loss. The only viable angle would be to attack the *tail directly*
+without lowering the mean — e.g. asymmetric scheduling or hard throttling at
+the LB to hold RPS constant. Both are anti-natural.
+
+Configuration restored to baseline (nlist=256, slack=0, heavy_split=0).
+Code (`HeavySplit()` and `IVF_HEAVY_SPLIT_MAX` arg) retained as opt-in for
+future revisits.

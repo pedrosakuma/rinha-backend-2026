@@ -93,6 +93,17 @@ public static unsafe class IvfBuilder
         Lloyd(vectors, n, centroids, assign, nlist, maxIters);
         Console.Error.WriteLine($"  Lloyd in {sw.Elapsed.TotalSeconds:F2}s");
 
+        // J18: post-hoc split of heavy cells. Preserves natural clusters but subdivides
+        // any cell exceeding IVF_HEAVY_SPLIT_MAX rows via local k-means. New centroids
+        // are appended; nlist grows.
+        int heavyMax = int.TryParse(Environment.GetEnvironmentVariable("IVF_HEAVY_SPLIT_MAX") ?? "0", out var hm) ? hm : 0;
+        if (heavyMax > 0)
+        {
+            sw.Restart();
+            int splits = HeavySplit(vectors, n, ref centroids, assign, ref nlist, heavyMax, seed);
+            Console.Error.WriteLine($"  heavy-split (max={heavyMax}) in {sw.Elapsed.TotalSeconds:F2}s, splits={splits}, new nlist={nlist}");
+        }
+
         if (balanceSlack > 0)
         {
             sw.Restart();
@@ -431,6 +442,126 @@ public static unsafe class IvfBuilder
             float inv = 1.0f / counts[c];
             for (int d = 0; d < PaddedDimensions; d++) centroids[dst + d] = (float)(sums[dst + d] * inv);
         }
+    }
+
+    /// <summary>
+    /// Post-hoc split of heavy cells: any cell with size &gt; maxSize is partitioned
+    /// into ceil(size/maxSize) sub-cells via local k-means. Preserves natural clusters
+    /// (only oversized cells are touched). New centroids are appended; nlist grows.
+    /// Returns number of cells split.
+    /// </summary>
+    private static int HeavySplit(float[] vectors, int n, ref float[] centroids,
+        int[] assign, ref int nlist, int maxSize, int seed)
+    {
+        // Build per-cell index lists (snapshot of current state).
+        var perCell = new List<int>[nlist];
+        for (int i = 0; i < nlist; i++) perCell[i] = new List<int>();
+        for (int i = 0; i < n; i++) perCell[assign[i]].Add(i);
+
+        var heavy = new List<int>();
+        int extra = 0;
+        for (int c = 0; c < nlist; c++)
+        {
+            int sz = perCell[c].Count;
+            if (sz > maxSize)
+            {
+                heavy.Add(c);
+                int parts = (sz + maxSize - 1) / maxSize;
+                extra += parts - 1;
+            }
+        }
+        if (heavy.Count == 0) return 0;
+
+        int newNlist = nlist + extra;
+        Array.Resize(ref centroids, newNlist * PaddedDimensions);
+
+        var rng = new Random(seed * 7 + 13);
+        int nextIdx = nlist;
+        const int LocalIters = 12;
+        var sub = new float[16 * PaddedDimensions]; // worst case: ~14 sub-clusters per cell
+        var subAssign = new int[1];                 // resized per cell
+        var sums = new float[16 * PaddedDimensions];
+        var counts = new int[16];
+
+        foreach (var c in heavy)
+        {
+            var members = perCell[c];
+            int m = members.Count;
+            int splitN = (m + maxSize - 1) / maxSize;
+            if (splitN > 16) splitN = 16; // hard cap; very unlikely
+
+            // Lazy resize buffers if needed (we sized for 16; fine).
+            if (subAssign.Length < m) subAssign = new int[m];
+
+            // Init sub-centroids by picking splitN distinct random members.
+            var picks = new HashSet<int>();
+            for (int s = 0; s < splitN; s++)
+            {
+                int p; do { p = rng.Next(m); } while (!picks.Add(p));
+                int row = members[p];
+                Array.Copy(vectors, (long)row * PaddedDimensions,
+                    sub, s * PaddedDimensions, PaddedDimensions);
+            }
+
+            for (int it = 0; it < LocalIters; it++)
+            {
+                // Assignment.
+                for (int mi = 0; mi < m; mi++)
+                {
+                    long rowOff = (long)members[mi] * PaddedDimensions;
+                    float bestD = float.PositiveInfinity; int bestS = 0;
+                    for (int s = 0; s < splitN; s++)
+                    {
+                        int sOff = s * PaddedDimensions;
+                        float d = 0;
+                        for (int dim = 0; dim < Dimensions; dim++)
+                        {
+                            float diff = vectors[rowOff + dim] - sub[sOff + dim];
+                            d += diff * diff;
+                        }
+                        if (d < bestD) { bestD = d; bestS = s; }
+                    }
+                    subAssign[mi] = bestS;
+                }
+                // Recompute means.
+                Array.Clear(sums, 0, splitN * PaddedDimensions);
+                Array.Clear(counts, 0, splitN);
+                for (int mi = 0; mi < m; mi++)
+                {
+                    int s = subAssign[mi];
+                    counts[s]++;
+                    long rowOff = (long)members[mi] * PaddedDimensions;
+                    int sOff = s * PaddedDimensions;
+                    for (int dim = 0; dim < Dimensions; dim++)
+                        sums[sOff + dim] += vectors[rowOff + dim];
+                }
+                for (int s = 0; s < splitN; s++)
+                {
+                    if (counts[s] == 0) continue;
+                    float inv = 1.0f / counts[s];
+                    int sOff = s * PaddedDimensions;
+                    for (int dim = 0; dim < Dimensions; dim++)
+                        sub[sOff + dim] = sums[sOff + dim] * inv;
+                }
+            }
+
+            // Apply: sub 0 inherits original cell id `c`, others get fresh ids.
+            var newIds = new int[splitN];
+            newIds[0] = c;
+            Array.Copy(sub, 0, centroids, (long)c * PaddedDimensions, PaddedDimensions);
+            for (int s = 1; s < splitN; s++)
+            {
+                newIds[s] = nextIdx;
+                Array.Copy(sub, s * PaddedDimensions,
+                    centroids, (long)nextIdx * PaddedDimensions, PaddedDimensions);
+                nextIdx++;
+            }
+            for (int mi = 0; mi < m; mi++)
+                assign[members[mi]] = newIds[subAssign[mi]];
+        }
+
+        nlist = newNlist;
+        return heavy.Count;
     }
 
     private static (float[] vecs, byte[] labs, sbyte[] q8s, int[] offsets) Reorder(
