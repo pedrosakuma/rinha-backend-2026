@@ -32,9 +32,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly int _earlyStopPct; // checkpoint % of nProbe (default 75)
     private readonly int _earlyStopPctEarly; // J9: optional 2nd, earlier checkpoint (e.g. 25). 0 = disabled.
     private readonly bool _bboxRepair; // J6: bbox LB exact repair
-    private readonly bool _scalarAbort; // J10: scalar early-abort dim-by-dim per row
+    private readonly int _scalarAbort; // 0=off, 1=AoS dim-unroll (J10), 2=SoA survivor compaction (J11)
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, bool scalarAbort = false)
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -47,7 +47,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
         _earlyStopPct = Math.Clamp(earlyStopPct, 10, 95);
         _earlyStopPctEarly = earlyStopPctEarly > 0 && earlyStopPctEarly < _earlyStopPct ? earlyStopPctEarly : 0;
         _bboxRepair = bboxRepair && dataset.HasIvfBbox;
-        _scalarAbort = scalarAbort;
+        // Mode 2 (SoA) requires Q8-SoA file; silently downgrade if missing.
+        if (scalarAbort == 2 && !dataset.HasQ8Soa) scalarAbort = 0;
+        _scalarAbort = scalarAbort is >= 0 and <= 2 ? scalarAbort : 0;
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -328,9 +330,14 @@ public sealed unsafe class IvfScorer : IFraudScorer
         sbyte* qPtr, ReadOnlySpan<int> cells, int ciStart, int ciEnd, int* offsets,
         Span<int> candDist, Span<int> candIdx, ref int worstRef)
     {
-        if (_scalarAbort)
+        if (_scalarAbort == 1)
         {
             ScanCellsQ8ScalarAbortRange(qPtr, cells, ciStart, ciEnd, offsets, candDist, candIdx, ref worstRef);
+            return;
+        }
+        if (_scalarAbort == 2)
+        {
+            ScanCellsQ8SoaAbortRange(qPtr, cells, ciStart, ciEnd, offsets, candDist, candIdx, ref worstRef);
             return;
         }
         var qLow = Vector128.Load(qPtr);
@@ -482,7 +489,104 @@ public sealed unsafe class IvfScorer : IFraudScorer
     }
 
     /// <summary>
-    /// J10: Scalar early-abort dim-by-dim per row. Inspired by the C #1 winner
+    /// J11: SoA scalar early-abort with row-survivor compaction (the C #1 winner pattern).
+    /// Per cluster:
+    ///   pass 0: stream dim 0 sequentially over all rows → compute partial acc, build survivor[].
+    ///   pass d (1..13): for each survivor, accumulate dim d's sqdiff; if acc &gt;= worst, drop.
+    /// Sequential per-dim streaming = perfect prefetch; survivor list shrinks geometrically
+    /// so total work is roughly N + N×p + N×p² + ... ≈ N/(1-p), much less than 14×N for high prune rate.
+    /// </summary>
+    private void ScanCellsQ8SoaAbortRange(
+        sbyte* qPtr, ReadOnlySpan<int> cells, int ciStart, int ciEnd, int* offsets,
+        Span<int> candDist, Span<int> candIdx, ref int worstRef)
+    {
+        var soa = _dataset.Q8SoaPtr;
+        long N = _dataset.Count;
+        int worst = worstRef;
+
+        // Hoist query dims.
+        int q0 = qPtr[0], q1 = qPtr[1], q2 = qPtr[2], q3 = qPtr[3];
+        int q4 = qPtr[4], q5 = qPtr[5], q6 = qPtr[6], q7 = qPtr[7];
+        int q8 = qPtr[8], q9 = qPtr[9], q10 = qPtr[10], q11 = qPtr[11];
+        int q12 = qPtr[12], q13 = qPtr[13];
+
+        // Per-dim base pointers in the SoA file.
+        sbyte* p0 = soa + 0 * N, p1 = soa + 1 * N, p2 = soa + 2 * N, p3 = soa + 3 * N;
+        sbyte* p4 = soa + 4 * N, p5 = soa + 5 * N, p6 = soa + 6 * N, p7 = soa + 7 * N;
+        sbyte* p8 = soa + 8 * N, p9 = soa + 9 * N, p10 = soa + 10 * N, p11 = soa + 11 * N;
+        sbyte* p12 = soa + 12 * N, p13 = soa + 13 * N;
+
+        const int MaxCellSize = 65536; // generous cap; nlist=256 over 3M ≈ 12K avg
+        Span<int> acc = stackalloc int[MaxCellSize];
+        Span<int> surv = stackalloc int[MaxCellSize];
+
+        for (int ci = ciStart; ci < ciEnd; ci++)
+        {
+            int c = cells[ci];
+            if (c < 0) break;
+            int start = offsets[c];
+            int end = offsets[c + 1];
+            int sz = end - start;
+            if (sz <= 0) continue;
+            if (sz > MaxCellSize) sz = MaxCellSize; // safety
+
+            // Pass 0: dim 0, all rows. acc[r] = (p0[start+r] - q0)^2; if < worst, mark survivor.
+            int n = 0;
+            for (int r = 0; r < sz; r++)
+            {
+                int d = p0[start + r] - q0;
+                int a = d * d;
+                acc[r] = a;
+                if (a < worst) surv[n++] = r;
+            }
+
+            // Pass d (1..13): only iterate survivors; further compact.
+            n = AddDimAndCompact(p1, start, q1, acc, surv, n, worst);
+            n = AddDimAndCompact(p2, start, q2, acc, surv, n, worst);
+            n = AddDimAndCompact(p3, start, q3, acc, surv, n, worst);
+            n = AddDimAndCompact(p4, start, q4, acc, surv, n, worst);
+            n = AddDimAndCompact(p5, start, q5, acc, surv, n, worst);
+            n = AddDimAndCompact(p6, start, q6, acc, surv, n, worst);
+            n = AddDimAndCompact(p7, start, q7, acc, surv, n, worst);
+            n = AddDimAndCompact(p8, start, q8, acc, surv, n, worst);
+            n = AddDimAndCompact(p9, start, q9, acc, surv, n, worst);
+            n = AddDimAndCompact(p10, start, q10, acc, surv, n, worst);
+            n = AddDimAndCompact(p11, start, q11, acc, surv, n, worst);
+            n = AddDimAndCompact(p12, start, q12, acc, surv, n, worst);
+            n = AddDimAndCompact(p13, start, q13, acc, surv, n, worst);
+
+            // Insert remaining survivors into top-K'.
+            for (int s = 0; s < n; s++)
+            {
+                int r = surv[s];
+                int dist = acc[r];
+                if (dist < worst)
+                {
+                    InsertTopKInt(candDist, candIdx, dist, start + r);
+                    worst = candDist[candDist.Length - 1];
+                }
+            }
+        }
+        worstRef = worst;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int AddDimAndCompact(sbyte* dimBase, int start, int qd, Span<int> acc, Span<int> surv, int nIn, int worst)
+    {
+        int nOut = 0;
+        for (int s = 0; s < nIn; s++)
+        {
+            int r = surv[s];
+            int d = dimBase[start + r] - qd;
+            int a = acc[r] + d * d;
+            acc[r] = a;
+            if (a < worst) surv[nOut++] = r;
+        }
+        return nOut;
+    }
+
+    /// <summary>
+    /// J10: Scalar early-abort dim-by-dim per row (AoS layout). Inspired by the C #1 winner
     /// (thiagorigonatti/rinha-2026). For each row, accumulate squared diff one
     /// dim at a time and abort the row as soon as accumulator ≥ current worst.
     /// On a query whose top-K' worst is small, most rows abort within 2-4 dims,

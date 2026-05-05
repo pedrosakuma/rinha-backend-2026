@@ -1,5 +1,6 @@
 using Rinha.Api;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using System.IO.Pipelines;
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
@@ -40,6 +41,7 @@ builder.Services.ConfigureHttpJsonOptions(o =>
 var vectorsPath = Environment.GetEnvironmentVariable("VECTORS_PATH") ?? "/data/references.bin";
 var labelsPath = Environment.GetEnvironmentVariable("LABELS_PATH") ?? "/data/labels.bin";
 var vectorsQ8Path = Environment.GetEnvironmentVariable("VECTORS_Q8_PATH"); // optional
+var vectorsQ8SoaPath = Environment.GetEnvironmentVariable("VECTORS_Q8_SOA_PATH"); // optional (J11)
 var ivfCentroidsPath = Environment.GetEnvironmentVariable("IVF_CENTROIDS_PATH");
 var ivfOffsetsPath = Environment.GetEnvironmentVariable("IVF_OFFSETS_PATH");
 var ivfBboxMinPath = Environment.GetEnvironmentVariable("IVF_BBOX_MIN_PATH");
@@ -53,8 +55,10 @@ var normalizationPath = Environment.GetEnvironmentVariable("NORMALIZATION_PATH")
 
 var normalization = NormalizationConstants.Load(normalizationPath);
 var mccRisk = MccRiskTable.Load(mccRiskPath);
-var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, ivfCentroidsPath, ivfOffsetsPath, ivfBboxMinPath, ivfBboxMaxPath, pqCodebooksPath, pqCodesPath, pqM, pqKsub);
+var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, vectorsQ8SoaPath, ivfCentroidsPath, ivfOffsetsPath, ivfBboxMinPath, ivfBboxMaxPath, pqCodebooksPath, pqCodesPath, pqM, pqKsub);
 var vectorizer = new Vectorizer(normalization, mccRisk);
+var jsonVectorizer = new JsonVectorizer(normalization, mccRisk);
+var fastJson = Environment.GetEnvironmentVariable("FAST_JSON") == "1";
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
 
@@ -106,6 +110,70 @@ if (profile)
                 $"json={jS*f/N:F1}us(max {jM*f:F1})");
         }
         return resp;
+    });
+}
+else if (fastJson)
+{
+    // J11c: bypass model binding entirely. Read raw body bytes via PipeReader,
+    // parse straight into a Span<float>, write the response by hand.
+    app.MapPost("/fraud-score", async (HttpContext ctx) =>
+    {
+        var pipe = ctx.Request.BodyReader;
+        var contentLength = ctx.Request.ContentLength ?? 0;
+        // Pull until we have the full body or the pipe completes.
+        ReadResult rr;
+        while (true)
+        {
+            rr = await pipe.ReadAsync();
+            if (rr.Buffer.Length >= contentLength || rr.IsCompleted) break;
+            pipe.AdvanceTo(rr.Buffer.Start, rr.Buffer.End);
+        }
+        var buffer = rr.Buffer;
+
+        Span<float> query = stackalloc float[Dataset.Dimensions];
+        if (buffer.IsSingleSegment)
+        {
+            jsonVectorizer.VectorizeJson(buffer.FirstSpan, query);
+        }
+        else
+        {
+            // Multi-segment is rare for ~500B bodies on local TCP; copy to a stack scratch.
+            int len = (int)buffer.Length;
+            if (len > 8 * 1024) len = 8 * 1024;
+            Span<byte> scratch = stackalloc byte[8 * 1024];
+            var slice = buffer.Slice(0, len);
+            int p = 0;
+            foreach (var seg in slice)
+            {
+                seg.Span.CopyTo(scratch[p..]);
+                p += seg.Length;
+            }
+            jsonVectorizer.VectorizeJson(scratch[..len], query);
+        }
+        pipe.AdvanceTo(buffer.End);
+
+        var score = scorer.Score(query);
+
+        // Hand-written response: "{\"approved\":true|false,\"fraud_score\":<float>}"
+        // Allocation-free path through Response.BodyWriter (PipeWriter) — get a memory
+        // span, write directly, Advance, FlushAsync.
+        ctx.Response.StatusCode = 200;
+        ctx.Response.ContentType = "application/json";
+
+        var bw = ctx.Response.BodyWriter;
+        var outMem = bw.GetMemory(64);
+        var outSpan = outMem.Span;
+        int o = 0;
+        ReadOnlySpan<byte> p1True = "{\"approved\":true,\"fraud_score\":"u8;
+        ReadOnlySpan<byte> p1False = "{\"approved\":false,\"fraud_score\":"u8;
+        var prefix = score < 0.6f ? p1True : p1False;
+        prefix.CopyTo(outSpan);
+        o += prefix.Length;
+        if (System.Buffers.Text.Utf8Formatter.TryFormat(score, outSpan[o..], out var written))
+            o += written;
+        outSpan[o++] = (byte)'}';
+        bw.Advance(o);
+        await bw.FlushAsync();
     });
 }
 else

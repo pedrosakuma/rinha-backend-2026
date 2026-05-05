@@ -39,6 +39,7 @@ public static unsafe class IvfBuilder
         // Optional bbox paths (J6: bbox lower-bound exact repair).
         // If provided, must come BEFORE positional numeric args. Detect by ".bin" suffix.
         string? bboxMinPath = null, bboxMaxPath = null;
+        string? q8SoaPath = null; // J11: SoA layout for scalar early-abort
         int positional = 5;
         if (args.Length > 5 && args[5].EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
             && args.Length > 6 && args[6].EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
@@ -46,6 +47,11 @@ public static unsafe class IvfBuilder
             bboxMinPath = args[5];
             bboxMaxPath = args[6];
             positional = 7;
+            if (args.Length > 7 && args[7].EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+            {
+                q8SoaPath = args[7];
+                positional = 8;
+            }
         }
         int nlist = args.Length > positional ? int.Parse(args[positional]) : 256;
         int maxIters = args.Length > positional + 1 ? int.Parse(args[positional + 1]) : 20;
@@ -120,6 +126,26 @@ public static unsafe class IvfBuilder
             WriteAll(bboxMinPath, MemoryMarshal.AsBytes(bboxMin.AsSpan()));
             WriteAll(bboxMaxPath, MemoryMarshal.AsBytes(bboxMax.AsSpan()));
             Console.Error.WriteLine($"  bbox in {sw.Elapsed.TotalSeconds:F2}s ({nlist}x{PaddedDimensions} floats each)");
+        }
+
+        // J11: SoA layout for scalar early-abort. 14 contiguous blocks of N bytes,
+        // block d = dim d's q8 value for row 0..N-1 (rows already in IVF order).
+        // Cache-friendly for per-dim sequential streaming with row-survivor compaction.
+        if (q8SoaPath is not null)
+        {
+            sw.Restart();
+            int total = n * Dimensions;
+            var soa = new sbyte[total];
+            for (int d = 0; d < Dimensions; d++)
+            {
+                int dimBase = d * n;
+                for (int r = 0; r < n; r++)
+                {
+                    soa[dimBase + r] = newQ8[(long)r * PaddedDimensions + d];
+                }
+            }
+            WriteAll(q8SoaPath, MemoryMarshal.AsBytes(soa.AsSpan()));
+            Console.Error.WriteLine($"  q8-soa in {sw.Elapsed.TotalSeconds:F2}s ({Dimensions}x{n} bytes)");
         }
 
         // Stats

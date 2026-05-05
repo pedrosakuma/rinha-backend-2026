@@ -22,6 +22,8 @@ public sealed unsafe class Dataset : IDisposable
     private readonly MemoryMappedViewAccessor _labelsView;
     private readonly MemoryMappedFile? _q8Mmf;
     private readonly MemoryMappedViewAccessor? _q8View;
+    private readonly MemoryMappedFile? _q8SoaMmf;
+    private readonly MemoryMappedViewAccessor? _q8SoaView;
     private readonly MemoryMappedFile? _centroidsMmf;
     private readonly MemoryMappedViewAccessor? _centroidsView;
     private readonly MemoryMappedFile? _offsetsMmf;
@@ -37,6 +39,7 @@ public sealed unsafe class Dataset : IDisposable
     private readonly float* _vectorsPtr;
     private readonly byte* _labelsPtr;
     private readonly sbyte* _q8Ptr;
+    private readonly sbyte* _q8SoaPtr;
     private readonly float* _centroidsPtr;
     private readonly int* _offsetsPtr;
     private readonly float* _bboxMinPtr;
@@ -49,6 +52,7 @@ public sealed unsafe class Dataset : IDisposable
     public int PqM { get; }
     public int PqKsub { get; }
     public bool HasQ8 => _q8Ptr != null;
+    public bool HasQ8Soa => _q8SoaPtr != null;
     public bool HasIvf => _centroidsPtr != null && _offsetsPtr != null;
     public bool HasIvfBbox => _bboxMinPtr != null && _bboxMaxPtr != null;
     public bool HasPq => _pqCodebooksPtr != null && _pqCodesPtr != null;
@@ -57,6 +61,7 @@ public sealed unsafe class Dataset : IDisposable
         MemoryMappedFile vectorsMmf, MemoryMappedViewAccessor vectorsView,
         MemoryMappedFile labelsMmf, MemoryMappedViewAccessor labelsView,
         MemoryMappedFile? q8Mmf, MemoryMappedViewAccessor? q8View,
+        MemoryMappedFile? q8SoaMmf, MemoryMappedViewAccessor? q8SoaView,
         MemoryMappedFile? centroidsMmf, MemoryMappedViewAccessor? centroidsView,
         MemoryMappedFile? offsetsMmf, MemoryMappedViewAccessor? offsetsView,
         MemoryMappedFile? bboxMinMmf, MemoryMappedViewAccessor? bboxMinView,
@@ -71,6 +76,8 @@ public sealed unsafe class Dataset : IDisposable
         _labelsView = labelsView;
         _q8Mmf = q8Mmf;
         _q8View = q8View;
+        _q8SoaMmf = q8SoaMmf;
+        _q8SoaView = q8SoaView;
         _centroidsMmf = centroidsMmf;
         _centroidsView = centroidsView;
         _offsetsMmf = offsetsMmf;
@@ -101,6 +108,13 @@ public sealed unsafe class Dataset : IDisposable
             byte* q8Base = null;
             _q8View.SafeMemoryMappedViewHandle.AcquirePointer(ref q8Base);
             _q8Ptr = (sbyte*)q8Base;
+        }
+
+        if (_q8SoaView is not null)
+        {
+            byte* q8SoaBase = null;
+            _q8SoaView.SafeMemoryMappedViewHandle.AcquirePointer(ref q8SoaBase);
+            _q8SoaPtr = (sbyte*)q8SoaBase;
         }
 
         if (_centroidsView is not null)
@@ -150,6 +164,7 @@ public sealed unsafe class Dataset : IDisposable
         string vectorsPath,
         string labelsPath,
         string? vectorsQ8Path = null,
+        string? vectorsQ8SoaPath = null,
         string? ivfCentroidsPath = null,
         string? ivfOffsetsPath = null,
         string? ivfBboxMinPath = null,
@@ -186,6 +201,20 @@ public sealed unsafe class Dataset : IDisposable
                 throw new InvalidDataException($"Q8 file size {q8Len} != expected {q8Expected}");
             q8Mmf = MemoryMappedFile.CreateFromFile(vectorsQ8Path, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
             q8View = q8Mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        }
+
+        // J11: SoA layout (14 contiguous N-byte blocks). Cache-friendly for per-dim
+        // streaming with row-survivor compaction (scalar early-abort).
+        MemoryMappedFile? q8SoaMmf = null;
+        MemoryMappedViewAccessor? q8SoaView = null;
+        if (!string.IsNullOrEmpty(vectorsQ8SoaPath) && File.Exists(vectorsQ8SoaPath))
+        {
+            var soaLen = new FileInfo(vectorsQ8SoaPath).Length;
+            long soaExpected = count * Dimensions;
+            if (soaLen != soaExpected)
+                throw new InvalidDataException($"Q8-SoA file size {soaLen} != expected {soaExpected}");
+            q8SoaMmf = MemoryMappedFile.CreateFromFile(vectorsQ8SoaPath, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+            q8SoaView = q8SoaMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         }
 
         MemoryMappedFile? centroidsMmf = null;
@@ -255,7 +284,8 @@ public sealed unsafe class Dataset : IDisposable
 
         return new Dataset(
             vectorsMmf, vectorsView, labelsMmf, labelsView,
-            q8Mmf, q8View, centroidsMmf, centroidsView, offsetsMmf, offsetsView,
+            q8Mmf, q8View, q8SoaMmf, q8SoaView,
+            centroidsMmf, centroidsView, offsetsMmf, offsetsView,
             bboxMinMmf, bboxMinView, bboxMaxMmf, bboxMaxView,
             pqCodebooksMmf, pqCodebooksView, pqCodesMmf, pqCodesView,
             (int)count, numCells, pqM, pqKsub);
@@ -291,6 +321,14 @@ public sealed unsafe class Dataset : IDisposable
         get => _q8Ptr;
     }
 
+    /// <summary>J11: returns a pointer to the SoA Q8 block — concatenated 14 N-byte arrays.
+    /// Dim d's row r value is at offset (long)d * Count + r.</summary>
+    public sbyte* Q8SoaPtr
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _q8SoaPtr;
+    }
+
     public float* CentroidsPtr
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -320,6 +358,7 @@ public sealed unsafe class Dataset : IDisposable
         try { _vectorsView.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _labelsView.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _q8View?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        try { _q8SoaView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _centroidsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _offsetsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _bboxMinView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
@@ -332,6 +371,8 @@ public sealed unsafe class Dataset : IDisposable
         _labelsMmf.Dispose();
         _q8View?.Dispose();
         _q8Mmf?.Dispose();
+        _q8SoaView?.Dispose();
+        _q8SoaMmf?.Dispose();
         _centroidsView?.Dispose();
         _centroidsMmf?.Dispose();
         _offsetsView?.Dispose();

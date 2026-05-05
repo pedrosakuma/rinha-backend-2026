@@ -24,7 +24,7 @@ public static class ScorerFactory
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_EARLY_STOP_PCT"), 75),
                                     Environment.GetEnvironmentVariable("IVF_BBOX_REPAIR") == "1",
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_EARLY_STOP_PCT_EARLY"), 0),
-                                    Environment.GetEnvironmentVariable("IVF_SCALAR_ABORT") == "1"),
+                                    ParseInt(Environment.GetEnvironmentVariable("IVF_SCALAR_ABORT"), 0)),
         "ivfpq"              => new Rinha.Api.Scorers.IvfPqScorer(dataset,
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_NPROBE"), 96),
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_RERANK"), 64)),

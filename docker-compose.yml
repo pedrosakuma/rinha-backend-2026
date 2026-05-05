@@ -25,6 +25,7 @@ services:
       IVF_EARLY_STOP_PCT_EARLY: "${IVF_EARLY_STOP_PCT_EARLY:-0}"
       IVF_BBOX_REPAIR: "${IVF_BBOX_REPAIR:-0}"
       IVF_SCALAR_ABORT: "${IVF_SCALAR_ABORT:-0}"
+      FAST_JSON: "${FAST_JSON:-0}"
     networks: [app]
     deploy:
       resources:
