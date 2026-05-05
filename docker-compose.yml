@@ -21,11 +21,19 @@ services:
       IVF_RERANK: "${IVF_RERANK:-64}"
       Q8_RERANK: "${Q8_RERANK:-32}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
-      # J13: empirical sweep (n=9 each, noise floor σ≈20) shows pct=78 is the optimum.
-      # Baseline (pct=75): mean=5094 (±13). pct=78: mean=5171 (+77, 10.4σ). pct=80:+52, pct=85:+38.
-      # Higher pct → margin gate fires later → more queries pass it → fewer fall to full scan.
-      # Bbox-repair tested in same sweep: ≈neutral on top of pct=78, kept default OFF.
-      IVF_EARLY_STOP_PCT: "${IVF_EARLY_STOP_PCT:-78}"
+      # J14: re-sweep with what-if instrumentation (PROFILE_TIMING=2) reveals plateau
+      # at pct ∈ [70, 75], indistinguishable (Welch p=0.59). pct=72 picked as the centre.
+      # n=5 results (today, σ_baseline≈40):
+      #   pct=60: final 4874 (cauda explode, p99 +35%)
+      #   pct=65: final 5024
+      #   pct=70: final 5110 ← optimum numerical
+      #   pct=75: final 5100 ← tie
+      #   pct=78: final 5059 (previous default)
+      #   pct=85: final 5068
+      # What-if metrics show 95.8% of queries already gate-pass at pct=60 with mean-slack≈2.0,
+      # but bench scoring is dominated by p99: pushing pct too low starves the 4.2% "hard"
+      # queries of CPU under arrival-rate load → cauda piora.
+      IVF_EARLY_STOP_PCT: "${IVF_EARLY_STOP_PCT:-72}"
       IVF_EARLY_STOP_PCT_EARLY: "${IVF_EARLY_STOP_PCT_EARLY:-0}"
       IVF_BBOX_REPAIR: "${IVF_BBOX_REPAIR:-0}"
       # Dormant toggles (rejected experiments, kept as 0 to preserve tested behavior).
