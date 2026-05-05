@@ -97,8 +97,8 @@ public sealed unsafe class IvfScorer : IFraudScorer
         }
 
         int nlist = _dataset.NumCells;
-        Span<float> centDist = stackalloc float[256]; // safe upper bound; nlist ≤ 256 by config
-        if (nlist > 256)
+        Span<float> centDist = stackalloc float[512]; // safe upper bound; nlist ≤ 512 by config
+        if (nlist > 512)
         {
             // Defensive: heap fallback if user changes nlist beyond stack budget.
             centDist = new float[nlist];
@@ -422,8 +422,8 @@ public sealed unsafe class IvfScorer : IFraudScorer
         }
 
         int nlist = _dataset.NumCells;
-        Span<float> centDist = stackalloc float[256];
-        if (nlist > 256) centDist = new float[nlist];
+        Span<float> centDist = stackalloc float[512];
+        if (nlist > 512) centDist = new float[nlist];
 
         // 2) Distances to all centroids.
         fixed (float* qfPtr = paddedQuery)

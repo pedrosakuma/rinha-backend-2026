@@ -122,6 +122,12 @@ if (profile)
     long sTopA = 0, sTopB = 0, sTopC = 0; // top-3 score-times in window (us ticks)
     int rowsTopA = 0, rowsTopB = 0, rowsTopC = 0;
     int modeTopA = 0, modeTopB = 0, modeTopC = 0;
+    // Per-mode latency stats: index 0=full, 1=es1, 2=es2.
+    var modeHist = new long[3, Buckets];
+    var modeCount = new long[3];
+    var modeSumUs = new long[3];
+    var modeMaxUs = new long[3];
+    var modeRowsSum = new long[3];
     var lockObj = new object();
     int Window = whatIfMode ? 1000 : 5000;
     long startupGen0 = GC.CollectionCount(0);
@@ -180,6 +186,13 @@ if (profile)
             if (esMode == 0) modeFull++;
             else if (esMode == 1) modeEarly1++;
             else modeEarly2++;
+            // Per-mode telemetry.
+            int mIdx = esMode == 0 ? 0 : (esMode == 1 ? 1 : 2);
+            modeCount[mIdx]++;
+            modeSumUs[mIdx] += sUs;
+            if (sUs > modeMaxUs[mIdx]) modeMaxUs[mIdx] = sUs;
+            modeRowsSum[mIdx] += rows;
+            modeHist[mIdx, bucket]++;
             // Maintain top-3 by score time, capturing rows + mode of those slow queries.
             if (s > sTopA) { sTopC = sTopB; sTopB = sTopA; sTopA = s;
                              rowsTopC = rowsTopB; rowsTopB = rowsTopA; rowsTopA = rows;
@@ -222,6 +235,8 @@ if (profile)
             long mF, mE1, mE2, rS, rM;
             int rTA, rTB, rTC, mTA, mTB, mTC;
             long[] h = new long[Buckets];
+            long[] mC = new long[3], mSum = new long[3], mMax = new long[3], mRows = new long[3];
+            long[,] mH = new long[3, Buckets];
             long[] wPass = null!, wUna = null!, wFire = null!, wSlkCnt = null!;
             double[] wSlkSum = null!;
             lock (lockObj)
@@ -233,6 +248,15 @@ if (profile)
                 rTA = rowsTopA; rTB = rowsTopB; rTC = rowsTopC;
                 mTA = modeTopA; mTB = modeTopB; mTC = modeTopC;
                 Array.Copy(hist, h, Buckets);
+                for (int mi = 0; mi < 3; mi++)
+                {
+                    mC[mi] = modeCount[mi]; mSum[mi] = modeSumUs[mi];
+                    mMax[mi] = modeMaxUs[mi]; mRows[mi] = modeRowsSum[mi];
+                    for (int b = 0; b < Buckets; b++) mH[mi, b] = modeHist[mi, b];
+                }
+                Array.Clear(modeCount); Array.Clear(modeSumUs);
+                Array.Clear(modeMaxUs); Array.Clear(modeRowsSum);
+                Array.Clear(modeHist);
                 if (whatIfMode)
                 {
                     wPass = (long[])wiPass.Clone();
@@ -278,6 +302,33 @@ if (profile)
                 $"top3=[{tA*f:F0}us r={rTA:N0} m={mTA}] [{tB*f:F0}us r={rTB:N0} m={mTB}] [{tC*f:F0}us r={rTC:N0} m={mTC}] " +
                 $"gc[g0/g1/g2={dG0}/{dG1}/{dG2} alloc={dAlloc/1024}KB] " +
                 $"score-hist[us:{sb}]");
+
+            // Per-mode latency: dump histogram + p50/p99 derived from buckets.
+            string[] modeNames = { "full", "es1", "es2" };
+            for (int mi = 0; mi < 3; mi++)
+            {
+                long mn = mC[mi];
+                if (mn == 0) continue;
+                long target50 = mn / 2, target99 = (mn * 99) / 100;
+                long acc = 0; int p50b = -1, p99b = -1;
+                for (int b = 0; b < Buckets; b++)
+                {
+                    acc += mH[mi, b];
+                    if (p50b < 0 && acc >= target50) p50b = b;
+                    if (p99b < 0 && acc >= target99) { p99b = b; break; }
+                }
+                long p50Lo = p50b < 0 ? 0 : (100L << p50b);
+                long p99Lo = p99b < 0 ? 0 : (100L << p99b);
+                var sbm = new System.Text.StringBuilder();
+                for (int b = 0; b < Buckets; b++)
+                {
+                    sbm.Append(100L << b).Append(':').Append(mH[mi, b]).Append(' ');
+                }
+                Console.WriteLine(
+                    $"  mode={modeNames[mi]} N={mn} mean={mSum[mi]/(double)mn:F0}us " +
+                    $"p50≥{p50Lo}us p99≥{p99Lo}us max={mMax[mi]}us " +
+                    $"rows-avg={mRows[mi]/mn:N0} hist[us:{sbm}]");
+            }
 
             if (whatIfMode)
             {

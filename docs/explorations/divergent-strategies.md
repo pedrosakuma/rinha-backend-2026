@@ -299,3 +299,53 @@ the tail wouldn't move. The real p99 budget lives in the ~4% of queries that
 hit `mode=full` (5–7 ms each on the IVF Q8 scan), not in the request plumbing.
 
 Instrumentation kept behind the `ALLOC_TRACE=1` env flag (zero cost when off).
+
+## J17: Per-mode latency telemetry + cell-size variance attack (REJECTED)
+
+### Discovery: bench p99 IS the worst es2 query, not "hard full-scan queries"
+
+PROFILE_TIMING=1 enriched with per-mode (full/es1/es2) latency histograms. Under
+production k6 load:
+
+mode | N | mean | p99 | max | rows-avg
+---|---|---|---|---|---
+full | 232 (4%) | 2164us | ≥3200us | 4789us | 1,236,784
+es2  | 4768 (95%) | 1737us | ≥3200us | **8074us** | 978,483
+
+Top-3 worst queries in every window are **all `m=2` (es2)**, scanning ~1.4M
+rows each. `vec=3us`, `json=1.5us` — both negligible. Bench p99 (6.4ms) ≈ es2
+worst case → tail is single-query worst-case score time, not queue/contention.
+
+### Hypothesis: cell-size variance drives the tail
+
+256 IVF cells: min=564, median=8686, mean=11718, **max=43874, p99=37250**. The
+14 cells > 30k rows are the source of slow es2 queries — when their nearest
+centroid lands on a heavy cell, that cell alone contributes ~1.5% of dataset.
+
+### Three attacks tried, all rejected
+
+variant | p50 | p99 | det_score | final | Δ vs J14 (5113)
+---|---|---|---|---|---
+**baseline** (nlist=256, slack=0) | 3.07 | 6.36 | ~2820 | 5113 | —
+nlist=384, nProbe=144 | 6.21 | 16.93 | n/a | **4637** | **−476**
+nlist=384, nProbe=96  | 2.61 | 13.70 | n/a | **4670** | **−443**
+slack=0.2 (max cell capped at 14063) | 2.49 | 6.32 | 2630 (fn=9) | **4830** | **−286**
+slack=0.1 (max cell capped at 12891) | 2.41 | 5.46 | 2666 (fp=27,fn=3) | **4923** | **−190**
+
+### Lessons
+
+1. **The variance hypothesis was correct as a latency model**: capping max cell
+   size *does* reduce p99 (5.46ms with slack=0.1 vs 6.36ms baseline).
+2. **But rebalancing clustering harms detection more than it gains in p99**:
+   moving points across natural cluster boundaries pushes some queries' true
+   nearest neighbours out of the visited cells, raising fp/fn. Each FN costs
+   ~80–180 pts; det_score drop of 150–190 dwarfs the latency win.
+3. **nlist increase fails differently**: with nProbe scaled proportionally,
+   per-cell fixed costs multiply; CPU saturates → max es2 explodes to 23ms.
+   With nProbe held constant, coverage-in-rows drops → recall loss + paradox.
+4. The only viable angle for variance reduction would be **post-hoc geometric
+   split of heavy cells** (preserve natural clusters, then 2-way subdivide
+   cells > 30k). That preserves recall but requires preprocessor changes;
+   not attempted in this session.
+
+PROFILE_TIMING=1 per-mode telemetry retained. nlist remained 256, slack remained 0.
