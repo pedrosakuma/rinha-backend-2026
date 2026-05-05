@@ -277,3 +277,25 @@ The 53% the cascade decides are the *easiest* queries (low km_from_home, normal 
 - Score formula is p99-dominated under saturation, so optimisations that reduce mean while accepting higher tail **lose net pts**. Same pattern observed with `IVF_EARLY_STOP_PCT=60` (−184 pts).
 - A useful cascade would have to attack hard queries, not easy ones (e.g. a fast approximate scorer for queries near cluster boundaries, accepting tiny accuracy loss to halve their cost).
 - Kept code in tree as opt-in (`CASCADE=1`) for revisits.
+
+## J16: Alloc tracing (REJECTED — no signal)
+
+Added `ALLOC_TRACE=1` env in fastJson hot path: dumps gen0/1/2 collection counts and `GC.GetTotalAllocatedBytes` deltas every 5000 reqs.
+
+Findings under k6 full-profile load (50,000 requests measured per replica):
+
+window | bytes/req | gen0 | gen1 | gen2
+---|---|---|---|---
+1 (warmup) | 726 | 0 | 0 | 0
+2..10 (steady) | 154-158 | 0 | 0 | 0
+
+**Zero garbage collections of any generation across the entire bench.** The
+fastJson path (PipeReader read → stack-allocated query → hand-written response
+via `BodyWriter`) is already effectively zero-alloc. ServerGC is on, single
+heap (`DOTNET_GCHeapCount=1`).
+
+**Conclusion**: GC/alloc is not a contributor to p99. Even with `bytes_per_req=0`
+the tail wouldn't move. The real p99 budget lives in the ~4% of queries that
+hit `mode=full` (5–7 ms each on the IVF Q8 scan), not in the request plumbing.
+
+Instrumentation kept behind the `ALLOC_TRACE=1` env flag (zero cost when off).

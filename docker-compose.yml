@@ -43,6 +43,7 @@ services:
       IVF_DENSITY_ORDER: "${IVF_DENSITY_ORDER:-0}"
       FAST_JSON: "${FAST_JSON:-0}"
       PROFILE_TIMING: "${PROFILE_TIMING:-0}"
+      ALLOC_TRACE: "${ALLOC_TRACE:-0}"
     networks: [app]
     deploy:
       resources:

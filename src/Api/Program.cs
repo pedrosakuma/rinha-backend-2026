@@ -325,6 +325,13 @@ else if (fastJson)
 {
     // J11c: bypass model binding entirely. Read raw body bytes via PipeReader,
     // parse straight into a Span<float>, write the response by hand.
+
+    // Optional GC/alloc telemetry: ALLOC_TRACE=1 dumps gen0/1/2 + bytes per 5000 reqs.
+    var allocTrace = Environment.GetEnvironmentVariable("ALLOC_TRACE") == "1";
+    long _atN = 0;
+    long _atG0 = GC.CollectionCount(0), _atG1 = GC.CollectionCount(1), _atG2 = GC.CollectionCount(2);
+    long _atAlloc = GC.GetTotalAllocatedBytes(precise: false);
+    var _atLock = new object();
     app.MapPost("/fraud-score", async (HttpContext ctx) =>
     {
         var pipe = ctx.Request.BodyReader;
@@ -395,6 +402,30 @@ else if (fastJson)
         outSpan[o++] = (byte)'}';
         bw.Advance(o);
         await bw.FlushAsync();
+
+        if (allocTrace)
+        {
+            bool dump = false;
+            long g0=0, g1=0, g2=0, dAlloc=0, N=0;
+            lock (_atLock)
+            {
+                _atN++;
+                if (_atN >= 5000)
+                {
+                    long ng0 = GC.CollectionCount(0), ng1 = GC.CollectionCount(1), ng2 = GC.CollectionCount(2);
+                    long nAlloc = GC.GetTotalAllocatedBytes(precise: false);
+                    g0 = ng0 - _atG0; g1 = ng1 - _atG1; g2 = ng2 - _atG2;
+                    dAlloc = nAlloc - _atAlloc;
+                    N = _atN;
+                    _atG0 = ng0; _atG1 = ng1; _atG2 = ng2; _atAlloc = nAlloc; _atN = 0;
+                    dump = true;
+                }
+            }
+            if (dump)
+            {
+                Console.WriteLine($"[alloc N={N}] gc[g0/g1/g2={g0}/{g1}/{g2}] alloc={dAlloc/1024}KB total={dAlloc} bytes_per_req={dAlloc/(double)N:F1}");
+            }
+        }
     });
 }
 else
