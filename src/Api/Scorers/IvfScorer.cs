@@ -62,6 +62,17 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private static readonly bool s_earlyMajority =
         Environment.GetEnvironmentVariable("IVF_EARLY_MAJORITY") == "1";
 
+    // J22: anytime/deadline scan — when set, the *tail* Q8 scan (post-checkpoint, after
+    // early-stop fails) cuts off after this many microseconds from query start. Returns
+    // an approximate top-K based on cells visited so far. Env: IVF_DEADLINE_US (0 = off).
+    private static readonly long s_deadlineTicks = ComputeDeadlineTicks();
+    private static long ComputeDeadlineTicks()
+    {
+        var s = Environment.GetEnvironmentVariable("IVF_DEADLINE_US");
+        if (string.IsNullOrEmpty(s) || !int.TryParse(s, out var us) || us <= 0) return 0;
+        return us * System.Diagnostics.Stopwatch.Frequency / 1_000_000L;
+    }
+
     public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
@@ -88,6 +99,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
 
         LastEarlyStopMode = 0;
         LastRowsScanned = 0;
+        long deadlineAt = s_deadlineTicks > 0
+            ? System.Diagnostics.Stopwatch.GetTimestamp() + s_deadlineTicks
+            : 0;
 
         // 1) Quantize query to int8.
         Span<sbyte> qQ8 = stackalloc sbyte[PaddedDimensions];
@@ -254,7 +268,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                         }
                         else
                         {
-                            ScanCellsQ8Avx2Range(qPtr, cells, checkpoint, _nProbe, offsets, candDist, candIdx, ref q8Worst);
+                            ScanCellsQ8Avx2RangeDeadline(qPtr, cells, checkpoint, _nProbe, offsets, candDist, candIdx, ref q8Worst, deadlineAt);
                         }
                     }
                     else if (!earlyStopped)
@@ -611,6 +625,48 @@ public sealed unsafe class IvfScorer : IFraudScorer
         sbyte* qPtr, ReadOnlySpan<int> cells, int* offsets,
         Span<int> candDist, Span<int> candIdx, ref int worstRef)
         => ScanCellsQ8Avx2Range(qPtr, cells, 0, cells.Length, offsets, candDist, candIdx, ref worstRef);
+
+    private void ScanCellsQ8Avx2RangeDeadline(
+        sbyte* qPtr, ReadOnlySpan<int> cells, int ciStart, int ciEnd, int* offsets,
+        Span<int> candDist, Span<int> candIdx, ref int worstRef, long deadlineAt)
+    {
+        if (deadlineAt == 0 || _scalarAbort != 0)
+        {
+            ScanCellsQ8Avx2Range(qPtr, cells, ciStart, ciEnd, offsets, candDist, candIdx, ref worstRef);
+            return;
+        }
+        var qLow = Vector128.Load(qPtr);
+        var qWide = Vector256.WidenLower(qLow.ToVector256());
+        var sbase = _dataset.Q8VectorsPtr;
+        int worst = worstRef;
+        int rowsScanned = 0;
+        for (int ci = ciStart; ci < ciEnd; ci++)
+        {
+            int c = cells[ci];
+            if (c < 0) break;
+            // Deadline check at cell boundary (~µs granularity, cheap RDTSC).
+            if (System.Diagnostics.Stopwatch.GetTimestamp() > deadlineAt) break;
+            int start = offsets[c];
+            int end = offsets[c + 1];
+            rowsScanned += end - start;
+            for (int i = start; i < end; i++)
+            {
+                sbyte* row = sbase + (long)i * PaddedDimensions;
+                var r128 = Vector128.Load(row);
+                var rWide = Vector256.WidenLower(r128.ToVector256());
+                var diff = rWide - qWide;
+                var prod = Avx2.MultiplyAddAdjacent(diff, diff);
+                int dist = Vector256.Sum(prod);
+                if (dist < worst)
+                {
+                    InsertTopKInt(candDist, candIdx, dist, i);
+                    worst = candDist[candDist.Length - 1];
+                }
+            }
+        }
+        worstRef = worst;
+        LastRowsScanned += rowsScanned;
+    }
 
     private void ScanCellsQ8Avx2Range(
         sbyte* qPtr, ReadOnlySpan<int> cells, int ciStart, int ciEnd, int* offsets,

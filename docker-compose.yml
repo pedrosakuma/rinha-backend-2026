@@ -20,6 +20,7 @@ services:
       LIFO_LIMIT: "${LIFO_LIMIT:-0}"
       LIFO_QUEUE: "${LIFO_QUEUE:-32}"
       IVF_EARLY_MAJORITY: "${IVF_EARLY_MAJORITY:-0}"
+      IVF_DEADLINE_US: "${IVF_DEADLINE_US:-0}"
       SCORER: "${SCORER:-ivf}"
       IVF_NPROBE: "${IVF_NPROBE:-96}"
       IVF_RERANK: "${IVF_RERANK:-64}"
