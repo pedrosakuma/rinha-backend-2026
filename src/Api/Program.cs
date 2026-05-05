@@ -104,6 +104,34 @@ if (Environment.GetEnvironmentVariable("WARMUP") != "0")
 
 var app = builder.Build();
 
+// J20: LIFO concurrency limiter — admission control to defeat the "bench paradox".
+// k6 ramping-arrival-rate floods VUs as soon as queue drains; serving "newest first"
+// (LIFO) means in-progress requests finish under their deadline while old queued
+// requests are dropped fast. PermitLimit matches CPU/threadpool budget per replica.
+var lifoLimitEnv = Environment.GetEnvironmentVariable("LIFO_LIMIT");
+if (!string.IsNullOrEmpty(lifoLimitEnv) && int.TryParse(lifoLimitEnv, out var lifoPermits) && lifoPermits > 0)
+{
+    var lifoQueue = int.TryParse(Environment.GetEnvironmentVariable("LIFO_QUEUE"), out var q) ? q : 32;
+    var limiter = new System.Threading.RateLimiting.ConcurrencyLimiter(
+        new System.Threading.RateLimiting.ConcurrencyLimiterOptions
+        {
+            PermitLimit = lifoPermits,
+            QueueLimit = lifoQueue,
+            QueueProcessingOrder = System.Threading.RateLimiting.QueueProcessingOrder.NewestFirst,
+        });
+    Console.WriteLine($"LIFO admission: permits={lifoPermits} queue={lifoQueue}");
+    app.Use(async (ctx, next) =>
+    {
+        using var lease = await limiter.AcquireAsync(1, ctx.RequestAborted).ConfigureAwait(false);
+        if (!lease.IsAcquired)
+        {
+            ctx.Response.StatusCode = 503;
+            return;
+        }
+        await next(ctx).ConfigureAwait(false);
+    });
+}
+
 app.MapGet("/ready", () => Results.Ok());
 
 var profileEnv = Environment.GetEnvironmentVariable("PROFILE_TIMING");

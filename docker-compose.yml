@@ -17,6 +17,8 @@ services:
       DOTNET_gcServer: "${DOTNET_GCSERVER:-0}"
       DOTNET_GCConserveMemory: "9"
       DOTNET_PROCESSOR_COUNT: "1"
+      LIFO_LIMIT: "${LIFO_LIMIT:-0}"
+      LIFO_QUEUE: "${LIFO_QUEUE:-32}"
       SCORER: "${SCORER:-ivf}"
       IVF_NPROBE: "${IVF_NPROBE:-96}"
       IVF_RERANK: "${IVF_RERANK:-64}"
