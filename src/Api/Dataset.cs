@@ -160,6 +160,86 @@ public sealed unsafe class Dataset : IDisposable
         }
     }
 
+    /// <summary>
+    /// Pre-touch all mmap-backed pages so the first user requests don't pay
+    /// minor page-fault overhead. Reads one byte per 4KB page across every
+    /// view that was actually opened. Returns the total bytes scanned.
+    /// </summary>
+    public long Prefetch()
+    {
+        const int PageSize = 4096;
+        long total = 0;
+        long sink = 0;
+
+        long vBytes = (long)Count * PaddedDimensions * sizeof(float);
+        sink += TouchPages((byte*)_vectorsPtr, vBytes, PageSize);
+        total += vBytes;
+
+        long lBytes = Count;
+        sink += TouchPages(_labelsPtr, lBytes, PageSize);
+        total += lBytes;
+
+        if (_q8Ptr != null)
+        {
+            long bytes = (long)Count * 16; // q8 row stride = PaddedDimensions (16)
+            sink += TouchPages((byte*)_q8Ptr, bytes, PageSize);
+            total += bytes;
+        }
+        if (_q8SoaPtr != null)
+        {
+            long bytes = (long)Count * Dimensions;
+            sink += TouchPages((byte*)_q8SoaPtr, bytes, PageSize);
+            total += bytes;
+        }
+        if (_centroidsPtr != null)
+        {
+            long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+            sink += TouchPages((byte*)_centroidsPtr, bytes, PageSize);
+            total += bytes;
+        }
+        if (_offsetsPtr != null)
+        {
+            long bytes = (long)(NumCells + 1) * sizeof(int);
+            sink += TouchPages((byte*)_offsetsPtr, bytes, PageSize);
+            total += bytes;
+        }
+        if (_bboxMinPtr != null)
+        {
+            long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+            sink += TouchPages((byte*)_bboxMinPtr, bytes, PageSize);
+            total += bytes;
+        }
+        if (_bboxMaxPtr != null)
+        {
+            long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+            sink += TouchPages((byte*)_bboxMaxPtr, bytes, PageSize);
+            total += bytes;
+        }
+        if (_pqCodebooksPtr != null)
+        {
+            long bytes = (long)PqM * PqKsub * (Dimensions / PqM) * sizeof(float);
+            sink += TouchPages((byte*)_pqCodebooksPtr, bytes, PageSize);
+            total += bytes;
+        }
+        if (_pqCodesPtr != null)
+        {
+            long bytes = (long)Count * PqM;
+            sink += TouchPages(_pqCodesPtr, bytes, PageSize);
+            total += bytes;
+        }
+
+        GC.KeepAlive(sink);
+        return total;
+    }
+
+    private static long TouchPages(byte* p, long bytes, int pageSize)
+    {
+        long acc = 0;
+        for (long i = 0; i < bytes; i += pageSize) acc += p[i];
+        if (bytes > 0) acc += p[bytes - 1];
+        return acc;
+    }
+
     public static Dataset Open(
         string vectorsPath,
         string labelsPath,

@@ -62,6 +62,30 @@ var fastJson = Environment.GetEnvironmentVariable("FAST_JSON") == "1";
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
 
+// Pre-touch all mmap pages and run a JIT warm-up so the first user requests
+// don't pay page-fault or tier0->tier1 jit overhead. Disable with WARMUP=0.
+if (Environment.GetEnvironmentVariable("WARMUP") != "0")
+{
+    var swPre = System.Diagnostics.Stopwatch.StartNew();
+    long touched = dataset.Prefetch();
+    swPre.Stop();
+    var swJit = System.Diagnostics.Stopwatch.StartNew();
+    int warmupIters = int.TryParse(Environment.GetEnvironmentVariable("WARMUP_ITERS"), out var _wi) && _wi > 0 ? _wi : 64;
+    Span<float> warmQ = stackalloc float[Dataset.Dimensions];
+    var rng = new Random(20260505);
+    float warmSink = 0;
+    for (int i = 0; i < warmupIters; i++)
+    {
+        for (int d = 0; d < Dataset.Dimensions; d++)
+            warmQ[d] = (float)(rng.NextDouble() * 2 - 1);
+        warmSink += scorer.Score(warmQ);
+    }
+    swJit.Stop();
+    GC.KeepAlive(warmSink);
+    Console.WriteLine($"Warm-up: prefetch={touched / (1024 * 1024)}MiB in {swPre.ElapsedMilliseconds}ms, " +
+                      $"jit={warmupIters} iters in {swJit.ElapsedMilliseconds}ms.");
+}
+
 var app = builder.Build();
 
 app.MapGet("/ready", () => Results.Ok());
@@ -71,8 +95,22 @@ if (profile)
 {
     long n = 0, vSum = 0, sSum = 0, jSum = 0;
     long vMax = 0, sMax = 0, jMax = 0;
+    long modeFull = 0, modeEarly1 = 0, modeEarly2 = 0;
+    long rowsSum = 0, rowsMax = 0;
+    // Score-time histogram: log-scale buckets (us). Bucket i covers [2^i * 100us, 2^(i+1) * 100us).
+    // 12 buckets cover 100us..409.6ms.
+    const int Buckets = 12;
+    var hist = new long[Buckets];
+    long sTopA = 0, sTopB = 0, sTopC = 0; // top-3 score-times in window (us ticks)
+    int rowsTopA = 0, rowsTopB = 0, rowsTopC = 0;
+    int modeTopA = 0, modeTopB = 0, modeTopC = 0;
     var lockObj = new object();
     const int Window = 5000;
+    long startupGen0 = GC.CollectionCount(0);
+    long startupGen1 = GC.CollectionCount(1);
+    long startupGen2 = GC.CollectionCount(2);
+    long lastGen0 = startupGen0, lastGen1 = startupGen1, lastGen2 = startupGen2;
+    long lastAlloc = GC.GetTotalAllocatedBytes(precise: false);
     app.MapPost("/fraud-score", (FraudRequest request) =>
     {
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -81,10 +119,18 @@ if (profile)
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         var score = scorer.Score(query);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        // Read scorer telemetry (thread-static, set by IvfScorer).
+        int esMode = Rinha.Api.Scorers.IvfScorer.LastEarlyStopMode;
+        int rows = Rinha.Api.Scorers.IvfScorer.LastRowsScanned;
         var resp = Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
         long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
 
         long v = t1 - t0, s = t2 - t1, j = t3 - t2;
+        // Convert score-ticks to us for histogram bucket selection.
+        long sUs = s * 1_000_000 / System.Diagnostics.Stopwatch.Frequency;
+        int bucket = sUs <= 0 ? 0 : System.Numerics.BitOperations.Log2((ulong)Math.Max(1, sUs / 100));
+        if (bucket >= Buckets) bucket = Buckets - 1;
+
         bool flush = false;
         lock (lockObj)
         {
@@ -93,21 +139,69 @@ if (profile)
             if (v > vMax) vMax = v;
             if (s > sMax) sMax = s;
             if (j > jMax) jMax = j;
+            hist[bucket]++;
+            rowsSum += rows;
+            if (rows > rowsMax) rowsMax = rows;
+            if (esMode == 0) modeFull++;
+            else if (esMode == 1) modeEarly1++;
+            else modeEarly2++;
+            // Maintain top-3 by score time, capturing rows + mode of those slow queries.
+            if (s > sTopA) { sTopC = sTopB; sTopB = sTopA; sTopA = s;
+                             rowsTopC = rowsTopB; rowsTopB = rowsTopA; rowsTopA = rows;
+                             modeTopC = modeTopB; modeTopB = modeTopA; modeTopA = esMode; }
+            else if (s > sTopB) { sTopC = sTopB; sTopB = s;
+                                  rowsTopC = rowsTopB; rowsTopB = rows;
+                                  modeTopC = modeTopB; modeTopB = esMode; }
+            else if (s > sTopC) { sTopC = s; rowsTopC = rows; modeTopC = esMode; }
             if (n >= Window) flush = true;
         }
         if (flush)
         {
-            long N, vS, sS, jS, vM, sM, jM;
+            long N, vS, sS, jS, vM, sM, jM, tA, tB, tC;
+            long mF, mE1, mE2, rS, rM;
+            int rTA, rTB, rTC, mTA, mTB, mTC;
+            long[] h = new long[Buckets];
             lock (lockObj)
             {
                 N = n; vS = vSum; sS = sSum; jS = jSum; vM = vMax; sM = sMax; jM = jMax;
+                tA = sTopA; tB = sTopB; tC = sTopC;
+                mF = modeFull; mE1 = modeEarly1; mE2 = modeEarly2;
+                rS = rowsSum; rM = rowsMax;
+                rTA = rowsTopA; rTB = rowsTopB; rTC = rowsTopC;
+                mTA = modeTopA; mTB = modeTopB; mTC = modeTopC;
+                Array.Copy(hist, h, Buckets);
                 n = 0; vSum = sSum = jSum = 0; vMax = sMax = jMax = 0;
+                sTopA = sTopB = sTopC = 0;
+                rowsSum = rowsMax = 0;
+                modeFull = modeEarly1 = modeEarly2 = 0;
+                rowsTopA = rowsTopB = rowsTopC = 0;
+                modeTopA = modeTopB = modeTopC = 0;
+                Array.Clear(hist, 0, Buckets);
             }
+            // GC delta in window.
+            long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+            long alloc = GC.GetTotalAllocatedBytes(precise: false);
+            long dG0 = g0 - lastGen0, dG1 = g1 - lastGen1, dG2 = g2 - lastGen2;
+            long dAlloc = alloc - lastAlloc;
+            lastGen0 = g0; lastGen1 = g1; lastGen2 = g2; lastAlloc = alloc;
+
             double f = 1e6 / System.Diagnostics.Stopwatch.Frequency;
+            // Build histogram string: bucket boundaries in us.
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < Buckets; i++)
+            {
+                long lo = 100L << i;
+                sb.Append(lo).Append(':').Append(h[i]).Append(' ');
+            }
             Console.WriteLine(
                 $"[timing N={N}] vec={vS*f/N:F1}us(max {vM*f:F1}) " +
                 $"score={sS*f/N:F1}us(max {sM*f:F1}) " +
-                $"json={jS*f/N:F1}us(max {jM*f:F1})");
+                $"json={jS*f/N:F1}us(max {jM*f:F1}) " +
+                $"rows-avg={rS/N:N0}/max={rM:N0} " +
+                $"mode[full={mF * 100 / N}% es1={mE1 * 100 / N}% es2={mE2 * 100 / N}%] " +
+                $"top3=[{tA*f:F0}us r={rTA:N0} m={mTA}] [{tB*f:F0}us r={rTB:N0} m={mTB}] [{tC*f:F0}us r={rTC:N0} m={mTC}] " +
+                $"gc[g0/g1/g2={dG0}/{dG1}/{dG2} alloc={dAlloc/1024}KB] " +
+                $"score-hist[us:{sb}]");
         }
         return resp;
     });

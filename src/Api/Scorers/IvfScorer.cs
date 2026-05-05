@@ -33,8 +33,15 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly int _earlyStopPctEarly; // J9: optional 2nd, earlier checkpoint (e.g. 25). 0 = disabled.
     private readonly bool _bboxRepair; // J6: bbox LB exact repair
     private readonly int _scalarAbort; // 0=off, 1=AoS dim-unroll (J10), 2=SoA survivor compaction (J11)
+    private readonly bool _densityOrder; // J12a: reorder visited cells (within early-stop block) by size desc
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0)
+    /// <summary>Per-thread last-query telemetry. 0=full scan, 1=early stop at early checkpoint,
+    /// 2=early stop at main checkpoint. Updated after each Score() call.</summary>
+    [ThreadStatic] public static int LastEarlyStopMode;
+    /// <summary>Per-thread total Q8 rows scanned in the last query (sum of cell sizes scanned).</summary>
+    [ThreadStatic] public static int LastRowsScanned;
+
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -50,12 +57,16 @@ public sealed unsafe class IvfScorer : IFraudScorer
         // Mode 2 (SoA) requires Q8-SoA file; silently downgrade if missing.
         if (scalarAbort == 2 && !dataset.HasQ8Soa) scalarAbort = 0;
         _scalarAbort = scalarAbort is >= 0 and <= 2 ? scalarAbort : 0;
+        _densityOrder = densityOrder;
     }
 
     public float Score(ReadOnlySpan<float> query)
     {
         if (query.Length < Dataset.Dimensions)
             throw new ArgumentException("Query vector too small", nameof(query));
+
+        LastEarlyStopMode = 0;
+        LastRowsScanned = 0;
 
         // 1) Quantize query to int8.
         Span<sbyte> qQ8 = stackalloc sbyte[PaddedDimensions];
@@ -147,6 +158,31 @@ public sealed unsafe class IvfScorer : IFraudScorer
                     int earlyCheckpoint = (_nProbe * _earlyStopPctEarly) / 100;
                     int curStart = 0;
 
+                    // J12a: optionally reorder cells inside the pre-checkpoint block by
+                    // size desc, so dense cells contribute candidates earliest. The gate
+                    // invariant uses cellsDist[checkpoint] (a value, not an index relation),
+                    // so permuting cells[0..checkpoint) leaves it intact.
+                    if (_densityOrder && checkpoint > 1)
+                    {
+                        var offs = _dataset.CellOffsetsPtr;
+                        // Insertion sort by descending cell size within [0..checkpoint).
+                        for (int i = 1; i < checkpoint; i++)
+                        {
+                            int ci = cells[i];
+                            int szi = (int)(offs[ci + 1] - offs[ci]);
+                            int j = i - 1;
+                            while (j >= 0)
+                            {
+                                int cj = cells[j];
+                                int szj = (int)(offs[cj + 1] - offs[cj]);
+                                if (szj >= szi) break;
+                                cells[j + 1] = cj;
+                                j--;
+                            }
+                            cells[j + 1] = ci;
+                        }
+                    }
+
                     // J9: optional very-early checkpoint (e.g. 25%) with the same margin rule.
                     // Saves ~50-70% of Q8 scan on "easy" queries (clear class, big margin).
                     if (earlyCheckpoint >= 1 && earlyCheckpoint < checkpoint)
@@ -165,6 +201,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                         if (marginOk0)
                         {
                             earlyStopped = true;
+                            LastEarlyStopMode = 1;
                         }
                         else
                         {
@@ -192,6 +229,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                         if (marginOk)
                         {
                             earlyStopped = true;
+                            LastEarlyStopMode = 2;
                         }
                         else
                         {
@@ -344,6 +382,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
         var qWide = Vector256.WidenLower(qLow.ToVector256());
         var sbase = _dataset.Q8VectorsPtr;
         int worst = worstRef;
+        int rowsScanned = 0;
 
         for (int ci = ciStart; ci < ciEnd; ci++)
         {
@@ -351,6 +390,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
             if (c < 0) break;
             int start = offsets[c];
             int end = offsets[c + 1];
+            rowsScanned += end - start;
             for (int i = start; i < end; i++)
             {
                 sbyte* row = sbase + (long)i * PaddedDimensions;
@@ -367,6 +407,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
             }
         }
         worstRef = worst;
+        LastRowsScanned += rowsScanned;
     }
 
     /// <summary>
