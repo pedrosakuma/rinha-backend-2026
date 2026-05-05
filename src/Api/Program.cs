@@ -2,6 +2,13 @@ using Rinha.Api;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using System.IO.Pipelines;
 
+// J19: pin ThreadPool to match cgroup CPU quota (0.45 cpu × 2 replicas).
+// Hill-climbing can inject extra workers that fight over the fractional quota,
+// adding context-switch overhead (~5-10us) directly to p99. With CPU-bound
+// scoring and no blocking I/O, 1 worker + 1 IO thread is the right shape.
+ThreadPool.SetMinThreads(workerThreads: 1, completionPortThreads: 1);
+ThreadPool.SetMaxThreads(workerThreads: 2, completionPortThreads: 2);
+
 var builder = WebApplication.CreateSlimBuilder(args);
 
 builder.Logging.ClearProviders();
