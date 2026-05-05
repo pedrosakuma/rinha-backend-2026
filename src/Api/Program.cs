@@ -90,7 +90,16 @@ var app = builder.Build();
 
 app.MapGet("/ready", () => Results.Ok());
 
-var profile = Environment.GetEnvironmentVariable("PROFILE_TIMING") == "1";
+var profileEnv = Environment.GetEnvironmentVariable("PROFILE_TIMING");
+var profile = profileEnv == "1" || profileEnv == "2";
+var whatIfMode = profileEnv == "2";
+
+// Initialise cell-visit counter when in what-if mode (one entry per cell).
+if (whatIfMode && dataset.HasIvf)
+{
+    Rinha.Api.Scorers.IvfScorer.CellVisits = new int[dataset.NumCells];
+}
+
 if (profile)
 {
     long n = 0, vSum = 0, sSum = 0, jSum = 0;
@@ -105,19 +114,36 @@ if (profile)
     int rowsTopA = 0, rowsTopB = 0, rowsTopC = 0;
     int modeTopA = 0, modeTopB = 0, modeTopC = 0;
     var lockObj = new object();
-    const int Window = 5000;
+    int Window = whatIfMode ? 1000 : 5000;
     long startupGen0 = GC.CollectionCount(0);
     long startupGen1 = GC.CollectionCount(1);
     long startupGen2 = GC.CollectionCount(2);
     long lastGen0 = startupGen0, lastGen1 = startupGen1, lastGen2 = startupGen2;
     long lastAlloc = GC.GetTotalAllocatedBytes(precise: false);
+
+    // What-if aggregator (active only when whatIfMode). Per-pct counts of: queries that would
+    // have passed the early-stop gate (margin AND unanimous), queries that would have been
+    // unanimous regardless of margin, and slack-sum (only counted when slack is finite).
+    int wiPctCount = Rinha.Api.Scorers.IvfScorer.WhatIfPcts.Length;
+    var wiPass      = new long[wiPctCount];
+    var wiUnanimous = new long[wiPctCount];
+    var wiSlackSum  = new double[wiPctCount];
+    var wiSlackCnt  = new long[wiPctCount];
+    // "earliest pct that fires" histogram: index = pct slot, value = how many queries
+    // would have early-stopped first at that pct. Queries that never fire land in the
+    // 'never' bucket.
+    var wiFirstFire = new long[wiPctCount + 1]; // last slot = 'never'
     app.MapPost("/fraud-score", (FraudRequest request) =>
     {
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         Span<float> query = stackalloc float[Dataset.Dimensions];
         vectorizer.Vectorize(request, query);
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-        var score = scorer.Score(query);
+        float score;
+        if (whatIfMode && scorer is Rinha.Api.Scorers.IvfScorer ivfScorer)
+            score = ivfScorer.ScoreWithWhatIf(query);
+        else
+            score = scorer.Score(query);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         // Read scorer telemetry (thread-static, set by IvfScorer).
         int esMode = Rinha.Api.Scorers.IvfScorer.LastEarlyStopMode;
@@ -153,6 +179,32 @@ if (profile)
                                   rowsTopC = rowsTopB; rowsTopB = rows;
                                   modeTopC = modeTopB; modeTopB = esMode; }
             else if (s > sTopC) { sTopC = s; rowsTopC = rows; modeTopC = esMode; }
+            if (whatIfMode)
+            {
+                var passArr = Rinha.Api.Scorers.IvfScorer.LastWhatIfPass;
+                var slkArr  = Rinha.Api.Scorers.IvfScorer.LastWhatIfSlack;
+                var unaArr  = Rinha.Api.Scorers.IvfScorer.LastWhatIfUnanimous;
+                if (passArr is not null && slkArr is not null && unaArr is not null)
+                {
+                    int firstFire = wiPctCount; // 'never' bucket
+                    for (int p = 0; p < wiPctCount; p++)
+                    {
+                        if (passArr[p] != 0)
+                        {
+                            wiPass[p]++;
+                            if (firstFire == wiPctCount) firstFire = p;
+                        }
+                        if (unaArr[p] != 0) wiUnanimous[p]++;
+                        float sl = slkArr[p];
+                        if (!float.IsNegativeInfinity(sl) && !float.IsNaN(sl))
+                        {
+                            wiSlackSum[p] += sl;
+                            wiSlackCnt[p]++;
+                        }
+                    }
+                    wiFirstFire[firstFire]++;
+                }
+            }
             if (n >= Window) flush = true;
         }
         if (flush)
@@ -161,6 +213,8 @@ if (profile)
             long mF, mE1, mE2, rS, rM;
             int rTA, rTB, rTC, mTA, mTB, mTC;
             long[] h = new long[Buckets];
+            long[] wPass = null!, wUna = null!, wFire = null!, wSlkCnt = null!;
+            double[] wSlkSum = null!;
             lock (lockObj)
             {
                 N = n; vS = vSum; sS = sSum; jS = jSum; vM = vMax; sM = sMax; jM = jMax;
@@ -170,6 +224,19 @@ if (profile)
                 rTA = rowsTopA; rTB = rowsTopB; rTC = rowsTopC;
                 mTA = modeTopA; mTB = modeTopB; mTC = modeTopC;
                 Array.Copy(hist, h, Buckets);
+                if (whatIfMode)
+                {
+                    wPass = (long[])wiPass.Clone();
+                    wUna  = (long[])wiUnanimous.Clone();
+                    wFire = (long[])wiFirstFire.Clone();
+                    wSlkSum = (double[])wiSlackSum.Clone();
+                    wSlkCnt = (long[])wiSlackCnt.Clone();
+                    Array.Clear(wiPass);
+                    Array.Clear(wiUnanimous);
+                    Array.Clear(wiFirstFire);
+                    Array.Clear(wiSlackSum);
+                    Array.Clear(wiSlackCnt);
+                }
                 n = 0; vSum = sSum = jSum = 0; vMax = sMax = jMax = 0;
                 sTopA = sTopB = sTopC = 0;
                 rowsSum = rowsMax = 0;
@@ -202,6 +269,45 @@ if (profile)
                 $"top3=[{tA*f:F0}us r={rTA:N0} m={mTA}] [{tB*f:F0}us r={rTB:N0} m={mTB}] [{tC*f:F0}us r={rTC:N0} m={mTC}] " +
                 $"gc[g0/g1/g2={dG0}/{dG1}/{dG2} alloc={dAlloc/1024}KB] " +
                 $"score-hist[us:{sb}]");
+
+            if (whatIfMode)
+            {
+                var pcts = Rinha.Api.Scorers.IvfScorer.WhatIfPcts;
+                var sbWi = new System.Text.StringBuilder();
+                sbWi.Append("[whatif N=").Append(N).Append("] pct gate-pass% unanimous% mean-slack first-fire%\n");
+                for (int p = 0; p < pcts.Length; p++)
+                {
+                    double gatePct = N == 0 ? 0 : 100.0 * wPass[p] / N;
+                    double unaPct  = N == 0 ? 0 : 100.0 * wUna[p] / N;
+                    double meanSlk = wSlkCnt[p] == 0 ? 0 : wSlkSum[p] / wSlkCnt[p];
+                    double firePct = N == 0 ? 0 : 100.0 * wFire[p] / N;
+                    sbWi.Append($"  pct={pcts[p],3} {gatePct,7:F1}%  {unaPct,7:F1}%  {meanSlk,+9:F4}  {firePct,7:F1}%\n");
+                }
+                double neverPct = N == 0 ? 0 : 100.0 * wFire[pcts.Length] / N;
+                sbWi.Append($"  pct=---     ---       ---       ---       {neverPct,7:F1}%  (never fires)\n");
+
+                // Estimate score for each pct: approximate scan_us using mode breakdown of CURRENT
+                // config (not pct-specific yet — refine in next iteration). For now, just note that
+                // higher first-fire% at smaller pct = lower expected p99.
+                Console.WriteLine(sbWi.ToString().TrimEnd());
+
+                // Cell-visit hot/cold summary.
+                var visits = Rinha.Api.Scorers.IvfScorer.CellVisits;
+                if (visits is not null)
+                {
+                    long total = 0, max = 0, min = long.MaxValue, zero = 0;
+                    for (int i = 0; i < visits.Length; i++)
+                    {
+                        long cv = visits[i];
+                        total += cv;
+                        if (cv > max) max = cv;
+                        if (cv < min) min = cv;
+                        if (cv == 0) zero++;
+                    }
+                    double avg = (double)total / Math.Max(1, visits.Length);
+                    Console.WriteLine($"[whatif N={N}] cells visited: avg={avg:F0} min={min} max={max} unused-cells={zero}/{visits.Length}");
+                }
+            }
         }
         return resp;
     });

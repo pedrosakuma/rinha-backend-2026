@@ -41,6 +41,8 @@ out_path, *paths = sys.argv[1:]
 runs = [json.load(open(p)) for p in paths]
 
 def med(vals): return round(statistics.median(vals), 2)
+def mean(vals): return round(statistics.mean(vals), 2)
+def sdev(vals): return round(statistics.stdev(vals), 2) if len(vals) >= 2 else 0.0
 
 p50 = med([r["latency"]["p50"] for r in runs])
 p90 = med([r["latency"]["p90"] for r in runs])
@@ -64,11 +66,14 @@ agg = {
         "p99_score":       {"value": med(p99_scores)},
         "detection_score": {"value": med(det_scores)},
         "final_score":     med(final_scores),
+        "final_mean":      mean(final_scores),
+        "final_stddev":    sdev(final_scores),
         "breakdown":       {"fp": fps, "fn": fns, "http_errors": errs},
         "per_run_final":   final_scores,
     },
 }
 json.dump(agg, open(out_path, "w"), indent=2)
 print(f"wrote {out_path}")
-print(f"median p50={p50}ms p90={p90}ms p99={p99}ms final_score={agg['scoring']['final_score']}")
+print(f"median p50={p50}ms p90={p90}ms p99={p99}ms final={agg['scoring']['final_score']} "
+      f"mean={agg['scoring']['final_mean']} σ={agg['scoring']['final_stddev']}")
 PY

@@ -41,6 +41,22 @@ public sealed unsafe class IvfScorer : IFraudScorer
     /// <summary>Per-thread total Q8 rows scanned in the last query (sum of cell sizes scanned).</summary>
     [ThreadStatic] public static int LastRowsScanned;
 
+    // ---------------- What-if instrumentation (PROFILE_TIMING=2) -----------------
+    /// <summary>Candidate checkpoint percentages probed by ScoreWhatIf. Programmatically
+    /// chosen to cover the empirically interesting band. Order matters for table output.</summary>
+    public static readonly int[] WhatIfPcts = { 60, 70, 72, 75, 78, 80, 82, 85, 88, 90 };
+    /// <summary>Per-thread, per-pct "would the gate have fired?" booleans (0 or 1) for the last query.</summary>
+    [ThreadStatic] public static int[]? LastWhatIfPass;
+    /// <summary>Per-thread, per-pct margin slack = cellsDist[chk] - bestDist[K-1]. Negative iff
+    /// margin condition failed. Computed using the *unanimous* check; -∞ if not unanimous.</summary>
+    [ThreadStatic] public static float[]? LastWhatIfSlack;
+    /// <summary>Per-thread, per-pct unanimity flag (independent of margin).</summary>
+    [ThreadStatic] public static int[]? LastWhatIfUnanimous;
+    /// <summary>The smallest pct at which the gate would have fired (margin AND unanimous), or -1.</summary>
+    [ThreadStatic] public static int LastWhatIfMinPassPct;
+    /// <summary>Cell-visit counter shared across queries (atomic increments). Length = NumCells.</summary>
+    public static int[]? CellVisits;
+
     public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
@@ -299,6 +315,172 @@ public sealed unsafe class IvfScorer : IFraudScorer
         }
 
         // 6) Fraud ratio over exact top-K.
+        int totalFrauds = 0;
+        for (int i = 0; i < K; i++)
+            if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) totalFrauds++;
+        return totalFrauds / (float)K;
+    }
+
+    /// <summary>
+    /// What-if instrumented scoring path. Always full-scan (no early-stop), but at each
+    /// candidate checkpoint percentage in <see cref="WhatIfPcts"/> snapshots:
+    /// (a) would the unanimity gate hold, (b) would the margin condition
+    /// bestDist[K-1] &lt; cellsDist[chk] hold, (c) the slack value cellsDist[chk]-bestDist[K-1].
+    ///
+    /// Result is identical to a no-early-stop Score() call. Per-pct telemetry written into
+    /// the [ThreadStatic] LastWhatIf* arrays for the caller to aggregate.
+    ///
+    /// Cost: O(num_checkpoints * kPrime) extra rerank work per query (~few µs total). Not
+    /// for production use — gated by Program.cs PROFILE_TIMING=2.
+    /// </summary>
+    public float ScoreWithWhatIf(ReadOnlySpan<float> query)
+    {
+        if (query.Length < Dataset.Dimensions)
+            throw new ArgumentException("Query vector too small", nameof(query));
+
+        int npc = WhatIfPcts.Length;
+        var pass = LastWhatIfPass;
+        if (pass is null || pass.Length != npc) pass = LastWhatIfPass = new int[npc];
+        var slack = LastWhatIfSlack;
+        if (slack is null || slack.Length != npc) slack = LastWhatIfSlack = new float[npc];
+        var unanimous = LastWhatIfUnanimous;
+        if (unanimous is null || unanimous.Length != npc) unanimous = LastWhatIfUnanimous = new int[npc];
+        for (int i = 0; i < npc; i++) { pass[i] = 0; slack[i] = float.NegativeInfinity; unanimous[i] = 0; }
+        LastWhatIfMinPassPct = -1;
+
+        // 1) Quantize query.
+        Span<sbyte> qQ8 = stackalloc sbyte[PaddedDimensions];
+        Span<float> paddedQuery = stackalloc float[PaddedDimensions];
+        for (int i = 0; i < Dataset.Dimensions; i++)
+        {
+            paddedQuery[i] = query[i];
+            int q = (int)MathF.Round(query[i] * Dataset.Q8Scale);
+            if (q > 127) q = 127;
+            else if (q < -128) q = -128;
+            qQ8[i] = (sbyte)q;
+        }
+
+        int nlist = _dataset.NumCells;
+        Span<float> centDist = stackalloc float[256];
+        if (nlist > 256) centDist = new float[nlist];
+
+        // 2) Distances to all centroids.
+        fixed (float* qfPtr = paddedQuery)
+        {
+            var q0 = Vector256.Load(qfPtr);
+            var q1 = Vector256.Load(qfPtr + 8);
+            var centBase = _dataset.CentroidsPtr;
+            for (int c = 0; c < nlist; c++)
+            {
+                float* cp = centBase + (long)c * PaddedDimensions;
+                var k0 = Vector256.Load(cp);
+                var k1 = Vector256.Load(cp + 8);
+                var d0 = k0 - q0;
+                var d1 = k1 - q1;
+                var s = (d0 * d0) + (d1 * d1);
+                centDist[c] = Vector256.Sum(s);
+            }
+        }
+
+        // 3) Top-NPROBE cells.
+        Span<int>   cells     = stackalloc int[_nProbe];
+        Span<float> cellsDist = stackalloc float[_nProbe];
+        for (int i = 0; i < _nProbe; i++) { cells[i] = -1; cellsDist[i] = float.PositiveInfinity; }
+        float cellsWorst = float.PositiveInfinity;
+        for (int c = 0; c < nlist; c++)
+        {
+            float d = centDist[c];
+            if (d < cellsWorst)
+            {
+                int pos = _nProbe - 1;
+                while (pos > 0 && cellsDist[pos - 1] > d) pos--;
+                for (int j = _nProbe - 1; j > pos; j--) { cellsDist[j] = cellsDist[j - 1]; cells[j] = cells[j - 1]; }
+                cellsDist[pos] = d;
+                cells[pos] = c;
+                cellsWorst = cellsDist[_nProbe - 1];
+            }
+        }
+
+        // Pre-compute the cell index of each pct boundary (clamped to [1, nProbe]).
+        Span<int> pctChk = stackalloc int[npc];
+        for (int p = 0; p < npc; p++)
+        {
+            int chk = (_nProbe * WhatIfPcts[p]) / 100;
+            if (chk < 1) chk = 1;
+            if (chk > _nProbe) chk = _nProbe;
+            pctChk[p] = chk;
+        }
+
+        // 4) Cell-visit counter (atomic, optional).
+        var visits = CellVisits;
+        if (visits is not null)
+        {
+            for (int i = 0; i < _nProbe; i++)
+            {
+                int ci = cells[i];
+                if ((uint)ci < (uint)visits.Length) System.Threading.Interlocked.Increment(ref visits[ci]);
+            }
+        }
+
+        // 5) Scan cells in order, snapshotting at each pct checkpoint.
+        Span<int> candDist = stackalloc int[_kPrime];
+        Span<int> candIdx  = stackalloc int[_kPrime];
+        for (int i = 0; i < _kPrime; i++) { candDist[i] = int.MaxValue; candIdx[i] = -1; }
+        int q8Worst = int.MaxValue;
+        Span<float> bestDist = stackalloc float[K];
+        Span<int>   bestIdx  = stackalloc int[K];
+
+        var offsets = _dataset.CellOffsetsPtr;
+        var labels  = _dataset.LabelsPtr;
+        int prevChk = 0;
+        int minPassPct = -1;
+        fixed (sbyte* qPtr = qQ8)
+        {
+            for (int p = 0; p < npc; p++)
+            {
+                int chk = pctChk[p];
+                if (chk > prevChk)
+                {
+                    if (Avx2.IsSupported)
+                        ScanCellsQ8Avx2Range(qPtr, cells, prevChk, chk, offsets, candDist, candIdx, ref q8Worst);
+                    else
+                        ScanCellsQ8Scalar(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
+                    prevChk = chk;
+                }
+                // Snapshot rerank fresh from current cands.
+                for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+                RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+                int valid = 0, frauds = 0;
+                for (int i = 0; i < K; i++)
+                {
+                    if (bestIdx[i] < 0) continue;
+                    valid++;
+                    if (labels[bestIdx[i]] != 0) frauds++;
+                }
+                bool isUnanimous = (valid == K) && (frauds == 0 || frauds == K);
+                float chkDist = chk < _nProbe ? cellsDist[chk] : float.PositiveInfinity;
+                float worstD  = bestDist[K - 1];
+                float sl = float.IsPositiveInfinity(worstD) ? float.NegativeInfinity : (chkDist - worstD);
+                bool marginOk = isUnanimous && worstD < chkDist;
+                unanimous[p] = isUnanimous ? 1 : 0;
+                slack[p] = sl;
+                pass[p] = marginOk ? 1 : 0;
+                if (marginOk && minPassPct < 0) minPassPct = WhatIfPcts[p];
+            }
+            // Drain any remaining cells (last pct may be < 100).
+            if (prevChk < _nProbe)
+            {
+                if (Avx2.IsSupported)
+                    ScanCellsQ8Avx2Range(qPtr, cells, prevChk, _nProbe, offsets, candDist, candIdx, ref q8Worst);
+                else
+                    ScanCellsQ8Scalar(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
+                for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+                RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+            }
+        }
+
+        LastWhatIfMinPassPct = minPassPct;
+
         int totalFrauds = 0;
         for (int i = 0; i < K; i++)
             if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) totalFrauds++;
