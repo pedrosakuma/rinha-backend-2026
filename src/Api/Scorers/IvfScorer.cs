@@ -322,6 +322,67 @@ public sealed unsafe class IvfScorer : IFraudScorer
     }
 
     /// <summary>
+    /// Computes the top-3 nearest IVF centroids for a query without running the full scan.
+    /// Used by the cascade pre-classifier (see <see cref="Cascade"/>): it needs the same
+    /// centroid distances the IvfScorer would compute, but stops there. Roughly ~2µs per
+    /// query (one AVX2 dot-product per centroid, NLIST≤256).
+    /// </summary>
+    public void ComputeTop3Cells(
+        ReadOnlySpan<float> query,
+        Span<int> top3Cells,
+        Span<float> top3Dists)
+    {
+        if (query.Length < Dataset.Dimensions)
+            throw new ArgumentException("Query vector too small", nameof(query));
+        if (top3Cells.Length < 3 || top3Dists.Length < 3)
+            throw new ArgumentException("top3 spans must hold at least 3 elements");
+
+        Span<float> paddedQuery = stackalloc float[PaddedDimensions];
+        for (int i = 0; i < Dataset.Dimensions; i++) paddedQuery[i] = query[i];
+
+        int nlist = _dataset.NumCells;
+        // Maintain top-3 in ascending order: top3Dists[0] is smallest.
+        top3Dists[0] = top3Dists[1] = top3Dists[2] = float.PositiveInfinity;
+        top3Cells[0] = top3Cells[1] = top3Cells[2] = -1;
+
+        fixed (float* qfPtr = paddedQuery)
+        {
+            var q0 = Vector256.Load(qfPtr);
+            var q1 = Vector256.Load(qfPtr + 8);
+            var centBase = _dataset.CentroidsPtr;
+            for (int c = 0; c < nlist; c++)
+            {
+                float* cp = centBase + (long)c * PaddedDimensions;
+                var k0 = Vector256.Load(cp);
+                var k1 = Vector256.Load(cp + 8);
+                var dlo = k0 - q0;
+                var dhi = k1 - q1;
+                float d = Vector256.Sum((dlo * dlo) + (dhi * dhi));
+                if (d < top3Dists[2])
+                {
+                    if (d < top3Dists[1])
+                    {
+                        top3Dists[2] = top3Dists[1]; top3Cells[2] = top3Cells[1];
+                        if (d < top3Dists[0])
+                        {
+                            top3Dists[1] = top3Dists[0]; top3Cells[1] = top3Cells[0];
+                            top3Dists[0] = d;            top3Cells[0] = c;
+                        }
+                        else
+                        {
+                            top3Dists[1] = d; top3Cells[1] = c;
+                        }
+                    }
+                    else
+                    {
+                        top3Dists[2] = d; top3Cells[2] = c;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// What-if instrumented scoring path. Always full-scan (no early-stop), but at each
     /// candidate checkpoint percentage in <see cref="WhatIfPcts"/> snapshots:
     /// (a) would the unanimity gate hold, (b) would the margin condition

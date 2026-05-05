@@ -1,0 +1,244 @@
+{
+  "feature_names": [
+    "v0",
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+    "v5",
+    "v6",
+    "v7",
+    "v8",
+    "v9",
+    "v10",
+    "v11",
+    "v12",
+    "v13",
+    "c0_id",
+    "c1_id",
+    "c2_id",
+    "d0",
+    "d1",
+    "d2",
+    "d_gap",
+    "d_ratio"
+  ],
+  "purity_threshold": 1.0,
+  "n_features": 22,
+  "max_depth": 4,
+  "n_leaves": 13,
+  "nodes": [
+    {
+      "node_id": 0,
+      "is_leaf": false,
+      "feature_idx": 7,
+      "feature_name": "v7",
+      "threshold": 0.18307683616876602,
+      "left": 1,
+      "right": 10
+    },
+    {
+      "node_id": 1,
+      "is_leaf": false,
+      "feature_idx": 2,
+      "feature_name": "v2",
+      "threshold": 0.0738906692713499,
+      "left": 2,
+      "right": 3
+    },
+    {
+      "node_id": 2,
+      "is_leaf": true,
+      "decided": true,
+      "pred": 0,
+      "n": 28795,
+      "purity": 1.0
+    },
+    {
+      "node_id": 3,
+      "is_leaf": false,
+      "feature_idx": 17,
+      "feature_name": "d0",
+      "threshold": 0.1385359764099121,
+      "left": 4,
+      "right": 7
+    },
+    {
+      "node_id": 4,
+      "is_leaf": false,
+      "feature_idx": 17,
+      "feature_name": "d0",
+      "threshold": 0.1302495002746582,
+      "left": 5,
+      "right": 6
+    },
+    {
+      "node_id": 5,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 0,
+      "n": 252,
+      "purity": 0.5674603174603174
+    },
+    {
+      "node_id": 6,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 0,
+      "n": 41,
+      "purity": 0.8048780487804879
+    },
+    {
+      "node_id": 7,
+      "is_leaf": false,
+      "feature_idx": 7,
+      "feature_name": "v7",
+      "threshold": 0.11665946990251541,
+      "left": 8,
+      "right": 9
+    },
+    {
+      "node_id": 8,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 429,
+      "purity": 0.5594405594405595
+    },
+    {
+      "node_id": 9,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 0,
+      "n": 335,
+      "purity": 0.5492537313432836
+    },
+    {
+      "node_id": 10,
+      "is_leaf": false,
+      "feature_idx": 3,
+      "feature_name": "v3",
+      "threshold": 0.28260868787765503,
+      "left": 11,
+      "right": 18
+    },
+    {
+      "node_id": 11,
+      "is_leaf": false,
+      "feature_idx": 5,
+      "feature_name": "v5",
+      "threshold": 0.0069444444961845875,
+      "left": 12,
+      "right": 15
+    },
+    {
+      "node_id": 12,
+      "is_leaf": false,
+      "feature_idx": 0,
+      "feature_name": "v0",
+      "threshold": 0.2001350000500679,
+      "left": 13,
+      "right": 14
+    },
+    {
+      "node_id": 13,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 20,
+      "purity": 0.65
+    },
+    {
+      "node_id": 14,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 22784,
+      "purity": 0.9999561095505618
+    },
+    {
+      "node_id": 15,
+      "is_leaf": false,
+      "feature_idx": 8,
+      "feature_name": "v8",
+      "threshold": 0.2750000059604645,
+      "left": 16,
+      "right": 17
+    },
+    {
+      "node_id": 16,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 0,
+      "n": 20,
+      "purity": 0.75
+    },
+    {
+      "node_id": 17,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 54,
+      "purity": 0.6111111111111112
+    },
+    {
+      "node_id": 18,
+      "is_leaf": false,
+      "feature_idx": 15,
+      "feature_name": "c1_id",
+      "threshold": 106.0,
+      "left": 19,
+      "right": 22
+    },
+    {
+      "node_id": 19,
+      "is_leaf": false,
+      "feature_idx": 19,
+      "feature_name": "d2",
+      "threshold": 0.7867591381072998,
+      "left": 20,
+      "right": 21
+    },
+    {
+      "node_id": 20,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 686,
+      "purity": 0.5539358600583091
+    },
+    {
+      "node_id": 21,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 80,
+      "purity": 0.725
+    },
+    {
+      "node_id": 22,
+      "is_leaf": false,
+      "feature_idx": 18,
+      "feature_name": "d1",
+      "threshold": 0.9609267711639404,
+      "left": 23,
+      "right": 24
+    },
+    {
+      "node_id": 23,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 0,
+      "n": 583,
+      "purity": 0.5506003430531733
+    },
+    {
+      "node_id": 24,
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 21,
+      "purity": 0.7619047619047619
+    }
+  ]
+}

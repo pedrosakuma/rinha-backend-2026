@@ -227,3 +227,53 @@ Em duas iterações, exploramos:
 
 **Considera-se encerrado** — a fronteira de Pareto está clara, e qualquer ganho adicional além de leaf-blacklist + early-stop precisaria de uma abordagem fundamentalmente nova (ex.: re-derivar o oráculo, mudar a função de score, conformal prediction).
 
+
+---
+
+## J15 update — cascade pre-classifier tested in-tree (REJECTED)
+
+Built the full pipeline (`tools/cascade_extract.py` + `tools/cascade_train.py` +
+`tools/cascade_emit.py`) and integrated `Cascade.TryDecide` as a pre-classifier
+before `IvfScorer.Score` (gated by `CASCADE=1`).
+
+### Setup
+- 54100 queries, label = `expected_fraud_score >= 0.6` (canonical ground truth from `bench/k6/test-data.json`).
+- Features: 14d query + top-3 centroid IDs/dists + d_gap + d_ratio (22 total).
+- DecisionTreeClassifier sweep depth ∈ {4..12}, purity threshold 1.0, min_samples_leaf 20.
+
+### Tree found at depth=4
+Single decided leaf: **km_from_home ≤ 0.183 AND amount_vs_avg ≤ 0.074 → legit** (n=28795, purity=1.000, **zero CV errors** across 5 folds). Coverage **53.2%**.
+
+depth | leaves | cov | err_cv
+---|---|---|---
+4 | 13 | 53.2% | 0
+5 | 22 | 95.3% | 3
+6 | 32 | 95.3% | 3
+8 | 62 | 95.3% | 10
+
+### Bench results
+
+profile=full (n=3, official 120s × 900 RPS):
+
+variant | p50 | p90 | p99 | final | Δ
+---|---|---|---|---|---
+pct=72 (no cascade) | 2.71ms | 6.94ms | 28.37ms | 4366 | baseline
+cascade depth=4 | 1.43ms | 2.49ms | **40.74ms** | 4209 | **−157**
+
+profile=short (30s ramp, n=5):
+
+variant | p50 | p99 | final | Δ
+---|---|---|---|---
+pct=72 | 2.89 | 5.00 | 5113 | baseline
+cascade | 1.27 | **40.37** | 4212 | **−901**
+
+### Why it loses
+
+Cascade decides 53% of queries in ~2µs (centroid scan + tree). Mean throughput rises **+14.7%**. k6 `ramping-arrival-rate` refills VUs faster → concurrency at the API rises → p99 climbs. The freed CPU is consumed by additional queries arriving from the load gen, not absorbed.
+
+The 53% the cascade decides are the *easiest* queries (low km_from_home, normal amount), which were already cheap in IVF. **The bottleneck is the hard 5%, and cascade does nothing for them.**
+
+### Lessons
+- Score formula is p99-dominated under saturation, so optimisations that reduce mean while accepting higher tail **lose net pts**. Same pattern observed with `IVF_EARLY_STOP_PCT=60` (−184 pts).
+- A useful cascade would have to attack hard queries, not easy ones (e.g. a fast approximate scorer for queries near cluster boundaries, accepting tiny accuracy loss to halve their cost).
+- Kept code in tree as opt-in (`CASCADE=1`) for revisits.

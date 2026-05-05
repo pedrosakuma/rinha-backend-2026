@@ -62,6 +62,15 @@ var fastJson = Environment.GetEnvironmentVariable("FAST_JSON") == "1";
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
 
+// Cascade pre-classifier (J15, exploration). Tested as a depth=4 sklearn DecisionTree
+// committing 53% of queries (km_from_home<0.18 AND amount_vs_avg<0.07 → always legit, n=28795,
+// purity=1.0, zero CV errors). Result: p50/p90 down 47-56% but p99 up 43-700% (k6 ramping
+// arrival rate refills VUs faster, increasing concurrency). Net: −157pts in profile=full.
+// Kept as opt-in (CASCADE=1) for future experiments targeting hard queries instead of easy ones.
+var cascadeEnabled = Environment.GetEnvironmentVariable("CASCADE") == "1"
+                     && scorer is Rinha.Api.Scorers.IvfScorer;
+var ivfScorerForCascade = cascadeEnabled ? (Rinha.Api.Scorers.IvfScorer)scorer : null;
+
 // Pre-touch all mmap pages and run a JIT warm-up so the first user requests
 // don't pay page-fault or tier0->tier1 jit overhead. Disable with WARMUP=0.
 if (Environment.GetEnvironmentVariable("WARMUP") != "0")
@@ -352,7 +361,19 @@ else if (fastJson)
         }
         pipe.AdvanceTo(buffer.End);
 
-        var score = scorer.Score(query);
+        float score;
+        if (cascadeEnabled)
+        {
+            Span<int>   top3Cells = stackalloc int[3];
+            Span<float> top3Dists = stackalloc float[3];
+            ivfScorerForCascade!.ComputeTop3Cells(query, top3Cells, top3Dists);
+            var (decided, cascadeScore) = Rinha.Api.Scorers.Cascade.TryDecide(query, top3Cells, top3Dists);
+            score = decided ? cascadeScore : scorer.Score(query);
+        }
+        else
+        {
+            score = scorer.Score(query);
+        }
 
         // Hand-written response: "{\"approved\":true|false,\"fraud_score\":<float>}"
         // Allocation-free path through Response.BodyWriter (PipeWriter) — get a memory
@@ -382,7 +403,19 @@ else
     {
         Span<float> query = stackalloc float[Dataset.Dimensions];
         vectorizer.Vectorize(request, query);
-        var score = scorer.Score(query);
+        float score;
+        if (cascadeEnabled)
+        {
+            Span<int>   top3Cells = stackalloc int[3];
+            Span<float> top3Dists = stackalloc float[3];
+            ivfScorerForCascade!.ComputeTop3Cells(query, top3Cells, top3Dists);
+            var (decided, cascadeScore) = Rinha.Api.Scorers.Cascade.TryDecide(query, top3Cells, top3Dists);
+            score = decided ? cascadeScore : scorer.Score(query);
+        }
+        else
+        {
+            score = scorer.Score(query);
+        }
         return Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
     });
 }

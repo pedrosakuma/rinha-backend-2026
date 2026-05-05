@@ -10,3 +10,5 @@ bench/results/
 .vscode/
 .idea/
 BenchmarkDotNet.Artifacts/
+.venv/
+cascade/dataset.npz
