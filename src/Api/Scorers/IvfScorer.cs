@@ -30,9 +30,10 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly int _dimFilter2; // optional 2nd dim added to LB
     private readonly bool _earlyStop; // class-aware early-stop (J5)
     private readonly int _earlyStopPct; // checkpoint % of nProbe (default 75)
+    private readonly int _earlyStopPctEarly; // J9: optional 2nd, earlier checkpoint (e.g. 25). 0 = disabled.
     private readonly bool _bboxRepair; // J6: bbox LB exact repair
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false)
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -43,6 +44,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
         _dimFilter2 = dimFilter2 is >= 0 and < Dataset.Dimensions && dimFilter2 != _dimFilter ? dimFilter2 : -1;
         _earlyStop = earlyStop;
         _earlyStopPct = Math.Clamp(earlyStopPct, 10, 95);
+        _earlyStopPctEarly = earlyStopPctEarly > 0 && earlyStopPctEarly < _earlyStopPct ? earlyStopPctEarly : 0;
         _bboxRepair = bboxRepair && dataset.HasIvfBbox;
     }
 
@@ -138,11 +140,41 @@ public sealed unsafe class IvfScorer : IFraudScorer
                     // overhead on the ~3% ambiguous tail (which dominates p99 under
                     // saturation).
                     int checkpoint = (_nProbe * _earlyStopPct) / 100;
-                    if (checkpoint >= 1 && _nProbe > checkpoint)
+                    int earlyCheckpoint = (_nProbe * _earlyStopPctEarly) / 100;
+                    int curStart = 0;
+
+                    // J9: optional very-early checkpoint (e.g. 25%) with the same margin rule.
+                    // Saves ~50-70% of Q8 scan on "easy" queries (clear class, big margin).
+                    if (earlyCheckpoint >= 1 && earlyCheckpoint < checkpoint)
                     {
-                        ScanCellsQ8Avx2Range(qPtr, cells, 0, checkpoint, offsets, candDist, candIdx, ref q8Worst);
+                        ScanCellsQ8Avx2Range(qPtr, cells, curStart, earlyCheckpoint, offsets, candDist, candIdx, ref q8Worst);
+                        RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+                        int frauds0 = 0, valid0 = 0;
+                        for (int i = 0; i < K; i++)
+                        {
+                            if (bestIdx[i] < 0) continue;
+                            valid0++;
+                            if (labels[bestIdx[i]] != 0) frauds0++;
+                        }
+                        bool unanimous0 = (valid0 == K) && (frauds0 == 0 || frauds0 == K);
+                        bool marginOk0 = unanimous0 && bestDist[K - 1] < cellsDist[earlyCheckpoint];
+                        if (marginOk0)
+                        {
+                            earlyStopped = true;
+                        }
+                        else
+                        {
+                            curStart = earlyCheckpoint;
+                        }
+                    }
+
+                    if (!earlyStopped && checkpoint >= 1 && _nProbe > checkpoint)
+                    {
+                        ScanCellsQ8Avx2Range(qPtr, cells, curStart, checkpoint, offsets, candDist, candIdx, ref q8Worst);
 
                         // Partial rerank using current candDist/candIdx → bestDist/bestIdx.
+                        // Reset bestIdx so we re-pick from current candidate pool.
+                        for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
                         RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
                         int frauds = 0, valid = 0;
                         for (int i = 0; i < K; i++)
@@ -162,7 +194,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                             ScanCellsQ8Avx2Range(qPtr, cells, checkpoint, _nProbe, offsets, candDist, candIdx, ref q8Worst);
                         }
                     }
-                    else
+                    else if (!earlyStopped)
                     {
                         ScanCellsQ8Avx2(qPtr, cells, offsets, candDist, candIdx, ref q8Worst);
                     }
