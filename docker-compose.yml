@@ -21,7 +21,11 @@ services:
       IVF_RERANK: "${IVF_RERANK:-64}"
       Q8_RERANK: "${Q8_RERANK:-32}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
-      IVF_EARLY_STOP_PCT: "${IVF_EARLY_STOP_PCT:-75}"
+      # J13: empirical sweep (n=9 each, noise floor σ≈20) shows pct=78 is the optimum.
+      # Baseline (pct=75): mean=5094 (±13). pct=78: mean=5171 (+77, 10.4σ). pct=80:+52, pct=85:+38.
+      # Higher pct → margin gate fires later → more queries pass it → fewer fall to full scan.
+      # Bbox-repair tested in same sweep: ≈neutral on top of pct=78, kept default OFF.
+      IVF_EARLY_STOP_PCT: "${IVF_EARLY_STOP_PCT:-78}"
       IVF_EARLY_STOP_PCT_EARLY: "${IVF_EARLY_STOP_PCT_EARLY:-0}"
       IVF_BBOX_REPAIR: "${IVF_BBOX_REPAIR:-0}"
       # Dormant toggles (rejected experiments, kept as 0 to preserve tested behavior).
