@@ -57,6 +57,11 @@ public sealed unsafe class IvfScorer : IFraudScorer
     /// <summary>Cell-visit counter shared across queries (atomic increments). Length = NumCells.</summary>
     public static int[]? CellVisits;
 
+    // J21: relax early-stop unanimity from 5/5 to 4/5 (or 1/5). Reduces tail-cell scans on
+    // borderline queries at small cost in label accuracy. Env: IVF_EARLY_MAJORITY=1.
+    private static readonly bool s_earlyMajority =
+        Environment.GetEnvironmentVariable("IVF_EARLY_MAJORITY") == "1";
+
     public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
@@ -212,7 +217,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                             valid0++;
                             if (labels[bestIdx[i]] != 0) frauds0++;
                         }
-                        bool unanimous0 = (valid0 == K) && (frauds0 == 0 || frauds0 == K);
+                        bool unanimous0 = (valid0 == K) && (s_earlyMajority ? (frauds0 <= 1 || frauds0 >= K - 1) : (frauds0 == 0 || frauds0 == K));
                         bool marginOk0 = unanimous0 && bestDist[K - 1] < cellsDist[earlyCheckpoint];
                         if (marginOk0)
                         {
@@ -240,7 +245,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                             valid++;
                             if (labels[bestIdx[i]] != 0) frauds++;
                         }
-                        bool unanimous = (valid == K) && (frauds == 0 || frauds == K);
+                        bool unanimous = (valid == K) && (s_earlyMajority ? (frauds <= 1 || frauds >= K - 1) : (frauds == 0 || frauds == K));
                         bool marginOk = unanimous && bestDist[K - 1] < cellsDist[checkpoint];
                         if (marginOk)
                         {
