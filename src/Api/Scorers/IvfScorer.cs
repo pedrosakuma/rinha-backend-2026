@@ -32,8 +32,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly int _earlyStopPct; // checkpoint % of nProbe (default 75)
     private readonly int _earlyStopPctEarly; // J9: optional 2nd, earlier checkpoint (e.g. 25). 0 = disabled.
     private readonly bool _bboxRepair; // J6: bbox LB exact repair
+    private readonly bool _scalarAbort; // J10: scalar early-abort dim-by-dim per row
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0)
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, bool scalarAbort = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -46,6 +47,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
         _earlyStopPct = Math.Clamp(earlyStopPct, 10, 95);
         _earlyStopPctEarly = earlyStopPctEarly > 0 && earlyStopPctEarly < _earlyStopPct ? earlyStopPctEarly : 0;
         _bboxRepair = bboxRepair && dataset.HasIvfBbox;
+        _scalarAbort = scalarAbort;
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -326,6 +328,11 @@ public sealed unsafe class IvfScorer : IFraudScorer
         sbyte* qPtr, ReadOnlySpan<int> cells, int ciStart, int ciEnd, int* offsets,
         Span<int> candDist, Span<int> candIdx, ref int worstRef)
     {
+        if (_scalarAbort)
+        {
+            ScanCellsQ8ScalarAbortRange(qPtr, cells, ciStart, ciEnd, offsets, candDist, candIdx, ref worstRef);
+            return;
+        }
         var qLow = Vector128.Load(qPtr);
         var qWide = Vector256.WidenLower(qLow.ToVector256());
         var sbase = _dataset.Q8VectorsPtr;
@@ -436,8 +443,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private void ScanCellsQ8Scalar(
         sbyte* qPtr, ReadOnlySpan<int> cells, int* offsets,
         Span<int> candDist, Span<int> candIdx, ref int worstRef)
-    {
-        var sbase = _dataset.Q8VectorsPtr;
+    {        var sbase = _dataset.Q8VectorsPtr;
         int worst = worstRef;
         for (int ci = 0; ci < cells.Length; ci++)
         {
@@ -473,6 +479,61 @@ public sealed unsafe class IvfScorer : IFraudScorer
         for (int j = n - 1; j > pos; j--) { dist[j] = dist[j - 1]; idx[j] = idx[j - 1]; }
         dist[pos] = newDist;
         idx[pos] = newIdx;
+    }
+
+    /// <summary>
+    /// J10: Scalar early-abort dim-by-dim per row. Inspired by the C #1 winner
+    /// (thiagorigonatti/rinha-2026). For each row, accumulate squared diff one
+    /// dim at a time and abort the row as soon as accumulator ≥ current worst.
+    /// On a query whose top-K' worst is small, most rows abort within 2-4 dims,
+    /// paying ~10 ops vs the AVX2 path's full 14-dim sqdiff (~30 ops total).
+    /// Iff prune_rate &gt; ~70% across the workload, this beats AVX2.
+    /// Uses fixed [0..13] dim order; selectivity-ordered would be a refinement.
+    /// </summary>
+    private void ScanCellsQ8ScalarAbortRange(
+        sbyte* qPtr, ReadOnlySpan<int> cells, int ciStart, int ciEnd, int* offsets,
+        Span<int> candDist, Span<int> candIdx, ref int worstRef)
+    {
+        var sbase = _dataset.Q8VectorsPtr;
+        int worst = worstRef;
+        // Hoist query dims into locals (registers) to avoid repeated loads.
+        int q0 = qPtr[0], q1 = qPtr[1], q2 = qPtr[2], q3 = qPtr[3];
+        int q4 = qPtr[4], q5 = qPtr[5], q6 = qPtr[6], q7 = qPtr[7];
+        int q8 = qPtr[8], q9 = qPtr[9], q10 = qPtr[10], q11 = qPtr[11];
+        int q12 = qPtr[12], q13 = qPtr[13];
+
+        for (int ci = ciStart; ci < ciEnd; ci++)
+        {
+            int c = cells[ci];
+            if (c < 0) break;
+            int start = offsets[c];
+            int end = offsets[c + 1];
+            for (int i = start; i < end; i++)
+            {
+                sbyte* row = sbase + (long)i * PaddedDimensions;
+                int d, acc;
+                d = row[0] - q0;   acc  = d * d;
+                d = row[1] - q1;   acc += d * d; if (acc >= worst) continue;
+                d = row[2] - q2;   acc += d * d;
+                d = row[3] - q3;   acc += d * d; if (acc >= worst) continue;
+                d = row[4] - q4;   acc += d * d;
+                d = row[5] - q5;   acc += d * d; if (acc >= worst) continue;
+                d = row[6] - q6;   acc += d * d;
+                d = row[7] - q7;   acc += d * d; if (acc >= worst) continue;
+                d = row[8] - q8;   acc += d * d;
+                d = row[9] - q9;   acc += d * d; if (acc >= worst) continue;
+                d = row[10] - q10; acc += d * d;
+                d = row[11] - q11; acc += d * d; if (acc >= worst) continue;
+                d = row[12] - q12; acc += d * d;
+                d = row[13] - q13; acc += d * d;
+                if (acc < worst)
+                {
+                    InsertTopKInt(candDist, candIdx, acc, i);
+                    worst = candDist[candDist.Length - 1];
+                }
+            }
+        }
+        worstRef = worst;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
