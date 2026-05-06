@@ -504,7 +504,18 @@ else if (fastJson)
             Span<float> top3Dists = stackalloc float[3];
             ivfScorerForCascade!.ComputeTop3Cells(query, top3Cells, top3Dists);
             var (decided, cascadeScore) = Rinha.Api.Scorers.Cascade.TryDecide(query, top3Cells, top3Dists);
-            score = decided ? cascadeScore : scorer.Score(query);
+            if (decided)
+            {
+                score = cascadeScore;
+            }
+            else
+            {
+                // Cascade-rejected queries are inherently uncertain — apply the hard-query
+                // deadline (same one HardQueryClassifier uses) to keep p99 bounded.
+                if (hardqDeadlineUs > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = hardqDeadlineUs;
+                score = scorer.Score(query);
+                Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
+            }
         }
         else
         {
