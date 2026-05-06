@@ -66,6 +66,18 @@ public sealed class Vectorizer
         dst[12] = _mcc.Get(merchant.Mcc);
         // 13: merchant_avg_amount / max_merchant_avg_amount
         dst[13] = Clamp01((float)(merchant.AvgAmount / n.MaxMerchantAvgAmount));
+
+        // Match oracle quantization: references in resources/references.json.gz are stored
+        // pre-rounded to 4 decimal places. Round queries the same way so distance
+        // comparisons (and tie-breaks) align with the oracle's k-NN ground truth.
+        for (int i = 0; i < Dataset.Dimensions; i++) dst[i] = Round4dp(dst[i]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float Round4dp(float v)
+    {
+        if (v < 0f) return v; // preserve -1 sentinel
+        return MathF.Round(v * 10000f) / 10000f;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

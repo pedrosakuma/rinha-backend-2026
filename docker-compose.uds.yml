@@ -1,0 +1,22 @@
+services:
+  api1:
+    environment:
+      UDS_PATH: /run/uds/api1.sock
+    volumes:
+      - uds-vol:/run/uds
+  api2:
+    environment:
+      UDS_PATH: /run/uds/api2.sock
+    volumes:
+      - uds-vol:/run/uds
+  lb:
+    volumes:
+      - ./docker/nginx-uds.conf:/etc/nginx/nginx.conf:ro
+      - uds-vol:/run/uds
+
+volumes:
+  uds-vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "mode=0777"
