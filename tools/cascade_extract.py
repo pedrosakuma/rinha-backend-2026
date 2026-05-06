@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """Extract per-query features and labels from bench/k6/test-data.json.
 
+⚠️  AVISO DE INTEGRIDADE — TREINAMENTO NO TEST SET ⚠️
+Este script lê queries DIRETO do test set do bench (bench/k6/test-data.json) e
+gera o dataset usado para treinar o cascade decision-tree. Como as queries do
+treino são literalmente as mesmas avaliadas pelo bench, o cascade resultante
+**memoriza** o mapping query→label e atinge ~95% coverage de forma artificial.
+
+Em qualquer cenário de avaliação real (queries não vistas), esse cascade não
+generaliza. O combo padrão do compose foi flipado para CASCADE=0 por isso.
+
+Para gerar um cascade legítimo, este script precisa ser refeito amostrando
+queries sintéticas do CORPUS (references.json.gz) ou de uma divisão train/test
+estanque. Ver docs/perf-journal.md.
+
 Mirrors src/Api/Vectorizer.cs (the single source of truth for the production
 14-d embedding) and computes top-3 IVF cell distances using
 data/ivf_centroids.bin. Output is a single .npz consumed by cascade_train.py.
