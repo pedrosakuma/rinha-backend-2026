@@ -32,7 +32,7 @@ services:
       TP_MIN_WORKERS: "${TP_MIN_WORKERS:-1}"
       TP_MAX_WORKERS: "${TP_MAX_WORKERS:-2}"
       SCORER: "${SCORER:-ivf}"
-      IVF_NPROBE: "${IVF_NPROBE:-96}"
+      IVF_NPROBE: "${IVF_NPROBE:-8}"
       IVF_RERANK: "${IVF_RERANK:-64}"
       Q8_RERANK: "${Q8_RERANK:-32}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
