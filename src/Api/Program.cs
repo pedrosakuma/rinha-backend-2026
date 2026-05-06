@@ -6,8 +6,16 @@ using System.IO.Pipelines;
 // Hill-climbing can inject extra workers that fight over the fractional quota,
 // adding context-switch overhead (~5-10us) directly to p99. With CPU-bound
 // scoring and no blocking I/O, 1 worker + 1 IO thread is the right shape.
-ThreadPool.SetMinThreads(workerThreads: 1, completionPortThreads: 1);
-ThreadPool.SetMaxThreads(workerThreads: 2, completionPortThreads: 2);
+//
+// L2-cascade follow-up: when a small fraction of requests run a 3ms IVF path
+// while the bulk runs in ~10µs (cascade fast-path), 2 workers can both be
+// occupied by IVF tail simultaneously and the fast-path queue piles up,
+// inflating p99 dramatically. Env override TP_MAX_WORKERS lets us widen the
+// pool when running with a mixed-latency handler.
+var tpMin = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_WORKERS"), out var _tpMin) && _tpMin > 0 ? _tpMin : 1;
+var tpMax = int.TryParse(Environment.GetEnvironmentVariable("TP_MAX_WORKERS"), out var _tpMax) && _tpMax > 0 ? _tpMax : 2;
+ThreadPool.SetMinThreads(workerThreads: tpMin, completionPortThreads: 1);
+ThreadPool.SetMaxThreads(workerThreads: tpMax, completionPortThreads: 2);
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
@@ -100,7 +108,8 @@ if (Environment.GetEnvironmentVariable("WARMUP") != "0")
     GC.KeepAlive(warmSink);
     Console.WriteLine($"Warm-up: prefetch={touched / (1024 * 1024)}MiB in {swPre.ElapsedMilliseconds}ms, " +
                       $"jit={warmupIters} iters in {swJit.ElapsedMilliseconds}ms, " +
-                      $"thp_advised={dataset.LastHugepageAdvisedBytes / (1024 * 1024)}MiB.");
+                      $"thp_advised={dataset.LastHugepageAdvisedBytes / (1024 * 1024)}MiB, " +
+                      $"mlocked={dataset.LastMlockedBytes / (1024 * 1024)}MiB.");
 }
 
 var app = builder.Build();

@@ -174,15 +174,18 @@ public sealed unsafe class Dataset : IDisposable
         long total = 0;
         long sink = 0;
         long hpTotal = 0;
+        long mlTotal = 0;
 
         long vBytes = (long)Count * PaddedDimensions * sizeof(float);
         hpTotal += AdviseHuge((byte*)_vectorsPtr, vBytes);
         sink += TouchPages((byte*)_vectorsPtr, vBytes, PageSize);
+        // Note: full float vectors (~192MB) exceed cgroup limit; no mlock.
         total += vBytes;
 
         long lBytes = Count;
         hpTotal += AdviseHuge(_labelsPtr, lBytes);
         sink += TouchPages(_labelsPtr, lBytes, PageSize);
+        mlTotal += MlockRegion(_labelsPtr, lBytes);
         total += lBytes;
 
         if (_q8Ptr != null)
@@ -190,6 +193,7 @@ public sealed unsafe class Dataset : IDisposable
             long bytes = (long)Count * 16; // q8 row stride = PaddedDimensions (16)
             hpTotal += AdviseHuge((byte*)_q8Ptr, bytes);
             sink += TouchPages((byte*)_q8Ptr, bytes, PageSize);
+            mlTotal += MlockRegion((byte*)_q8Ptr, bytes);
             total += bytes;
         }
         if (_q8SoaPtr != null)
@@ -197,6 +201,7 @@ public sealed unsafe class Dataset : IDisposable
             long bytes = (long)Count * Dimensions;
             hpTotal += AdviseHuge((byte*)_q8SoaPtr, bytes);
             sink += TouchPages((byte*)_q8SoaPtr, bytes, PageSize);
+            // Q8-SoA unused by default scorer; skip mlock.
             total += bytes;
         }
         if (_centroidsPtr != null)
@@ -204,6 +209,7 @@ public sealed unsafe class Dataset : IDisposable
             long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
             hpTotal += AdviseHuge((byte*)_centroidsPtr, bytes);
             sink += TouchPages((byte*)_centroidsPtr, bytes, PageSize);
+            mlTotal += MlockRegion((byte*)_centroidsPtr, bytes);
             total += bytes;
         }
         if (_offsetsPtr != null)
@@ -211,6 +217,7 @@ public sealed unsafe class Dataset : IDisposable
             long bytes = (long)(NumCells + 1) * sizeof(int);
             hpTotal += AdviseHuge((byte*)_offsetsPtr, bytes);
             sink += TouchPages((byte*)_offsetsPtr, bytes, PageSize);
+            mlTotal += MlockRegion((byte*)_offsetsPtr, bytes);
             total += bytes;
         }
         if (_bboxMinPtr != null)
@@ -244,6 +251,7 @@ public sealed unsafe class Dataset : IDisposable
 
         GC.KeepAlive(sink);
         LastHugepageAdvisedBytes = hpTotal;
+        LastMlockedBytes = mlTotal;
         return total;
     }
 
@@ -252,9 +260,14 @@ public sealed unsafe class Dataset : IDisposable
 
     [DllImport("libc", EntryPoint = "madvise", SetLastError = true)]
     private static extern int LinuxMadvise(IntPtr addr, UIntPtr length, int advice);
+    [DllImport("libc", EntryPoint = "mlock", SetLastError = true)]
+    private static extern int LinuxMlock(IntPtr addr, UIntPtr length);
     private const int MADV_HUGEPAGE = 14;
     private static readonly bool s_thpEnabled =
         Environment.GetEnvironmentVariable("DATASET_THP") != "0" &&
+        OperatingSystem.IsLinux();
+    private static readonly bool s_mlockEnabled =
+        Environment.GetEnvironmentVariable("DATASET_MLOCK") == "1" &&
         OperatingSystem.IsLinux();
 
     private static long AdviseHuge(byte* p, long bytes)
@@ -266,6 +279,25 @@ public sealed unsafe class Dataset : IDisposable
         try
         {
             int rc = LinuxMadvise((IntPtr)p, len, MADV_HUGEPAGE);
+            return rc == 0 ? bytes : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>L2-cascade follow-up: mlock() the dataset to prevent the kernel
+    /// from evicting pages when memory traffic drops (e.g., when cascade fast-paths
+    /// most queries away from Q8 scans). Returns bytes successfully locked.</summary>
+    public long LastMlockedBytes { get; private set; }
+
+    private static long MlockRegion(byte* p, long bytes)
+    {
+        if (!s_mlockEnabled || bytes <= 0) return 0;
+        try
+        {
+            int rc = LinuxMlock((IntPtr)p, (UIntPtr)bytes);
             return rc == 0 ? bytes : 0;
         }
         catch

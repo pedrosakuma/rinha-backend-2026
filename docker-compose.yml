@@ -15,8 +15,8 @@ services:
       PORT: "9999"
       DOTNET_GCHeapCount: "1"
       DOTNET_gcServer: "${DOTNET_GCSERVER:-0}"
-      DOTNET_GCConserveMemory: "9"
-      DOTNET_PROCESSOR_COUNT: "1"
+      DOTNET_GCConserveMemory: "${DOTNET_GCCONSERVE:-9}"
+      DOTNET_PROCESSOR_COUNT: "${DOTNET_PROCESSOR_COUNT:-1}"
       LIFO_LIMIT: "${LIFO_LIMIT:-0}"
       LIFO_QUEUE: "${LIFO_QUEUE:-32}"
       IVF_EARLY_MAJORITY: "${IVF_EARLY_MAJORITY:-0}"
@@ -25,8 +25,12 @@ services:
       HARDQ_DEADLINE_US: "${HARDQ_DEADLINE_US:-1500}"
       HARDQ_NPROBE_EASY: "${HARDQ_NPROBE_EASY:-0}"
       IVF_BATCH_WAIT_US: "${IVF_BATCH_WAIT_US:-0}"
+      DATASET_THP: "${DATASET_THP:-1}"
+      DATASET_MLOCK: "${DATASET_MLOCK:-0}"
       CASCADE: "${CASCADE:-0}"
       IVF_PREFETCH: "${IVF_PREFETCH:-0}"
+      TP_MIN_WORKERS: "${TP_MIN_WORKERS:-1}"
+      TP_MAX_WORKERS: "${TP_MAX_WORKERS:-2}"
       SCORER: "${SCORER:-ivf}"
       IVF_NPROBE: "${IVF_NPROBE:-96}"
       IVF_RERANK: "${IVF_RERANK:-64}"
@@ -58,6 +62,8 @@ services:
     networks: [app]
     volumes:
       - ./tools/hq-data:/hq
+    ulimits:
+      memlock: -1
     deploy:
       resources:
         limits:
@@ -82,7 +88,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.30"
           memory: "50MB"
 
 networks:
