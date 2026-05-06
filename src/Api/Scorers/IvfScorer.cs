@@ -57,6 +57,11 @@ public sealed unsafe class IvfScorer : IFraudScorer
     /// <summary>Cell-visit counter shared across queries (atomic increments). Length = NumCells.</summary>
     public static int[]? CellVisits;
 
+    /// <summary>J24: per-call deadline override in microseconds. When &gt; 0, takes precedence
+    /// over the static IVF_DEADLINE_US. Set this from the request handler after running the
+    /// hard-query classifier; reset to 0 after Score() returns. ThreadStatic, no contention.</summary>
+    [ThreadStatic] public static int CallDeadlineUs;
+
     // J21: relax early-stop unanimity from 5/5 to 4/5 (or 1/5). Reduces tail-cell scans on
     // borderline queries at small cost in label accuracy. Env: IVF_EARLY_MAJORITY=1.
     private static readonly bool s_earlyMajority =
@@ -99,9 +104,16 @@ public sealed unsafe class IvfScorer : IFraudScorer
 
         LastEarlyStopMode = 0;
         LastRowsScanned = 0;
-        long deadlineAt = s_deadlineTicks > 0
-            ? System.Diagnostics.Stopwatch.GetTimestamp() + s_deadlineTicks
-            : 0;
+        long deadlineAt = 0;
+        if (CallDeadlineUs > 0)
+        {
+            deadlineAt = System.Diagnostics.Stopwatch.GetTimestamp()
+                + (long)CallDeadlineUs * System.Diagnostics.Stopwatch.Frequency / 1_000_000L;
+        }
+        else if (s_deadlineTicks > 0)
+        {
+            deadlineAt = System.Diagnostics.Stopwatch.GetTimestamp() + s_deadlineTicks;
+        }
 
         // 1) Quantize query to int8.
         Span<sbyte> qQ8 = stackalloc sbyte[PaddedDimensions];

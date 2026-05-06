@@ -21,6 +21,8 @@ services:
       LIFO_QUEUE: "${LIFO_QUEUE:-32}"
       IVF_EARLY_MAJORITY: "${IVF_EARLY_MAJORITY:-0}"
       IVF_DEADLINE_US: "${IVF_DEADLINE_US:-0}"
+      HARDQ_DUMP_PATH: "${HARDQ_DUMP_PATH:-}"
+      HARDQ_DEADLINE_US: "${HARDQ_DEADLINE_US:-1500}"
       SCORER: "${SCORER:-ivf}"
       IVF_NPROBE: "${IVF_NPROBE:-96}"
       IVF_RERANK: "${IVF_RERANK:-64}"
@@ -50,6 +52,8 @@ services:
       PROFILE_TIMING: "${PROFILE_TIMING:-0}"
       ALLOC_TRACE: "${ALLOC_TRACE:-0}"
     networks: [app]
+    volumes:
+      - ./tools/hq-data:/hq
     deploy:
       resources:
         limits:

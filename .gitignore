@@ -12,3 +12,4 @@ bench/results/
 BenchmarkDotNet.Artifacts/
 .venv/
 cascade/dataset.npz
+tools/hq-data/*.csv

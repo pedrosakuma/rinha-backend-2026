@@ -144,6 +144,24 @@ if (whatIfMode && dataset.HasIvf)
     Rinha.Api.Scorers.IvfScorer.CellVisits = new int[dataset.NumCells];
 }
 
+// J24: hard-query dataset collector — opt-in via HARDQ_DUMP_PATH env.
+var hqDumpPath = Environment.GetEnvironmentVariable("HARDQ_DUMP_PATH");
+if (!string.IsNullOrEmpty(hqDumpPath))
+{
+    Rinha.Api.HardQueryDump.Open(hqDumpPath);
+    Console.WriteLine($"HardQueryDump: writing to {hqDumpPath}");
+}
+
+// J24: hard-query predictor — when HARDQ_DEADLINE_US > 0, run a tiny DT classifier
+// on the input vector; if predicted "hard" (full IVF scan likely), apply this
+// per-call deadline to bound p99 on the worst tail.
+int hardqDeadlineUs = 0;
+{
+    var s = Environment.GetEnvironmentVariable("HARDQ_DEADLINE_US");
+    if (!string.IsNullOrEmpty(s) && int.TryParse(s, out var v) && v > 0) hardqDeadlineUs = v;
+    if (hardqDeadlineUs > 0) Console.WriteLine($"HardQueryClassifier: enabled, deadline={hardqDeadlineUs}µs on hard");
+}
+
 if (profile)
 {
     long n = 0, vSum = 0, sSum = 0, jSum = 0;
@@ -531,11 +549,24 @@ else
         }
         else
         {
+            if (hardqDeadlineUs > 0 && Rinha.Api.Scorers.HardQueryClassifier.IsHard(query))
+            {
+                Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = hardqDeadlineUs;
+            }
             score = scorer.Score(query);
+            Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
+        }
+        if (Rinha.Api.HardQueryDump.Enabled)
+        {
+            Rinha.Api.HardQueryDump.Append(query,
+                Rinha.Api.Scorers.IvfScorer.LastRowsScanned,
+                Rinha.Api.Scorers.IvfScorer.LastEarlyStopMode);
         }
         return Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
     });
 }
+
+app.Lifetime.ApplicationStopping.Register(() => Rinha.Api.HardQueryDump.Close());
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
