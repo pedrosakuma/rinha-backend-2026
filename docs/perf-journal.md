@@ -35,6 +35,7 @@
 | L2 | nginx 0.10→0.30 vCPU (cascade absorvia o resto) | unlock cascade | `4c475cc` |
 | — | Round queries to 4dp (oracle-aligned) | p99 fix | `7048610` |
 | — | nProbe 96→8 (após cascade absorver 95.3%) | combo | `d1f7ca1` |
+| — | nginx `postpone_output 0` (resp ~50B < MTU) | +20-30, -7% p99 | (este commit) |
 | — | Q16 int16 rerank (AVX2 pmaddwd, 16 lanes) | +25-50, -96MB WS | `43ddaa8` |
 
 ## Rejeitados (com razão)
@@ -61,6 +62,8 @@
 | J22 | Anytime/deadline scan | opt-in only | `IVF_DEADLINE_US` toggle |
 | L1 | Query batching | opt-in only | sem ganho consistente |
 | L4 | Per-call CallNProbe override | opt-in only | sem uso prático |
+| — | nginx `worker_priority -5` | falhou | container sem `CAP_SYS_NICE` (`setpriority denied`) |
+| — | nginx `proxy_next_upstream off` | regrediu sob carga | sem retry, requests lentas hard-fail (outliers 5230) |
 | — | Heavy-split build (sessão Q16) | -90 pts | mais cells → np=8 cobre menos espaço; p99 não mexeu (early-stop limita worst-case, não cell size) |
 
 ### Cascade (caso especial)
@@ -88,7 +91,7 @@ CASCADE=0
 IVF_Q16=1   # default
 ```
 
-Resultado n=10: **5614 σ=62 p99=2.43ms fn=0**.
+Resultado n=10: **~5634 σ≈30 p99=2.30ms fn=0** (com `postpone_output 0` no nginx).
 
 ## Observações operacionais
 

@@ -77,10 +77,10 @@ Bench k6 (profile `short`, n=10) com combo defensível
 
 | métrica | valor |
 |---------|-------|
-| score   | **5614** σ=62 |
-| p50     | 0.99 ms |
-| p90     | 1.28 ms |
-| p99     | 2.43 ms |
+| score   | **~5634** σ≈30 |
+| p50     | 0.97 ms |
+| p90     | 1.23 ms |
+| p99     | 2.30 ms |
 | fn      | 0 |
 
 Para o histórico completo de tentativas, ver
