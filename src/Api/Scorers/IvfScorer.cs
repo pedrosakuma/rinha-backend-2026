@@ -361,7 +361,192 @@ public sealed unsafe class IvfScorer : IFraudScorer
     }
 
     /// <summary>
-    /// Computes the top-3 nearest IVF centroids for a query without running the full scan.
+    /// L1: batched scoring of 2 queries in a single sweep over the union of probe sets.
+    /// Each row in the union is loaded once from L1 and produces TWO Q8 distances in
+    /// parallel (one per query) — amortizes memory bandwidth across queries.
+    /// No early-stop / no bbox repair / no per-call deadline (simplification for MVP).
+    /// </summary>
+    public void ScoreBatch2(ReadOnlySpan<float> q1raw, ReadOnlySpan<float> q2raw, out float s1, out float s2)
+    {
+        if (!Avx2.IsSupported)
+        {
+            s1 = Score(q1raw);
+            s2 = Score(q2raw);
+            return;
+        }
+
+        Span<sbyte> q1Q8 = stackalloc sbyte[PaddedDimensions];
+        Span<sbyte> q2Q8 = stackalloc sbyte[PaddedDimensions];
+        Span<float> q1Padded = stackalloc float[PaddedDimensions];
+        Span<float> q2Padded = stackalloc float[PaddedDimensions];
+        QuantizeAndPad(q1raw, q1Q8, q1Padded);
+        QuantizeAndPad(q2raw, q2Q8, q2Padded);
+
+        int nlist = _dataset.NumCells;
+        Span<float> centDist1 = stackalloc float[512];
+        Span<float> centDist2 = stackalloc float[512];
+
+        fixed (float* qfPtr1 = q1Padded, qfPtr2 = q2Padded)
+        {
+            ComputeCentroidDistances(qfPtr1, centDist1, nlist);
+            ComputeCentroidDistances(qfPtr2, centDist2, nlist);
+        }
+
+        Span<int> cells1 = stackalloc int[_nProbe];
+        Span<int> cells2 = stackalloc int[_nProbe];
+        Span<float> cellsDist1 = stackalloc float[_nProbe];
+        Span<float> cellsDist2 = stackalloc float[_nProbe];
+        PickTopCells(centDist1, nlist, cells1, cellsDist1);
+        PickTopCells(centDist2, nlist, cells2, cellsDist2);
+
+        Span<byte> cellMask = stackalloc byte[nlist];
+        cellMask.Clear();
+        for (int i = 0; i < _nProbe; i++) { int c = cells1[i]; if (c >= 0) cellMask[c] |= 1; }
+        for (int i = 0; i < _nProbe; i++) { int c = cells2[i]; if (c >= 0) cellMask[c] |= 2; }
+
+        Span<int> cand1Dist = stackalloc int[_kPrime];
+        Span<int> cand1Idx  = stackalloc int[_kPrime];
+        Span<int> cand2Dist = stackalloc int[_kPrime];
+        Span<int> cand2Idx  = stackalloc int[_kPrime];
+        for (int i = 0; i < _kPrime; i++)
+        {
+            cand1Dist[i] = int.MaxValue; cand1Idx[i] = -1;
+            cand2Dist[i] = int.MaxValue; cand2Idx[i] = -1;
+        }
+        int worst1 = int.MaxValue, worst2 = int.MaxValue;
+
+        var offsets = _dataset.CellOffsetsPtr;
+        var sbase = _dataset.Q8VectorsPtr;
+        long rowsScanned = 0;
+        fixed (sbyte* qPtr1 = q1Q8, qPtr2 = q2Q8)
+        {
+            var qLow1 = Vector128.Load(qPtr1);
+            var qLow2 = Vector128.Load(qPtr2);
+            var qWide1 = Vector256.WidenLower(qLow1.ToVector256());
+            var qWide2 = Vector256.WidenLower(qLow2.ToVector256());
+
+            for (int c = 0; c < nlist; c++)
+            {
+                byte mask = cellMask[c];
+                if (mask == 0) continue;
+                int start = offsets[c];
+                int end = offsets[c + 1];
+                rowsScanned += end - start;
+
+                if (mask == 3)
+                {
+                    for (int i = start; i < end; i++)
+                    {
+                        sbyte* row = sbase + (long)i * PaddedDimensions;
+                        var r128 = Vector128.Load(row);
+                        var rWide = Vector256.WidenLower(r128.ToVector256());
+                        var diff1 = rWide - qWide1;
+                        var diff2 = rWide - qWide2;
+                        int d1 = Vector256.Sum(Avx2.MultiplyAddAdjacent(diff1, diff1));
+                        int d2 = Vector256.Sum(Avx2.MultiplyAddAdjacent(diff2, diff2));
+                        if (d1 < worst1) { InsertTopKInt(cand1Dist, cand1Idx, d1, i); worst1 = cand1Dist[_kPrime - 1]; }
+                        if (d2 < worst2) { InsertTopKInt(cand2Dist, cand2Idx, d2, i); worst2 = cand2Dist[_kPrime - 1]; }
+                    }
+                }
+                else if (mask == 1)
+                {
+                    for (int i = start; i < end; i++)
+                    {
+                        sbyte* row = sbase + (long)i * PaddedDimensions;
+                        var r128 = Vector128.Load(row);
+                        var rWide = Vector256.WidenLower(r128.ToVector256());
+                        var diff = rWide - qWide1;
+                        int d = Vector256.Sum(Avx2.MultiplyAddAdjacent(diff, diff));
+                        if (d < worst1) { InsertTopKInt(cand1Dist, cand1Idx, d, i); worst1 = cand1Dist[_kPrime - 1]; }
+                    }
+                }
+                else
+                {
+                    for (int i = start; i < end; i++)
+                    {
+                        sbyte* row = sbase + (long)i * PaddedDimensions;
+                        var r128 = Vector128.Load(row);
+                        var rWide = Vector256.WidenLower(r128.ToVector256());
+                        var diff = rWide - qWide2;
+                        int d = Vector256.Sum(Avx2.MultiplyAddAdjacent(diff, diff));
+                        if (d < worst2) { InsertTopKInt(cand2Dist, cand2Idx, d, i); worst2 = cand2Dist[_kPrime - 1]; }
+                    }
+                }
+            }
+        }
+        LastRowsScanned += (int)rowsScanned;
+
+        Span<float> bestDist1 = stackalloc float[K];
+        Span<int>   bestIdx1  = stackalloc int[K];
+        Span<float> bestDist2 = stackalloc float[K];
+        Span<int>   bestIdx2  = stackalloc int[K];
+        for (int i = 0; i < K; i++)
+        {
+            bestDist1[i] = float.PositiveInfinity; bestIdx1[i] = -1;
+            bestDist2[i] = float.PositiveInfinity; bestIdx2[i] = -1;
+        }
+        RerankFloat(q1Padded, cand1Dist, cand1Idx, bestDist1, bestIdx1);
+        RerankFloat(q2Padded, cand2Dist, cand2Idx, bestDist2, bestIdx2);
+
+        var labels = _dataset.LabelsPtr;
+        int frauds1 = 0, frauds2 = 0;
+        for (int i = 0; i < K; i++)
+        {
+            if (bestIdx1[i] >= 0 && labels[bestIdx1[i]] != 0) frauds1++;
+            if (bestIdx2[i] >= 0 && labels[bestIdx2[i]] != 0) frauds2++;
+        }
+        s1 = frauds1 / (float)K;
+        s2 = frauds2 / (float)K;
+    }
+
+    private static void QuantizeAndPad(ReadOnlySpan<float> raw, Span<sbyte> q8, Span<float> padded)
+    {
+        for (int i = 0; i < Dataset.Dimensions; i++)
+        {
+            padded[i] = raw[i];
+            int q = (int)MathF.Round(raw[i] * Dataset.Q8Scale);
+            if (q > 127) q = 127;
+            else if (q < -128) q = -128;
+            q8[i] = (sbyte)q;
+        }
+    }
+
+    private void ComputeCentroidDistances(float* qfPtr, Span<float> centDist, int nlist)
+    {
+        var q0 = Vector256.Load(qfPtr);
+        var q1 = Vector256.Load(qfPtr + 8);
+        var centBase = _dataset.CentroidsPtr;
+        for (int c = 0; c < nlist; c++)
+        {
+            float* cp = centBase + (long)c * PaddedDimensions;
+            var k0 = Vector256.Load(cp);
+            var k1 = Vector256.Load(cp + 8);
+            var d0 = k0 - q0;
+            var d1 = k1 - q1;
+            var s = (d0 * d0) + (d1 * d1);
+            centDist[c] = Vector256.Sum(s);
+        }
+    }
+
+    private void PickTopCells(ReadOnlySpan<float> centDist, int nlist, Span<int> cells, Span<float> cellsDist)
+    {
+        for (int i = 0; i < _nProbe; i++) { cells[i] = -1; cellsDist[i] = float.PositiveInfinity; }
+        float worst = float.PositiveInfinity;
+        for (int c = 0; c < nlist; c++)
+        {
+            float d = centDist[c];
+            if (d < worst)
+            {
+                int pos = _nProbe - 1;
+                while (pos > 0 && cellsDist[pos - 1] > d) pos--;
+                for (int j = _nProbe - 1; j > pos; j--) { cellsDist[j] = cellsDist[j - 1]; cells[j] = cells[j - 1]; }
+                cellsDist[pos] = d;
+                cells[pos] = c;
+                worst = cellsDist[_nProbe - 1];
+            }
+        }
+    }
+
     /// Used by the cascade pre-classifier (see <see cref="Cascade"/>): it needs the same
     /// centroid distances the IvfScorer would compute, but stops there. Roughly ~2µs per
     /// query (one AVX2 dot-product per centroid, NLIST≤256).

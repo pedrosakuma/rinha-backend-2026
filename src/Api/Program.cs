@@ -173,6 +173,20 @@ int hardqNProbeEasy = 0;
     if (hardqNProbeEasy > 0) Console.WriteLine($"HardQueryClassifier: nProbe={hardqNProbeEasy} on easy queries");
 }
 
+// L1: optional batched scoring — coordinator pairs concurrent requests within a short
+// window and runs IvfScorer.ScoreBatch2 (single sweep, two queries). Opt-in: set
+// IVF_BATCH_WAIT_US > 0 to enable. Requires scorer to be IvfScorer.
+Rinha.Api.Scorers.IvfBatchCoordinator? batchCoord = null;
+{
+    var s = Environment.GetEnvironmentVariable("IVF_BATCH_WAIT_US");
+    if (!string.IsNullOrEmpty(s) && int.TryParse(s, out var v) && v > 0
+        && scorer is Rinha.Api.Scorers.IvfScorer ivfForBatch)
+    {
+        batchCoord = new Rinha.Api.Scorers.IvfBatchCoordinator(ivfForBatch, v);
+        Console.WriteLine($"IvfBatchCoordinator: enabled, pair_wait={v}µs");
+    }
+}
+
 if (profile)
 {
     long n = 0, vSum = 0, sSum = 0, jSum = 0;
@@ -545,43 +559,55 @@ else if (fastJson)
 }
 else
 {
-    app.MapPost("/fraud-score", (FraudRequest request) =>
+    if (batchCoord is not null)
     {
-        Span<float> query = stackalloc float[Dataset.Dimensions];
-        vectorizer.Vectorize(request, query);
-        float score;
-        if (cascadeEnabled)
+        // L1 batched path: handler is async because we await the worker's TCS.
+        app.MapPost("/fraud-score", async (FraudRequest request) =>
         {
-            Span<int>   top3Cells = stackalloc int[3];
-            Span<float> top3Dists = stackalloc float[3];
-            ivfScorerForCascade!.ComputeTop3Cells(query, top3Cells, top3Dists);
-            var (decided, cascadeScore) = Rinha.Api.Scorers.Cascade.TryDecide(query, top3Cells, top3Dists);
-            score = decided ? cascadeScore : scorer.Score(query);
-        }
-        else
+            var qArr = new float[Dataset.Dimensions];
+            vectorizer.Vectorize(request, qArr.AsSpan());
+            float bs = await batchCoord.SubmitAsync(qArr).ConfigureAwait(false);
+            return Results.Json(new FraudResponse(bs < 0.6f, bs), AppJsonContext.Default.FraudResponse);
+        });
+    }
+    else
+    {
+        app.MapPost("/fraud-score", (FraudRequest request) =>
         {
-            bool isHard = (hardqDeadlineUs > 0 || hardqNProbeEasy > 0)
-                && Rinha.Api.Scorers.HardQueryClassifier.IsHard(query);
-            // Hard queries get the static deadline (default 1500µs) at full nProbe.
-            // Easy queries get reduced nProbe + (same deadline as a safety cap on tail).
-            int dl = isHard ? hardqDeadlineUs : (hardqNProbeEasy > 0 ? hardqDeadlineUs : 0);
-            if (dl > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = dl;
-            if (!isHard && hardqNProbeEasy > 0)
+            Span<float> query = stackalloc float[Dataset.Dimensions];
+            vectorizer.Vectorize(request, query);
+            float score;
+            if (cascadeEnabled)
             {
-                Rinha.Api.Scorers.IvfScorer.CallNProbe = hardqNProbeEasy;
+                Span<int>   top3Cells = stackalloc int[3];
+                Span<float> top3Dists = stackalloc float[3];
+                ivfScorerForCascade!.ComputeTop3Cells(query, top3Cells, top3Dists);
+                var (decided, cascadeScore) = Rinha.Api.Scorers.Cascade.TryDecide(query, top3Cells, top3Dists);
+                score = decided ? cascadeScore : scorer.Score(query);
             }
-            score = scorer.Score(query);
-            Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
-            Rinha.Api.Scorers.IvfScorer.CallNProbe = 0;
-        }
-        if (Rinha.Api.HardQueryDump.Enabled)
-        {
-            Rinha.Api.HardQueryDump.Append(query,
-                Rinha.Api.Scorers.IvfScorer.LastRowsScanned,
-                Rinha.Api.Scorers.IvfScorer.LastEarlyStopMode);
-        }
-        return Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
-    });
+            else
+            {
+                bool isHard = (hardqDeadlineUs > 0 || hardqNProbeEasy > 0)
+                    && Rinha.Api.Scorers.HardQueryClassifier.IsHard(query);
+                int dl = isHard ? hardqDeadlineUs : (hardqNProbeEasy > 0 ? hardqDeadlineUs : 0);
+                if (dl > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = dl;
+                if (!isHard && hardqNProbeEasy > 0)
+                {
+                    Rinha.Api.Scorers.IvfScorer.CallNProbe = hardqNProbeEasy;
+                }
+                score = scorer.Score(query);
+                Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
+                Rinha.Api.Scorers.IvfScorer.CallNProbe = 0;
+            }
+            if (Rinha.Api.HardQueryDump.Enabled)
+            {
+                Rinha.Api.HardQueryDump.Append(query,
+                    Rinha.Api.Scorers.IvfScorer.LastRowsScanned,
+                    Rinha.Api.Scorers.IvfScorer.LastEarlyStopMode);
+            }
+            return Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
+        });
+    }
 }
 
 app.Lifetime.ApplicationStopping.Register(() => Rinha.Api.HardQueryDump.Close());
