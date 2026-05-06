@@ -164,72 +164,114 @@ public sealed unsafe class Dataset : IDisposable
     /// Pre-touch all mmap-backed pages so the first user requests don't pay
     /// minor page-fault overhead. Reads one byte per 4KB page across every
     /// view that was actually opened. Returns the total bytes scanned.
+    /// L3: also calls madvise(MADV_HUGEPAGE) on each region to promote 4KB
+    /// pages to 2MB hugepages, shrinking the TLB footprint dramatically
+    /// (192MB float dataset = 48k 4KB pages → 96 2MB pages).
     /// </summary>
     public long Prefetch()
     {
         const int PageSize = 4096;
         long total = 0;
         long sink = 0;
+        long hpTotal = 0;
 
         long vBytes = (long)Count * PaddedDimensions * sizeof(float);
+        hpTotal += AdviseHuge((byte*)_vectorsPtr, vBytes);
         sink += TouchPages((byte*)_vectorsPtr, vBytes, PageSize);
         total += vBytes;
 
         long lBytes = Count;
+        hpTotal += AdviseHuge(_labelsPtr, lBytes);
         sink += TouchPages(_labelsPtr, lBytes, PageSize);
         total += lBytes;
 
         if (_q8Ptr != null)
         {
             long bytes = (long)Count * 16; // q8 row stride = PaddedDimensions (16)
+            hpTotal += AdviseHuge((byte*)_q8Ptr, bytes);
             sink += TouchPages((byte*)_q8Ptr, bytes, PageSize);
             total += bytes;
         }
         if (_q8SoaPtr != null)
         {
             long bytes = (long)Count * Dimensions;
+            hpTotal += AdviseHuge((byte*)_q8SoaPtr, bytes);
             sink += TouchPages((byte*)_q8SoaPtr, bytes, PageSize);
             total += bytes;
         }
         if (_centroidsPtr != null)
         {
             long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+            hpTotal += AdviseHuge((byte*)_centroidsPtr, bytes);
             sink += TouchPages((byte*)_centroidsPtr, bytes, PageSize);
             total += bytes;
         }
         if (_offsetsPtr != null)
         {
             long bytes = (long)(NumCells + 1) * sizeof(int);
+            hpTotal += AdviseHuge((byte*)_offsetsPtr, bytes);
             sink += TouchPages((byte*)_offsetsPtr, bytes, PageSize);
             total += bytes;
         }
         if (_bboxMinPtr != null)
         {
             long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+            hpTotal += AdviseHuge((byte*)_bboxMinPtr, bytes);
             sink += TouchPages((byte*)_bboxMinPtr, bytes, PageSize);
             total += bytes;
         }
         if (_bboxMaxPtr != null)
         {
             long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+            hpTotal += AdviseHuge((byte*)_bboxMaxPtr, bytes);
             sink += TouchPages((byte*)_bboxMaxPtr, bytes, PageSize);
             total += bytes;
         }
         if (_pqCodebooksPtr != null)
         {
             long bytes = (long)PqM * PqKsub * (Dimensions / PqM) * sizeof(float);
+            hpTotal += AdviseHuge((byte*)_pqCodebooksPtr, bytes);
             sink += TouchPages((byte*)_pqCodebooksPtr, bytes, PageSize);
             total += bytes;
         }
         if (_pqCodesPtr != null)
         {
             long bytes = (long)Count * PqM;
+            hpTotal += AdviseHuge(_pqCodesPtr, bytes);
             sink += TouchPages(_pqCodesPtr, bytes, PageSize);
             total += bytes;
         }
 
         GC.KeepAlive(sink);
+        LastHugepageAdvisedBytes = hpTotal;
         return total;
+    }
+
+    /// <summary>Total bytes successfully advised with MADV_HUGEPAGE on the last Prefetch call. 0 on non-Linux or if disabled.</summary>
+    public long LastHugepageAdvisedBytes { get; private set; }
+
+    [DllImport("libc", EntryPoint = "madvise", SetLastError = true)]
+    private static extern int LinuxMadvise(IntPtr addr, UIntPtr length, int advice);
+    private const int MADV_HUGEPAGE = 14;
+    private static readonly bool s_thpEnabled =
+        Environment.GetEnvironmentVariable("DATASET_THP") != "0" &&
+        OperatingSystem.IsLinux();
+
+    private static long AdviseHuge(byte* p, long bytes)
+    {
+        if (!s_thpEnabled || bytes <= 0) return 0;
+        // madvise requires page-aligned start; mmap base is always page-aligned,
+        // so just round length up to whole pages.
+        UIntPtr len = (UIntPtr)bytes;
+        try
+        {
+            int rc = LinuxMadvise((IntPtr)p, len, MADV_HUGEPAGE);
+            return rc == 0 ? bytes : 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     private static long TouchPages(byte* p, long bytes, int pageSize)

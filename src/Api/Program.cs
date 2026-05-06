@@ -99,7 +99,8 @@ if (Environment.GetEnvironmentVariable("WARMUP") != "0")
     swJit.Stop();
     GC.KeepAlive(warmSink);
     Console.WriteLine($"Warm-up: prefetch={touched / (1024 * 1024)}MiB in {swPre.ElapsedMilliseconds}ms, " +
-                      $"jit={warmupIters} iters in {swJit.ElapsedMilliseconds}ms.");
+                      $"jit={warmupIters} iters in {swJit.ElapsedMilliseconds}ms, " +
+                      $"thp_advised={dataset.LastHugepageAdvisedBytes / (1024 * 1024)}MiB.");
 }
 
 var app = builder.Build();
