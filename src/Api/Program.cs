@@ -163,6 +163,16 @@ int hardqDeadlineUs = 0;
     if (hardqDeadlineUs > 0) Console.WriteLine($"HardQueryClassifier: enabled, deadline={hardqDeadlineUs}µs on hard");
 }
 
+// L4: adaptive nProbe — drop nProbe on classifier-predicted EASY queries
+// (the bulk, ~95.7%) to save Q8 scan work; keep full nProbe on HARD queries.
+// Disabled when 0 (use static IVF_NPROBE for everyone).
+int hardqNProbeEasy = 0;
+{
+    var s = Environment.GetEnvironmentVariable("HARDQ_NPROBE_EASY");
+    if (!string.IsNullOrEmpty(s) && int.TryParse(s, out var v) && v > 0) hardqNProbeEasy = v;
+    if (hardqNProbeEasy > 0) Console.WriteLine($"HardQueryClassifier: nProbe={hardqNProbeEasy} on easy queries");
+}
+
 if (profile)
 {
     long n = 0, vSum = 0, sSum = 0, jSum = 0;
@@ -550,12 +560,19 @@ else
         }
         else
         {
-            if (hardqDeadlineUs > 0 && Rinha.Api.Scorers.HardQueryClassifier.IsHard(query))
+            bool isHard = (hardqDeadlineUs > 0 || hardqNProbeEasy > 0)
+                && Rinha.Api.Scorers.HardQueryClassifier.IsHard(query);
+            // Hard queries get the static deadline (default 1500µs) at full nProbe.
+            // Easy queries get reduced nProbe + (same deadline as a safety cap on tail).
+            int dl = isHard ? hardqDeadlineUs : (hardqNProbeEasy > 0 ? hardqDeadlineUs : 0);
+            if (dl > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = dl;
+            if (!isHard && hardqNProbeEasy > 0)
             {
-                Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = hardqDeadlineUs;
+                Rinha.Api.Scorers.IvfScorer.CallNProbe = hardqNProbeEasy;
             }
             score = scorer.Score(query);
             Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
+            Rinha.Api.Scorers.IvfScorer.CallNProbe = 0;
         }
         if (Rinha.Api.HardQueryDump.Enabled)
         {

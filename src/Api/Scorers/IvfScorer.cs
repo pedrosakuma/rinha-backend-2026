@@ -62,6 +62,11 @@ public sealed unsafe class IvfScorer : IFraudScorer
     /// hard-query classifier; reset to 0 after Score() returns. ThreadStatic, no contention.</summary>
     [ThreadStatic] public static int CallDeadlineUs;
 
+    /// <summary>L4: per-call nProbe override. When &gt; 0 and ≤ constructor _nProbe, scans only
+    /// the top-N cells instead of the full _nProbe. Used by the request handler to drop nProbe
+    /// on easy queries (classifier-predicted), saving Q8 scan work on the bulk.</summary>
+    [ThreadStatic] public static int CallNProbe;
+
     // J21: relax early-stop unanimity from 5/5 to 4/5 (or 1/5). Reduces tail-cell scans on
     // borderline queries at small cost in label accuracy. Env: IVF_EARLY_MAJORITY=1.
     private static readonly bool s_earlyMajority =
@@ -128,6 +133,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
         }
 
         int nlist = _dataset.NumCells;
+        // L4: per-call nProbe override. Buffer stays at _nProbe (max), but we only fill
+        // & scan the top-n cells. Cells[n.._nProbe-1] stay sentinel -1 so scan loops break.
+        int n = (CallNProbe > 0 && CallNProbe <= _nProbe) ? CallNProbe : _nProbe;
         Span<float> centDist = stackalloc float[512]; // safe upper bound; nlist ≤ 512 by config
         if (nlist > 512)
         {
@@ -153,7 +161,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
             }
         }
 
-        // 3) Pick top-NPROBE cells (small partial sort).
+        // 3) Pick top-n cells (small partial sort; buffer is sized to _nProbe = max).
         Span<int>   cells     = stackalloc int[_nProbe];
         Span<float> cellsDist = stackalloc float[_nProbe];
         for (int i = 0; i < _nProbe; i++) { cells[i] = -1; cellsDist[i] = float.PositiveInfinity; }
@@ -163,12 +171,12 @@ public sealed unsafe class IvfScorer : IFraudScorer
             float d = centDist[c];
             if (d < cellsWorst)
             {
-                int pos = _nProbe - 1;
+                int pos = n - 1;
                 while (pos > 0 && cellsDist[pos - 1] > d) pos--;
-                for (int j = _nProbe - 1; j > pos; j--) { cellsDist[j] = cellsDist[j - 1]; cells[j] = cells[j - 1]; }
+                for (int j = n - 1; j > pos; j--) { cellsDist[j] = cellsDist[j - 1]; cells[j] = cells[j - 1]; }
                 cellsDist[pos] = d;
                 cells[pos] = c;
-                cellsWorst = cellsDist[_nProbe - 1];
+                cellsWorst = cellsDist[n - 1];
             }
         }
 
@@ -201,8 +209,8 @@ public sealed unsafe class IvfScorer : IFraudScorer
                     // Checkpoint at 75%: smaller savings on easy queries, but cheaper
                     // overhead on the ~3% ambiguous tail (which dominates p99 under
                     // saturation).
-                    int checkpoint = (_nProbe * _earlyStopPct) / 100;
-                    int earlyCheckpoint = (_nProbe * _earlyStopPctEarly) / 100;
+                    int checkpoint = (n * _earlyStopPct) / 100;
+                    int earlyCheckpoint = (n * _earlyStopPctEarly) / 100;
                     int curStart = 0;
 
                     // J12a: optionally reorder cells inside the pre-checkpoint block by
@@ -256,7 +264,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                         }
                     }
 
-                    if (!earlyStopped && checkpoint >= 1 && _nProbe > checkpoint)
+                    if (!earlyStopped && checkpoint >= 1 && n > checkpoint)
                     {
                         ScanCellsQ8Avx2Range(qPtr, cells, curStart, checkpoint, offsets, candDist, candIdx, ref q8Worst);
 
@@ -280,7 +288,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                         }
                         else
                         {
-                            ScanCellsQ8Avx2RangeDeadline(qPtr, cells, checkpoint, _nProbe, offsets, candDist, candIdx, ref q8Worst, deadlineAt);
+                            ScanCellsQ8Avx2RangeDeadline(qPtr, cells, checkpoint, n, offsets, candDist, candIdx, ref q8Worst, deadlineAt);
                         }
                     }
                     else if (!earlyStopped)
