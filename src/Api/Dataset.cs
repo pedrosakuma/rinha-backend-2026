@@ -15,6 +15,7 @@ public sealed unsafe class Dataset : IDisposable
     public const int Dimensions = 14;
     public const int PaddedDimensions = 16;
     public const float Q8Scale = 127f;
+    public const float Q16Scale = 10000f;
 
     private readonly MemoryMappedFile _vectorsMmf;
     private readonly MemoryMappedViewAccessor _vectorsView;
@@ -24,6 +25,8 @@ public sealed unsafe class Dataset : IDisposable
     private readonly MemoryMappedViewAccessor? _q8View;
     private readonly MemoryMappedFile? _q8SoaMmf;
     private readonly MemoryMappedViewAccessor? _q8SoaView;
+    private readonly MemoryMappedFile? _q16Mmf;
+    private readonly MemoryMappedViewAccessor? _q16View;
     private readonly MemoryMappedFile? _centroidsMmf;
     private readonly MemoryMappedViewAccessor? _centroidsView;
     private readonly MemoryMappedFile? _offsetsMmf;
@@ -40,6 +43,7 @@ public sealed unsafe class Dataset : IDisposable
     private readonly byte* _labelsPtr;
     private readonly sbyte* _q8Ptr;
     private readonly sbyte* _q8SoaPtr;
+    private readonly short* _q16Ptr;
     private readonly float* _centroidsPtr;
     private readonly int* _offsetsPtr;
     private readonly float* _bboxMinPtr;
@@ -53,6 +57,7 @@ public sealed unsafe class Dataset : IDisposable
     public int PqKsub { get; }
     public bool HasQ8 => _q8Ptr != null;
     public bool HasQ8Soa => _q8SoaPtr != null;
+    public bool HasQ16 => _q16Ptr != null;
     public bool HasIvf => _centroidsPtr != null && _offsetsPtr != null;
     public bool HasIvfBbox => _bboxMinPtr != null && _bboxMaxPtr != null;
     public bool HasPq => _pqCodebooksPtr != null && _pqCodesPtr != null;
@@ -62,6 +67,7 @@ public sealed unsafe class Dataset : IDisposable
         MemoryMappedFile labelsMmf, MemoryMappedViewAccessor labelsView,
         MemoryMappedFile? q8Mmf, MemoryMappedViewAccessor? q8View,
         MemoryMappedFile? q8SoaMmf, MemoryMappedViewAccessor? q8SoaView,
+        MemoryMappedFile? q16Mmf, MemoryMappedViewAccessor? q16View,
         MemoryMappedFile? centroidsMmf, MemoryMappedViewAccessor? centroidsView,
         MemoryMappedFile? offsetsMmf, MemoryMappedViewAccessor? offsetsView,
         MemoryMappedFile? bboxMinMmf, MemoryMappedViewAccessor? bboxMinView,
@@ -78,6 +84,8 @@ public sealed unsafe class Dataset : IDisposable
         _q8View = q8View;
         _q8SoaMmf = q8SoaMmf;
         _q8SoaView = q8SoaView;
+        _q16Mmf = q16Mmf;
+        _q16View = q16View;
         _centroidsMmf = centroidsMmf;
         _centroidsView = centroidsView;
         _offsetsMmf = offsetsMmf;
@@ -115,6 +123,13 @@ public sealed unsafe class Dataset : IDisposable
             byte* q8SoaBase = null;
             _q8SoaView.SafeMemoryMappedViewHandle.AcquirePointer(ref q8SoaBase);
             _q8SoaPtr = (sbyte*)q8SoaBase;
+        }
+
+        if (_q16View is not null)
+        {
+            byte* q16Base = null;
+            _q16View.SafeMemoryMappedViewHandle.AcquirePointer(ref q16Base);
+            _q16Ptr = (short*)q16Base;
         }
 
         if (_centroidsView is not null)
@@ -319,6 +334,7 @@ public sealed unsafe class Dataset : IDisposable
         string labelsPath,
         string? vectorsQ8Path = null,
         string? vectorsQ8SoaPath = null,
+        string? vectorsQ16Path = null,
         string? ivfCentroidsPath = null,
         string? ivfOffsetsPath = null,
         string? ivfBboxMinPath = null,
@@ -369,6 +385,19 @@ public sealed unsafe class Dataset : IDisposable
                 throw new InvalidDataException($"Q8-SoA file size {soaLen} != expected {soaExpected}");
             q8SoaMmf = MemoryMappedFile.CreateFromFile(vectorsQ8SoaPath, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
             q8SoaView = q8SoaMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        }
+
+        // J25: Q16 (int16) layout for high-precision rerank — replaces float on hot path.
+        MemoryMappedFile? q16Mmf = null;
+        MemoryMappedViewAccessor? q16View = null;
+        if (!string.IsNullOrEmpty(vectorsQ16Path) && File.Exists(vectorsQ16Path))
+        {
+            var q16Len = new FileInfo(vectorsQ16Path).Length;
+            long q16Expected = count * PaddedDimensions * sizeof(short);
+            if (q16Len != q16Expected)
+                throw new InvalidDataException($"Q16 file size {q16Len} != expected {q16Expected}");
+            q16Mmf = MemoryMappedFile.CreateFromFile(vectorsQ16Path, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+            q16View = q16Mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         }
 
         MemoryMappedFile? centroidsMmf = null;
@@ -439,6 +468,7 @@ public sealed unsafe class Dataset : IDisposable
         return new Dataset(
             vectorsMmf, vectorsView, labelsMmf, labelsView,
             q8Mmf, q8View, q8SoaMmf, q8SoaView,
+            q16Mmf, q16View,
             centroidsMmf, centroidsView, offsetsMmf, offsetsView,
             bboxMinMmf, bboxMinView, bboxMaxMmf, bboxMaxView,
             pqCodebooksMmf, pqCodebooksView, pqCodesMmf, pqCodesView,
@@ -483,6 +513,14 @@ public sealed unsafe class Dataset : IDisposable
         get => _q8SoaPtr;
     }
 
+    /// <summary>J25: int16 dense AoS reference vectors (16 shorts per row, padded).
+    /// Same row order as Q8VectorsPtr (post-IVF reorder). Scale = Q16Scale (10000).</summary>
+    public short* Q16VectorsPtr
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _q16Ptr;
+    }
+
     public float* CentroidsPtr
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -513,6 +551,7 @@ public sealed unsafe class Dataset : IDisposable
         try { _labelsView.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _q8View?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _q8SoaView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        try { _q16View?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _centroidsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _offsetsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _bboxMinView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
@@ -527,6 +566,8 @@ public sealed unsafe class Dataset : IDisposable
         _q8Mmf?.Dispose();
         _q8SoaView?.Dispose();
         _q8SoaMmf?.Dispose();
+        _q16View?.Dispose();
+        _q16Mmf?.Dispose();
         _centroidsView?.Dispose();
         _centroidsMmf?.Dispose();
         _offsetsView?.Dispose();

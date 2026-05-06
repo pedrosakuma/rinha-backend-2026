@@ -34,6 +34,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
     private readonly bool _bboxRepair; // J6: bbox LB exact repair
     private readonly int _scalarAbort; // 0=off, 1=AoS dim-unroll (J10), 2=SoA survivor compaction (J11)
     private readonly bool _densityOrder; // J12a: reorder visited cells (within early-stop block) by size desc
+    private readonly bool _useQ16; // J25: use int16 rerank (replaces float on hot path)
 
     /// <summary>Per-thread last-query telemetry. 0=full scan, 1=early stop at early checkpoint,
     /// 2=early stop at main checkpoint. Updated after each Score() call.</summary>
@@ -107,6 +108,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
         if (scalarAbort == 2 && !dataset.HasQ8Soa) scalarAbort = 0;
         _scalarAbort = scalarAbort is >= 0 and <= 2 ? scalarAbort : 0;
         _densityOrder = densityOrder;
+        // J25: enable Q16 rerank if (a) data file present and (b) not explicitly disabled.
+        var q16Env = Environment.GetEnvironmentVariable("IVF_Q16");
+        _useQ16 = dataset.HasQ16 && q16Env != "0";
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -807,6 +811,11 @@ public sealed unsafe class IvfScorer : IFraudScorer
         ReadOnlySpan<int> candDist, ReadOnlySpan<int> candIdx,
         Span<float> bestDist, Span<int> bestIdx)
     {
+        if (_useQ16)
+        {
+            RerankQ16(paddedQuery, candIdx, bestDist, bestIdx);
+            return;
+        }
         float worst = bestDist[K - 1];
         fixed (float* qfPtr = paddedQuery)
         {
@@ -824,6 +833,55 @@ public sealed unsafe class IvfScorer : IFraudScorer
                 var d1 = r1 - q1;
                 var sum = (d0 * d0) + (d1 * d1);
                 float dist = Vector256.Sum(sum);
+                if (dist < worst)
+                {
+                    InsertTopK(bestDist, bestIdx, dist, idx);
+                    worst = bestDist[K - 1];
+                }
+            }
+        }
+    }
+
+    // J25: Q16 (int16) rerank — replaces float on hot path. Working set: 96MB vs 192MB
+    // for float. Same 16-lane width as float (Vector256<short>), but uses int16 ops:
+    // sub (wraps; safe because diff ∈ [-20000,20000]) → MultiplyAddAdjacent (squares
+    // and pairwise-sums into 8 int lanes) → horizontal int sum. Result is converted
+    // back to float via /Q16Scale² so it matches the cellsDist (float L2²) scale.
+    private void RerankQ16(
+        ReadOnlySpan<float> paddedQuery,
+        ReadOnlySpan<int> candIdx,
+        Span<float> bestDist, Span<int> bestIdx)
+    {
+        // Quantize query to 16 shorts on stack. Padding lanes (14,15) → 0.
+        Span<short> qq = stackalloc short[PaddedDimensions];
+        for (int i = 0; i < Dataset.Dimensions; i++)
+        {
+            int q = (int)MathF.Round(paddedQuery[i] * Dataset.Q16Scale);
+            if (q > 32767) q = 32767;
+            else if (q < -32768) q = -32768;
+            qq[i] = (short)q;
+        }
+        // qq[14], qq[15] left as 0 (stackalloc init may be undefined; explicit clear):
+        qq[14] = 0; qq[15] = 0;
+
+        const float invScaleSq = 1f / (Dataset.Q16Scale * Dataset.Q16Scale); // 1e-8
+
+        float worst = bestDist[K - 1];
+        var q16Vectors = _dataset.Q16VectorsPtr;
+        fixed (short* qPtr = qq)
+        {
+            var qv = Vector256.Load(qPtr); // 16 shorts
+            for (int c = 0; c < candIdx.Length; c++)
+            {
+                int idx = candIdx[c];
+                if (idx < 0) break;
+                short* row = q16Vectors + (long)idx * PaddedDimensions;
+                var rv = Vector256.Load(row);
+                var diff = Avx2.Subtract(rv, qv); // int16 wrap-safe (range fits)
+                // squares + pairwise-sum → 8 int lanes
+                var sq = Avx2.MultiplyAddAdjacent(diff, diff);
+                int distInt = Vector256.Sum(sq);
+                float dist = distInt * invScaleSq;
                 if (dist < worst)
                 {
                     InsertTopK(bestDist, bestIdx, dist, idx);

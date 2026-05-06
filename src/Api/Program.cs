@@ -57,6 +57,7 @@ var vectorsPath = Environment.GetEnvironmentVariable("VECTORS_PATH") ?? "/data/r
 var labelsPath = Environment.GetEnvironmentVariable("LABELS_PATH") ?? "/data/labels.bin";
 var vectorsQ8Path = Environment.GetEnvironmentVariable("VECTORS_Q8_PATH"); // optional
 var vectorsQ8SoaPath = Environment.GetEnvironmentVariable("VECTORS_Q8_SOA_PATH"); // optional (J11)
+var vectorsQ16Path = Environment.GetEnvironmentVariable("VECTORS_Q16_PATH"); // optional (J25)
 var ivfCentroidsPath = Environment.GetEnvironmentVariable("IVF_CENTROIDS_PATH");
 var ivfOffsetsPath = Environment.GetEnvironmentVariable("IVF_OFFSETS_PATH");
 var ivfBboxMinPath = Environment.GetEnvironmentVariable("IVF_BBOX_MIN_PATH");
@@ -70,7 +71,7 @@ var normalizationPath = Environment.GetEnvironmentVariable("NORMALIZATION_PATH")
 
 var normalization = NormalizationConstants.Load(normalizationPath);
 var mccRisk = MccRiskTable.Load(mccRiskPath);
-var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, vectorsQ8SoaPath, ivfCentroidsPath, ivfOffsetsPath, ivfBboxMinPath, ivfBboxMaxPath, pqCodebooksPath, pqCodesPath, pqM, pqKsub);
+var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, vectorsQ8SoaPath, vectorsQ16Path, ivfCentroidsPath, ivfOffsetsPath, ivfBboxMinPath, ivfBboxMaxPath, pqCodebooksPath, pqCodesPath, pqM, pqKsub);
 var vectorizer = new Vectorizer(normalization, mccRisk);
 var jsonVectorizer = new JsonVectorizer(normalization, mccRisk);
 var fastJson = Environment.GetEnvironmentVariable("FAST_JSON") == "1";

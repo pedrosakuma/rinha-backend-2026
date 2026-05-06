@@ -40,6 +40,7 @@ public static unsafe class IvfBuilder
         // If provided, must come BEFORE positional numeric args. Detect by ".bin" suffix.
         string? bboxMinPath = null, bboxMaxPath = null;
         string? q8SoaPath = null; // J11: SoA layout for scalar early-abort
+        string? q16Path = null;   // J25: int16 rerank (replaces float on hot path)
         int positional = 5;
         if (args.Length > 5 && args[5].EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
             && args.Length > 6 && args[6].EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
@@ -51,6 +52,11 @@ public static unsafe class IvfBuilder
             {
                 q8SoaPath = args[7];
                 positional = 8;
+                if (args.Length > 8 && args[8].EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+                {
+                    q16Path = args[8];
+                    positional = 9;
+                }
             }
         }
         int nlist = args.Length > positional ? int.Parse(args[positional]) : 256;
@@ -157,6 +163,33 @@ public static unsafe class IvfBuilder
             }
             WriteAll(q8SoaPath, MemoryMarshal.AsBytes(soa.AsSpan()));
             Console.Error.WriteLine($"  q8-soa in {sw.Elapsed.TotalSeconds:F2}s ({Dimensions}x{n} bytes)");
+        }
+
+        // J25: Q16 (int16) layout for high-precision rerank (replaces float on hot path).
+        // Scale = 10000 (queries are pre-rounded to 4dp, references upstream are also 4dp).
+        // Range used: [-10000, 10000] fits comfortably in int16. Sentinel -1f → -10000.
+        // Padding (dims 14..15) → 0. Storage: N * 16 * 2 = 32 bytes/row (96MB total),
+        // vs 64 bytes/row for float. Net working-set save: ~96MB.
+        if (q16Path is not null)
+        {
+            sw.Restart();
+            var q16 = new short[(long)n * PaddedDimensions];
+            for (int r = 0; r < n; r++)
+            {
+                long baseSrc = (long)r * PaddedDimensions;
+                long baseDst = (long)r * PaddedDimensions;
+                for (int d = 0; d < Dimensions; d++)
+                {
+                    float v = newVecs[baseSrc + d];
+                    int q = (int)MathF.Round(v * 10000f);
+                    if (q > 32767) q = 32767;
+                    else if (q < -32768) q = -32768;
+                    q16[baseDst + d] = (short)q;
+                }
+                // padding lanes already zero (default-initialized array)
+            }
+            WriteAll(q16Path, MemoryMarshal.AsBytes(q16.AsSpan()));
+            Console.Error.WriteLine($"  q16 in {sw.Elapsed.TotalSeconds:F2}s ({n}x{PaddedDimensions} shorts = {(long)n * PaddedDimensions * 2:N0} bytes)");
         }
 
         // Stats
