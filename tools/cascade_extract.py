@@ -146,6 +146,11 @@ def main():
         if (i + 1) % 10000 == 0:
             print(f"  vectorized {i+1}/{n}")
 
+    # Match production Vectorizer.cs: round to 4dp, preserving -1 sentinel.
+    # Aligns cascade training data with what the API actually classifies on.
+    mask = feats >= 0.0
+    feats[mask] = np.round(feats[mask] * 10000.0) / 10000.0
+
     # Distances to all centroids: (n, 256) squared L2.
     # ||q-c||^2 = ||q||^2 + ||c||^2 - 2 q·c
     print("computing centroid distances…")

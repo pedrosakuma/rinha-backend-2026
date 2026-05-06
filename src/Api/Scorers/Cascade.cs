@@ -23,33 +23,33 @@ public static class Cascade
         ReadOnlySpan<int>   top3Cells,
         ReadOnlySpan<float> top3Dists)
     {
-        if (query[7] <= 0.1830768f)
+        if (query[7] <= 0.1830500f)
         {
-            if (query[2] <= 0.0738907f)
+            if (query[2] <= 0.0739000f)
             {
                 // leaf 2: n=28795 purity=1.000 pred=legit
                 return (true, 0f);
             }
             else
             {
-                if (top3Dists[0] <= 0.1385360f)
+                if (top3Dists[0] <= 0.1385379f)
                 {
                     if (top3Dists[0] <= 0.1302495f)
                     {
-                        if (query[13] <= 0.0138325f)
+                        if (query[13] <= 0.0135500f)
                         {
-                            // leaf 6: n=84 purity=0.714 REJECT → IvfScorer fallback
+                            // leaf 6: n=81 purity=0.716 REJECT → IvfScorer fallback
                             return (false, 0f);
                         }
                         else
                         {
-                            // leaf 7: n=168 purity=0.506 REJECT → IvfScorer fallback
+                            // leaf 7: n=171 purity=0.503 REJECT → IvfScorer fallback
                             return (false, 0f);
                         }
                     }
                     else
                     {
-                        if (query[6] <= 0.1522945f)
+                        if (query[6] <= 0.1523000f)
                         {
                             // leaf 9: n=20 purity=0.700 REJECT → IvfScorer fallback
                             return (false, 0f);
@@ -63,7 +63,7 @@ public static class Cascade
                 }
                 else
                 {
-                    if (query[7] <= 0.1166595f)
+                    if (query[7] <= 0.1166500f)
                     {
                         if (query[12] <= 0.3250000f)
                         {
@@ -78,7 +78,7 @@ public static class Cascade
                     }
                     else
                     {
-                        if (top3Dists[0] <= 0.1638474f)
+                        if (top3Dists[0] <= 0.1638200f)
                         {
                             // leaf 16: n=59 purity=0.610 REJECT → IvfScorer fallback
                             return (false, 0f);
@@ -94,27 +94,27 @@ public static class Cascade
         }
         else
         {
-            if (query[3] <= 0.2826087f)
+            if (query[3] <= 0.2826000f)
             {
-                if (query[5] <= 0.0069444f)
+                if (query[5] <= 0.0069000f)
                 {
-                    if (query[13] <= 0.0099985f)
+                    if (query[0] <= 0.2001500f)
                     {
-                        if (query[0] <= 0.2003375f)
+                        // leaf 21: n=22 purity=0.682 REJECT → IvfScorer fallback
+                        return (false, 0f);
+                    }
+                    else
+                    {
+                        if (query[2] <= 0.7198500f)
                         {
-                            // leaf 22: n=20 purity=0.950 REJECT → IvfScorer fallback
+                            // leaf 23: n=20 purity=0.950 REJECT → IvfScorer fallback
                             return (false, 0f);
                         }
                         else
                         {
-                            // leaf 23: n=22764 purity=1.000 pred=fraud
+                            // leaf 24: n=22762 purity=1.000 pred=fraud
                             return (true, 1f);
                         }
-                    }
-                    else
-                    {
-                        // leaf 24: n=20 purity=0.650 REJECT → IvfScorer fallback
-                        return (false, 0f);
                     }
                 }
                 else
@@ -126,7 +126,7 @@ public static class Cascade
                     }
                     else
                     {
-                        if (query[13] <= 0.0159435f)
+                        if (query[13] <= 0.0159500f)
                         {
                             // leaf 28: n=23 purity=0.609 REJECT → IvfScorer fallback
                             return (false, 0f);
@@ -143,9 +143,9 @@ public static class Cascade
             {
                 if ((float)top3Cells[1] <= 106.0000000f)
                 {
-                    if (top3Dists[2] <= 0.7867591f)
+                    if (top3Dists[2] <= 0.7867596f)
                     {
-                        if (query[0] <= 0.0574395f)
+                        if (query[0] <= 0.0574500f)
                         {
                             // leaf 33: n=29 purity=0.690 REJECT → IvfScorer fallback
                             return (false, 0f);
@@ -158,7 +158,7 @@ public static class Cascade
                     }
                     else
                     {
-                        if (query[0] <= 0.2470425f)
+                        if (query[0] <= 0.2470500f)
                         {
                             // leaf 36: n=59 purity=0.814 REJECT → IvfScorer fallback
                             return (false, 0f);
@@ -172,7 +172,7 @@ public static class Cascade
                 }
                 else
                 {
-                    if (top3Dists[1] <= 0.9609268f)
+                    if (top3Dists[1] <= 0.9609618f)
                     {
                         if ((float)top3Cells[0] <= 169.0000000f)
                         {

@@ -33,7 +33,7 @@
       "is_leaf": false,
       "feature_idx": 7,
       "feature_name": "v7",
-      "threshold": 0.18307683616876602,
+      "threshold": 0.1830499991774559,
       "left": 1,
       "right": 18
     },
@@ -42,7 +42,7 @@
       "is_leaf": false,
       "feature_idx": 2,
       "feature_name": "v2",
-      "threshold": 0.0738906692713499,
+      "threshold": 0.07390000112354755,
       "left": 2,
       "right": 3
     },
@@ -59,7 +59,7 @@
       "is_leaf": false,
       "feature_idx": 17,
       "feature_name": "d0",
-      "threshold": 0.1385359764099121,
+      "threshold": 0.13853788375854492,
       "left": 4,
       "right": 11
     },
@@ -77,7 +77,7 @@
       "is_leaf": false,
       "feature_idx": 13,
       "feature_name": "v13",
-      "threshold": 0.013832500204443932,
+      "threshold": 0.01355000026524067,
       "left": 6,
       "right": 7
     },
@@ -86,23 +86,23 @@
       "is_leaf": true,
       "decided": false,
       "pred": 0,
-      "n": 84,
-      "purity": 0.7142857142857143
+      "n": 81,
+      "purity": 0.7160493827160493
     },
     {
       "node_id": 7,
       "is_leaf": true,
       "decided": false,
       "pred": 1,
-      "n": 168,
-      "purity": 0.5059523809523809
+      "n": 171,
+      "purity": 0.5029239766081871
     },
     {
       "node_id": 8,
       "is_leaf": false,
       "feature_idx": 6,
       "feature_name": "v6",
-      "threshold": 0.15229453891515732,
+      "threshold": 0.15230000019073486,
       "left": 9,
       "right": 10
     },
@@ -127,7 +127,7 @@
       "is_leaf": false,
       "feature_idx": 7,
       "feature_name": "v7",
-      "threshold": 0.11665946990251541,
+      "threshold": 0.11665000021457672,
       "left": 12,
       "right": 15
     },
@@ -161,7 +161,7 @@
       "is_leaf": false,
       "feature_idx": 17,
       "feature_name": "d0",
-      "threshold": 0.1638474464416504,
+      "threshold": 0.1638200283050537,
       "left": 16,
       "right": 17
     },
@@ -186,7 +186,7 @@
       "is_leaf": false,
       "feature_idx": 3,
       "feature_name": "v3",
-      "threshold": 0.28260868787765503,
+      "threshold": 0.282600000500679,
       "left": 19,
       "right": 30
     },
@@ -195,30 +195,38 @@
       "is_leaf": false,
       "feature_idx": 5,
       "feature_name": "v5",
-      "threshold": 0.0069444444961845875,
+      "threshold": 0.006900000153109431,
       "left": 20,
       "right": 25
     },
     {
       "node_id": 20,
       "is_leaf": false,
-      "feature_idx": 13,
-      "feature_name": "v13",
-      "threshold": 0.009998499881476164,
+      "feature_idx": 0,
+      "feature_name": "v0",
+      "threshold": 0.2001500055193901,
       "left": 21,
-      "right": 24
+      "right": 22
     },
     {
       "node_id": 21,
-      "is_leaf": false,
-      "feature_idx": 0,
-      "feature_name": "v0",
-      "threshold": 0.2003374993801117,
-      "left": 22,
-      "right": 23
+      "is_leaf": true,
+      "decided": false,
+      "pred": 1,
+      "n": 22,
+      "purity": 0.6818181818181818
     },
     {
       "node_id": 22,
+      "is_leaf": false,
+      "feature_idx": 2,
+      "feature_name": "v2",
+      "threshold": 0.7198500037193298,
+      "left": 23,
+      "right": 24
+    },
+    {
+      "node_id": 23,
       "is_leaf": true,
       "decided": false,
       "pred": 1,
@@ -226,20 +234,12 @@
       "purity": 0.95
     },
     {
-      "node_id": 23,
+      "node_id": 24,
       "is_leaf": true,
       "decided": true,
       "pred": 1,
-      "n": 22764,
+      "n": 22762,
       "purity": 1.0
-    },
-    {
-      "node_id": 24,
-      "is_leaf": true,
-      "decided": false,
-      "pred": 1,
-      "n": 20,
-      "purity": 0.65
     },
     {
       "node_id": 25,
@@ -263,7 +263,7 @@
       "is_leaf": false,
       "feature_idx": 13,
       "feature_name": "v13",
-      "threshold": 0.015943500213325024,
+      "threshold": 0.01595000084489584,
       "left": 28,
       "right": 29
     },
@@ -297,7 +297,7 @@
       "is_leaf": false,
       "feature_idx": 19,
       "feature_name": "d2",
-      "threshold": 0.7867591381072998,
+      "threshold": 0.786759614944458,
       "left": 32,
       "right": 35
     },
@@ -306,7 +306,7 @@
       "is_leaf": false,
       "feature_idx": 0,
       "feature_name": "v0",
-      "threshold": 0.05743950046598911,
+      "threshold": 0.05745000019669533,
       "left": 33,
       "right": 34
     },
@@ -331,7 +331,7 @@
       "is_leaf": false,
       "feature_idx": 0,
       "feature_name": "v0",
-      "threshold": 0.24704249948263168,
+      "threshold": 0.2470499947667122,
       "left": 36,
       "right": 37
     },
@@ -356,7 +356,7 @@
       "is_leaf": false,
       "feature_idx": 18,
       "feature_name": "d1",
-      "threshold": 0.9609267711639404,
+      "threshold": 0.9609618186950684,
       "left": 39,
       "right": 42
     },
