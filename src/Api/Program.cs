@@ -14,8 +14,10 @@ using System.IO.Pipelines;
 // pool when running with a mixed-latency handler.
 var tpMin = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_WORKERS"), out var _tpMin) && _tpMin > 0 ? _tpMin : 1;
 var tpMax = int.TryParse(Environment.GetEnvironmentVariable("TP_MAX_WORKERS"), out var _tpMax) && _tpMax > 0 ? _tpMax : 2;
-ThreadPool.SetMinThreads(workerThreads: tpMin, completionPortThreads: 1);
-ThreadPool.SetMaxThreads(workerThreads: tpMax, completionPortThreads: 2);
+var ioMin = int.TryParse(Environment.GetEnvironmentVariable("TP_MIN_IO"), out var _ioMin) && _ioMin > 0 ? _ioMin : 1;
+var ioMax = int.TryParse(Environment.GetEnvironmentVariable("TP_MAX_IO"), out var _ioMax) && _ioMax > 0 ? _ioMax : 2;
+ThreadPool.SetMinThreads(workerThreads: tpMin, completionPortThreads: ioMin);
+ThreadPool.SetMaxThreads(workerThreads: tpMax, completionPortThreads: ioMax);
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
@@ -77,15 +79,6 @@ var jsonVectorizer = new JsonVectorizer(normalization, mccRisk);
 var fastJson = Environment.GetEnvironmentVariable("FAST_JSON") == "1";
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
-
-// Cascade pre-classifier (J15, exploration). Tested as a depth=4 sklearn DecisionTree
-// committing 53% of queries (km_from_home<0.18 AND amount_vs_avg<0.07 → always legit, n=28795,
-// purity=1.0, zero CV errors). Result: p50/p90 down 47-56% but p99 up 43-700% (k6 ramping
-// arrival rate refills VUs faster, increasing concurrency). Net: −157pts in profile=full.
-// Kept as opt-in (CASCADE=1) for future experiments targeting hard queries instead of easy ones.
-var cascadeEnabled = Environment.GetEnvironmentVariable("CASCADE") == "1"
-                     && scorer is Rinha.Api.Scorers.IvfScorer;
-var ivfScorerForCascade = cascadeEnabled ? (Rinha.Api.Scorers.IvfScorer)scorer : null;
 
 // Pre-touch all mmap pages and run a JIT warm-up so the first user requests
 // don't pay page-fault or tier0->tier1 jit overhead. Disable with WARMUP=0.
@@ -508,29 +501,11 @@ else if (fastJson)
         pipe.AdvanceTo(buffer.End);
 
         float score;
-        if (cascadeEnabled)
-        {
-            Span<int>   top3Cells = stackalloc int[3];
-            Span<float> top3Dists = stackalloc float[3];
-            ivfScorerForCascade!.ComputeTop3Cells(query, top3Cells, top3Dists);
-            var (decided, cascadeScore) = Rinha.Api.Scorers.Cascade.TryDecide(query, top3Cells, top3Dists);
-            if (decided)
-            {
-                score = cascadeScore;
-            }
-            else
-            {
-                // Cascade-rejected queries are inherently uncertain — apply the hard-query
-                // deadline (same one HardQueryClassifier uses) to keep p99 bounded.
-                if (hardqDeadlineUs > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = hardqDeadlineUs;
-                score = scorer.Score(query);
-                Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
-            }
-        }
-        else
-        {
-            score = scorer.Score(query);
-        }
+        // Cascade-rejected queries are inherently uncertain — apply the hard-query
+        // deadline (same one HardQueryClassifier uses) to keep p99 bounded.
+        if (hardqDeadlineUs > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = hardqDeadlineUs;
+        score = scorer.Score(query);
+        Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
 
         // Hand-written response: "{\"approved\":true|false,\"fraud_score\":<float>}"
         // Allocation-free path through Response.BodyWriter (PipeWriter) — get a memory
@@ -598,28 +573,17 @@ else
             Span<float> query = stackalloc float[Dataset.Dimensions];
             vectorizer.Vectorize(request, query);
             float score;
-            if (cascadeEnabled)
+            bool isHard = (hardqDeadlineUs > 0 || hardqNProbeEasy > 0)
+                && Rinha.Api.Scorers.HardQueryClassifier.IsHard(query);
+            int dl = isHard ? hardqDeadlineUs : (hardqNProbeEasy > 0 ? hardqDeadlineUs : 0);
+            if (dl > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = dl;
+            if (!isHard && hardqNProbeEasy > 0)
             {
-                Span<int>   top3Cells = stackalloc int[3];
-                Span<float> top3Dists = stackalloc float[3];
-                ivfScorerForCascade!.ComputeTop3Cells(query, top3Cells, top3Dists);
-                var (decided, cascadeScore) = Rinha.Api.Scorers.Cascade.TryDecide(query, top3Cells, top3Dists);
-                score = decided ? cascadeScore : scorer.Score(query);
+                Rinha.Api.Scorers.IvfScorer.CallNProbe = hardqNProbeEasy;
             }
-            else
-            {
-                bool isHard = (hardqDeadlineUs > 0 || hardqNProbeEasy > 0)
-                    && Rinha.Api.Scorers.HardQueryClassifier.IsHard(query);
-                int dl = isHard ? hardqDeadlineUs : (hardqNProbeEasy > 0 ? hardqDeadlineUs : 0);
-                if (dl > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = dl;
-                if (!isHard && hardqNProbeEasy > 0)
-                {
-                    Rinha.Api.Scorers.IvfScorer.CallNProbe = hardqNProbeEasy;
-                }
-                score = scorer.Score(query);
-                Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
-                Rinha.Api.Scorers.IvfScorer.CallNProbe = 0;
-            }
+            score = scorer.Score(query);
+            Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
+            Rinha.Api.Scorers.IvfScorer.CallNProbe = 0;
             if (Rinha.Api.HardQueryDump.Enabled)
             {
                 Rinha.Api.HardQueryDump.Append(query,

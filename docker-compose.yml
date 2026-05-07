@@ -22,18 +22,16 @@ services:
       IVF_EARLY_MAJORITY: "${IVF_EARLY_MAJORITY:-0}"
       IVF_DEADLINE_US: "${IVF_DEADLINE_US:-0}"
       HARDQ_DUMP_PATH: "${HARDQ_DUMP_PATH:-}"
-      HARDQ_DEADLINE_US: "${HARDQ_DEADLINE_US:-1500}"
+      HARDQ_DEADLINE_US: "${HARDQ_DEADLINE_US:-3000}"
       HARDQ_NPROBE_EASY: "${HARDQ_NPROBE_EASY:-0}"
       IVF_BATCH_WAIT_US: "${IVF_BATCH_WAIT_US:-0}"
       DATASET_THP: "${DATASET_THP:-1}"
       DATASET_MLOCK: "${DATASET_MLOCK:-0}"
-      # CASCADE=1 ativa decision-tree pre-classifier. ATENÇÃO: tree foi treinada
-      # em bench/k6/test-data.json (test set literal) → cheat. Mantido como toggle.
-      # Default 0 = combo defensível. Ver docs/perf-journal.md.
-      CASCADE: "${CASCADE:-0}"
       IVF_PREFETCH: "${IVF_PREFETCH:-0}"
-      TP_MIN_WORKERS: "${TP_MIN_WORKERS:-1}"
+      TP_MIN_WORKERS: "${TP_MIN_WORKERS:-2}"
       TP_MAX_WORKERS: "${TP_MAX_WORKERS:-2}"
+      TP_MIN_IO: "${TP_MIN_IO:-2}"
+      TP_MAX_IO: "${TP_MAX_IO:-4}"
       SCORER: "${SCORER:-ivf}"
       IVF_NPROBE: "${IVF_NPROBE:-8}"
       # IVF_RERANK (kPrime): 24 é sweet spot cascade-off Q16 (sweep 16-128).
@@ -61,7 +59,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
+          cpus: "0.37"
           memory: "150MB"
 
   api2:
@@ -82,7 +80,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.26"
           memory: "50MB"
 
 networks:
