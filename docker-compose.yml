@@ -11,6 +11,10 @@ services:
       context: .
       dockerfile: docker/Dockerfile.api
     image: ghcr.io/pedrosakuma/rinha-backend-2026-api:latest
+    # J25: pin a réplica em 2 logical CPUs para reduzir CFS migration jitter
+    # (insight do repo zan-dotnet). api1=cpus 0,1; api2=2,3; lb=0,2.
+    # Requer host com ≥4 logical CPUs (típico em qualquer máquina de avaliação).
+    cpuset: "0,1"
     environment:
       PORT: "9999"
       DOTNET_GCHeapCount: "1"
@@ -64,11 +68,13 @@ services:
 
   api2:
     <<: *api
+    cpuset: "2,3"
     depends_on:
       - api1
 
   lb:
     image: nginx:1.27-alpine
+    cpuset: "0,2"
     ports:
       - "9999:9999"
     volumes:

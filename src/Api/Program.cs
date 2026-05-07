@@ -244,7 +244,7 @@ if (profile)
         // Read scorer telemetry (thread-static, set by IvfScorer).
         int esMode = Rinha.Api.Scorers.IvfScorer.LastEarlyStopMode;
         int rows = Rinha.Api.Scorers.IvfScorer.LastRowsScanned;
-        var resp = Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
+        var resp = PrecomputedFraudResponse.FromScore(score);
         long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
 
         long v = t1 - t0, s = t2 - t1, j = t3 - t2;
@@ -507,26 +507,9 @@ else if (fastJson)
         score = scorer.Score(query);
         Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
 
-        // Hand-written response: "{\"approved\":true|false,\"fraud_score\":<float>}"
-        // Allocation-free path through Response.BodyWriter (PipeWriter) — get a memory
-        // span, write directly, Advance, FlushAsync.
-        ctx.Response.StatusCode = 200;
-        ctx.Response.ContentType = "application/json";
-
-        var bw = ctx.Response.BodyWriter;
-        var outMem = bw.GetMemory(64);
-        var outSpan = outMem.Span;
-        int o = 0;
-        ReadOnlySpan<byte> p1True = "{\"approved\":true,\"fraud_score\":"u8;
-        ReadOnlySpan<byte> p1False = "{\"approved\":false,\"fraud_score\":"u8;
-        var prefix = score < 0.6f ? p1True : p1False;
-        prefix.CopyTo(outSpan);
-        o += prefix.Length;
-        if (System.Buffers.Text.Utf8Formatter.TryFormat(score, outSpan[o..], out var written))
-            o += written;
-        outSpan[o++] = (byte)'}';
-        bw.Advance(o);
-        await bw.FlushAsync();
+        // J11d: pré-serializa as 6 respostas possíveis (fraud_score = N/5).
+        // Substitui o write manual de prefixo + Utf8Formatter.TryFormat(score).
+        await PrecomputedFraudResponse.FromScore(score).ExecuteAsync(ctx);
 
         if (allocTrace)
         {
@@ -563,7 +546,7 @@ else
             var qArr = new float[Dataset.Dimensions];
             vectorizer.Vectorize(request, qArr.AsSpan());
             float bs = await batchCoord.SubmitAsync(qArr).ConfigureAwait(false);
-            return Results.Json(new FraudResponse(bs < 0.6f, bs), AppJsonContext.Default.FraudResponse);
+            return PrecomputedFraudResponse.FromScore(bs);
         });
     }
     else
@@ -590,7 +573,7 @@ else
                     Rinha.Api.Scorers.IvfScorer.LastRowsScanned,
                     Rinha.Api.Scorers.IvfScorer.LastEarlyStopMode);
             }
-            return Results.Json(new FraudResponse(score < 0.6f, score), AppJsonContext.Default.FraudResponse);
+            return PrecomputedFraudResponse.FromScore(score);
         });
     }
 }
