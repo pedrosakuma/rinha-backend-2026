@@ -77,7 +77,7 @@ public sealed class JsonVectorizer
         // known_merchants array (start..end, exclusive). 0 = not seen.
         int kmArrStart = 0, kmArrEnd = 0;
         int merchIdStart = 0, merchIdEnd = 0;
-        string mccStr = string.Empty;
+        int mccStart = 0, mccEnd = 0;
 
         var reader = new Utf8JsonReader(body, isFinalBlock: true, state: default);
 
@@ -97,7 +97,7 @@ public sealed class JsonVectorizer
             }
             else if (Equals(ref reader, KMerchant))
             {
-                ReadMerchant(ref reader, body, ref merchAvg, ref merchIdStart, ref merchIdEnd, ref mccStr);
+                ReadMerchant(ref reader, body, ref merchAvg, ref merchIdStart, ref merchIdEnd, ref mccStart, ref mccEnd);
             }
             else if (Equals(ref reader, KTerminal))
             {
@@ -153,7 +153,9 @@ public sealed class JsonVectorizer
         }
         dst[11] = isKnown ? 0f : 1f;
 
-        dst[12] = _mcc.Get(mccStr);
+        dst[12] = mccEnd > mccStart
+            ? _mcc.Get(body.Slice(mccStart, mccEnd - mccStart))
+            : MccRiskTable.Default;
         dst[13] = Clamp01((float)(merchAvg / n.MaxMerchantAvgAmount));
 
         // Match oracle quantization: references in resources/references.json.gz are stored
@@ -249,7 +251,7 @@ public sealed class JsonVectorizer
     private static void ReadMerchant(ref Utf8JsonReader r, ReadOnlySpan<byte> body,
                                      ref double avgAmount,
                                      ref int merchIdStart, ref int merchIdEnd,
-                                     ref string mccStr)
+                                     ref int mccStart, ref int mccEnd)
     {
         r.Read();
         if (r.TokenType != JsonTokenType.StartObject) return;
@@ -282,7 +284,14 @@ public sealed class JsonVectorizer
                 r.Read();
                 if (r.TokenType == JsonTokenType.String)
                 {
-                    mccStr = r.GetString() ?? string.Empty;
+                    // Capture as offsets into the body — MccRiskTable.Get(ReadOnlySpan<byte>)
+                    // resolves it without allocating a string per request.
+                    var span = r.ValueSpan;
+                    if (!span.IsEmpty)
+                    {
+                        mccStart = GetSpanOffset(body, span);
+                        mccEnd = mccStart + span.Length;
+                    }
                 }
             }
             else

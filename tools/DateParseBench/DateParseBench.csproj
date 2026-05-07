@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <!--
+      NOT a NativeAOT project. Runs on the JIT so BenchmarkDotNet can do its
+      warmup/measurement loop and emit assembly listings. Production code in
+      src/Api/ is NativeAOT — absolute ns numbers will differ; relative ranking
+      is what matters here.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.14.0" />
+  </ItemGroup>
+</Project>

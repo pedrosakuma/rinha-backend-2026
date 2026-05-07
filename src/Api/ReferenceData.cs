@@ -33,11 +33,50 @@ public sealed class NormalizationConstants
 public sealed class MccRiskTable
 {
     private readonly Dictionary<string, float> _values;
+    // Parallel byte-keyed lookup for the JSON hot path (zero-alloc).
+    // MCC keys ship as exactly 4 ASCII digits in the dataset, so we pack each
+    // into a uint32 and linear-scan the small table (≤16 entries fits one cache line).
+    private readonly uint[] _keysPacked;
+    private readonly float[] _valuesPacked;
     public const float Default = 0.5f;
 
-    private MccRiskTable(Dictionary<string, float> values) => _values = values;
+    private MccRiskTable(Dictionary<string, float> values)
+    {
+        _values = values;
+        _keysPacked = new uint[values.Count];
+        _valuesPacked = new float[values.Count];
+        int i = 0;
+        foreach (var kv in values)
+        {
+            if (kv.Key.Length != 4)
+                throw new InvalidDataException($"MCC key '{kv.Key}' is not 4 chars (packed-uint lookup invariant)");
+            uint packed = (uint)kv.Key[0]
+                        | ((uint)kv.Key[1] << 8)
+                        | ((uint)kv.Key[2] << 16)
+                        | ((uint)kv.Key[3] << 24);
+            _keysPacked[i] = packed;
+            _valuesPacked[i] = kv.Value;
+            i++;
+        }
+    }
 
     public float Get(string mcc) => _values.TryGetValue(mcc, out var v) ? v : Default;
+
+    /// <summary>Zero-alloc lookup keyed on the raw 4-byte ASCII MCC span (e.g., taken
+    /// directly from Utf8JsonReader.ValueSpan). Returns Default for any non-4-byte input.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public float Get(ReadOnlySpan<byte> mccBytes)
+    {
+        if (mccBytes.Length != 4) return Default;
+        uint packed = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(mccBytes);
+        var keys = _keysPacked;
+        var values = _valuesPacked;
+        for (int i = 0; i < keys.Length; i++)
+        {
+            if (keys[i] == packed) return values[i];
+        }
+        return Default;
+    }
 
     public static MccRiskTable Load(string path)
     {
