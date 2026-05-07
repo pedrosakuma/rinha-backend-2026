@@ -68,12 +68,10 @@ public sealed unsafe class IvfScorer : IFraudScorer
     /// on easy queries (classifier-predicted), saving Q8 scan work on the bulk.</summary>
     [ThreadStatic] public static int CallNProbe;
 
-    // L2 (perf-leads-2026-05): explicit Sse.Prefetch0 in the Q8 scan hot loop. Default off
-    // and dormant — n=5 sweep showed neutral result (+7 pts vs baseline σ≈14, within noise),
-    // confirming the HW prefetcher already covers forward-sequential Q8 row access. Kept as
-    // opt-in (IVF_PREFETCH=1) for revisit if scan layout changes (e.g., Q8-SoA, gather).
-    private static readonly bool s_prefetchEnabled =
-        Environment.GetEnvironmentVariable("IVF_PREFETCH") == "1";
+    // L2 (perf-leads-2026-05): explicit prefetch in Q8 hot loop was tested and rejected
+    // (neutral, n=5 +7 pts within σ≈14). HW prefetcher covers forward-sequential row access.
+    // Code removed in perf-driven cleanup (2026-05). To re-test, see git history for the
+    // s_prefetchEnabled / IVF_PREFETCH env toggle.
 
     // J21: relax early-stop unanimity from 5/5 to 4/5 (or 1/5). Reduces tail-cell scans on
     // borderline queries at small cost in label accuracy. Env: IVF_EARLY_MAJORITY=1.
@@ -891,6 +889,24 @@ public sealed unsafe class IvfScorer : IFraudScorer
         }
     }
 
+    /// <summary>
+    /// Manual horizontal sum of 8 ints in a Vector256&lt;int&gt;.
+    /// JIT/ILC's `Vector256.Sum` codegen emits a redundant `vmovaps ymm,ymm`
+    /// before the extract; profile (perf annotate) showed ~32% of the hot loop
+    /// time on the reduction chain. This handcoded version skips the move and
+    /// uses the canonical `vpaddd + vpshufd` sequence (4 ops on Zen 3).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int HorizontalSumInt(Vector256<int> v)
+    {
+        var lo = v.GetLower();
+        var hi = v.GetUpper();
+        var s = Sse2.Add(lo, hi);                        // 4 ints
+        s = Sse2.Add(s, Sse2.Shuffle(s, 0x4E));          // pairs (swap halves)
+        s = Sse2.Add(s, Sse2.Shuffle(s, 0xB1));          // singles (swap inside pairs)
+        return s.ToScalar();
+    }
+
     private void ScanCellsQ8Avx2(
         sbyte* qPtr, ReadOnlySpan<int> cells, int* offsets,
         Span<int> candDist, Span<int> candIdx, ref int worstRef)
@@ -926,7 +942,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
                 var rWide = Vector256.WidenLower(r128.ToVector256());
                 var diff = rWide - qWide;
                 var prod = Avx2.MultiplyAddAdjacent(diff, diff);
-                int dist = Vector256.Sum(prod);
+                int dist = HorizontalSumInt(prod);
                 if (dist < worst)
                 {
                     InsertTopKInt(candDist, candIdx, dist, i);
@@ -957,7 +973,6 @@ public sealed unsafe class IvfScorer : IFraudScorer
         var sbase = _dataset.Q8VectorsPtr;
         int worst = worstRef;
         int rowsScanned = 0;
-        bool prefetchOn = s_prefetchEnabled;
 
         for (int ci = ciStart; ci < ciEnd; ci++)
         {
@@ -969,18 +984,11 @@ public sealed unsafe class IvfScorer : IFraudScorer
             for (int i = start; i < end; i++)
             {
                 sbyte* row = sbase + (long)i * PaddedDimensions;
-                if (prefetchOn)
-                {
-                    // L2 lead 2026-05: prefetch ~8 rows (128B, 2 cache lines) ahead.
-                    // Out-of-bounds prefetch is benign on x86 (no fault), so skip the
-                    // bounds check to keep the inner loop branchless.
-                    Sse.Prefetch0(row + 8 * PaddedDimensions);
-                }
                 var r128 = Vector128.Load(row);
                 var rWide = Vector256.WidenLower(r128.ToVector256());
                 var diff = rWide - qWide;
                 var prod = Avx2.MultiplyAddAdjacent(diff, diff);
-                int dist = Vector256.Sum(prod);
+                int dist = HorizontalSumInt(prod);
                 if (dist < worst)
                 {
                     InsertTopKInt(candDist, candIdx, dist, i);
