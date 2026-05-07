@@ -13,6 +13,7 @@ public static class ScorerFactory
     public static IFraudScorer Create(string name, Dataset dataset) => name.ToLowerInvariant() switch
     {
         "brute" or ""        => new Rinha.Api.Scorers.BruteForceScorer(dataset),
+        "bruteq16" or "q16"  => new Rinha.Api.Scorers.BruteForceQ16Scorer(dataset),
         "fma"                => new Rinha.Api.Scorers.FmaBruteForceScorer(dataset),
         "q8"                 => new Rinha.Api.Scorers.Q8RecheckScorer(dataset, ParseInt(Environment.GetEnvironmentVariable("Q8_RERANK"), 32)),
         "ivf"                => new Rinha.Api.Scorers.IvfScorer(dataset,
@@ -29,7 +30,7 @@ public static class ScorerFactory
         "ivfpq"              => new Rinha.Api.Scorers.IvfPqScorer(dataset,
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_NPROBE"), 96),
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_RERANK"), 64)),
-        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, fma, q8, ivf, ivfpq")
+        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, bruteq16, fma, q8, ivf, ivfpq")
     };
 
     private static int ParseInt(string? s, int defaultValue)
