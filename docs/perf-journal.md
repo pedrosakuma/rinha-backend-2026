@@ -16,9 +16,12 @@
 | Early-stop tuning (J13/J14) | ~5180 | `e8e38ae`, `bf960ed` |
 | Hard-query predictor (J24) | 5182 | `0154b8a` |
 | L3 huge pages | ~5196 | `11f84d1` |
-| Cascade default-on (cheat) | 5647 | `8289e50` |
+| Cascade default-on (cheat — depois removido) | 5647 | `8289e50` |
 | nProbe 96→8 | 5647 | `d1f7ca1` |
-| **Q16 rerank + cascade-off (defensible)** | **5614** | `43ddaa8` |
+| Q16 rerank + cascade-off (defensible) | 5614 | `43ddaa8` |
+| nginx postpone_output 0 | 5634 | `6b90a8f` |
+| HorizSum manual + drop prefetch branch | 5701 | `bc07fbe` |
+| **Submission profile (1.00 vCPU + cascade removed)** | **5708** | (este commit) |
 
 ## Aceitos (em produção)
 
@@ -35,8 +38,12 @@
 | L2 | nginx 0.10→0.30 vCPU (cascade absorvia o resto) | unlock cascade | `4c475cc` |
 | — | Round queries to 4dp (oracle-aligned) | p99 fix | `7048610` |
 | — | nProbe 96→8 (após cascade absorver 95.3%) | combo | `d1f7ca1` |
-| — | nginx `postpone_output 0` (resp ~50B < MTU) | +20-30, -7% p99 | (este commit) |
+| — | nginx `postpone_output 0` (resp ~50B < MTU) | +20-30, -7% p99 | `6b90a8f` |
 | — | Q16 int16 rerank (AVX2 pmaddwd, 16 lanes) | +25-50, -96MB WS | `43ddaa8` |
+| — | Manual `HorizontalSumInt` (4 ops vs 7) + drop dead prefetch branch | **+61, -12% p99, σ 3×↓** | `bc07fbe` |
+| — | `HARDQ_DEADLINE_US` 1500→3000 (recover recall em api<0.40 vCPU) | fn 10→0 | (submission) |
+| — | `TP_MIN_WORKERS=2` + `TP_MAX_IO=4` (prewarm IO completion) | σ 80→44 | (submission) |
+| — | Cascade source removido (era cheat, default-off há sessões) | integrity | (submission) |
 
 ## Rejeitados (com razão)
 
@@ -65,33 +72,70 @@
 | — | nginx `worker_priority -5` | falhou | container sem `CAP_SYS_NICE` (`setpriority denied`) |
 | — | nginx `proxy_next_upstream off` | regrediu sob carga | sem retry, requests lentas hard-fail (outliers 5230) |
 | — | Heavy-split build (sessão Q16) | -90 pts | mais cells → np=8 cobre menos espaço; p99 não mexeu (early-stop limita worst-case, não cell size) |
+| — | `shl` elimination (row pointer pre-multiplied) | -60, σ regrediu | sample skid no annotate enganou; ILC já hoist em `lea` no addressing mode |
+| — | J3b 2-row unroll revisited (post-A+C) | neutro | reduction não era gargalo real; OoO já cobria. Annotate skid de novo. |
+| — | network_mode host LB | não tentado | regra explícita da rinha proíbe (`bridge` only) |
 
-### Cascade (caso especial)
+### Cascade (caso especial — REMOVIDO)
 
-`tools/cascade_extract.py` treina decision-tree em `bench/k6/test-data.json`
-(o test set literal). Atinge **95.3% coverage** porque memoriza queries
-do bench → é **cheat**. Mantido como toggle (`CASCADE=0`/`1`) para
-referência histórica, mas **default flipado para 0** para o combo
-defensível.
+`tools/cascade_extract.py` treinava decision-tree em `bench/k6/test-data.json`
+(o test set literal). Atingia **95.3% coverage** porque memorizava queries
+do bench → era **cheat** óbvio.
 
-- Cheat: 5647 σ=37 p99=2.25 fn=0
-- Defensível: 5614 σ=62 p99=2.43 fn=0
+Histórico:
+- Cheat (CASCADE=1): 5647 σ=37 p99=2.25 fn=0
+- Defensível (CASCADE=0): 5614 σ=62 p99=2.43 fn=0
 - Diferença: 33 pts em troca de integridade.
 
-Para cascade legítimo: re-treinar em queries sintéticas amostradas do
-corpus, nunca do test set. Backlog.
+Após otimizações no hot path (HorizSum, drop prefetch, deadline,
+threadpool), o caminho legítimo sozinho passou de 5614 → 5708, **superando
+o cheat**. O código fonte do cascade foi removido inteiramente na preparação
+da submissão (`src/Api/Scorers/Cascade.cs`, `cascade/`, `tools/cascade_*.py`).
 
-## Combo defensível recomendado (atual)
+Para cascade legítimo no futuro: re-treinar em queries sintéticas amostradas
+do corpus, nunca do test set. Backlog.
+
+## Combo defensível recomendado (atual — defaults do compose)
 
 ```
 IVF_NPROBE=8
 IVF_RERANK=24
 IVF_EARLY_STOP_PCT=40
-CASCADE=0
-IVF_Q16=1   # default
+IVF_Q16=1
+HARDQ_DEADLINE_US=3000
+TP_MIN_WORKERS=2
+TP_MAX_WORKERS=2
+TP_MIN_IO=2
+TP_MAX_IO=4
 ```
 
-Resultado n=10: **~5634 σ≈30 p99=2.30ms fn=0** (com `postpone_output 0` no nginx).
+CPU shares (compose): api1=0.37, api2=0.37, lb=0.26 (soma=1.00).
+Memória: api=150MB cada, lb=50MB (soma=350MB).
+
+Resultado n=10: **5708 σ=44 p99=1.96ms fn=0**.
+
+## Sub-1.0 vCPU profile sweep (preparação submissão)
+
+Sweep das divisões CPU pra encaixar no limite 1.00 vCPU da rinha:
+
+| Config (api/api/lb) | p99 (ms) | fn | dets | final |
+|---|---:|---:|---:|---:|
+| 0.45/0.45/0.10 | 58.3 | 0 | 3000 | 4234 |
+| 0.43/0.43/0.14 | 40.5 | 0 | 3000 | 4392 |
+| 0.42/0.42/0.16 | 30.3 | 0 | 3000 | 4518 |
+| 0.40/0.40/0.20 | 11.5 | 0 | 3000 | 4937 |
+| 0.38/0.38/0.24 | 1.71 | 10 | 2819 | 5586 |
+| 0.35/0.35/0.30 | 1.69 | 10 | 2819 | 5591 |
+| **0.37/0.37/0.26 + deadline=3000 + TP=2/IO=2-4** | **1.96** | **0** | **3000** | **5708** |
+
+Modelo derivado:
+- `score_p99 = 3000 − 1000·log10(p99_ms)` (clampeado em ±3000).
+- `fn(api_cpu)`: threshold sharp em ~0.40 vCPU. Abaixo, `HARDQ_DEADLINE_US=1500`
+  abortava queries legítimas → fn=10 (penalty -181 pts em det score).
+  **Fix**: subir deadline para 3000µs recupera recall sem regredir p99
+  (saturado em ~1.7ms quando lb≥0.24).
+- `p99(lb_cpu)`: regime queueing (M/M/1-like) abaixo de ~0.22, satura
+  acima. Threshold de saturação ≈ 0.24-0.26.
 
 ## Observações operacionais
 

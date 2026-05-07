@@ -24,9 +24,9 @@ nginx (round-robin, sem lógica)
 
 | serviço | CPU  | memória |
 |---------|------|---------|
-| api1    | 0.45 | 150 MB  |
-| api2    | 0.45 | 150 MB  |
-| lb      | 0.10 | 50 MB   |
+| api1    | 0.37 | 150 MB  |
+| api2    | 0.37 | 150 MB  |
+| lb      | 0.26 | 50 MB   |
 | **soma**| **1.00** | **350 MB** |
 
 ## Estrutura
@@ -72,25 +72,20 @@ dotnet run --project src/Api -c Release
 
 ## Performance
 
-Bench k6 (profile `short`, n=10) com combo defensível
-(`IVF_NPROBE=8 IVF_RERANK=24 IVF_EARLY_STOP_PCT=40 CASCADE=0 IVF_Q16=1`):
+Bench k6 (profile `short`, n=10) com defaults do compose
+(`IVF_NPROBE=8 IVF_RERANK=24 IVF_EARLY_STOP_PCT=40 IVF_Q16=1 HARDQ_DEADLINE_US=3000 TP_MIN_WORKERS=2 TP_MAX_IO=4`):
 
 | métrica | valor |
 |---------|-------|
-| score   | **~5634** σ≈30 |
-| p50     | 0.97 ms |
-| p90     | 1.23 ms |
-| p99     | 2.30 ms |
+| score   | **~5708** σ≈44 |
+| p50     | 1.00 ms |
+| p90     | 1.24 ms |
+| p99     | 1.96 ms |
 | fn      | 0 |
 
 Para o histórico completo de tentativas, ver
 [`docs/perf-journal.md`](docs/perf-journal.md). Para os env vars,
 ver [`docs/tuning-knobs.md`](docs/tuning-knobs.md).
-
-> **Nota sobre `CASCADE=1`**: o cascade-tree foi treinado em
-> `bench/k6/test-data.json` (test set literal) e atinge ~5647 pts.
-> É **cheat** e está desligado por default. Mantido como toggle
-> para referência histórica.
 
 ## Possíveis próximos passos
 

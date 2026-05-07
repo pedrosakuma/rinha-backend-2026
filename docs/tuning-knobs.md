@@ -3,23 +3,24 @@
 > Referência completa dos toggles runtime. Para o histórico de decisões,
 > ver [`perf-journal.md`](perf-journal.md).
 
-## Combo defensível recomendado
+## Combo defensível recomendado (defaults do compose)
 
 ```
-IVF_NPROBE=8 IVF_RERANK=24 IVF_EARLY_STOP_PCT=40 CASCADE=0 IVF_Q16=1
+IVF_NPROBE=8 IVF_RERANK=24 IVF_EARLY_STOP_PCT=40 IVF_Q16=1
+HARDQ_DEADLINE_US=3000 TP_MIN_WORKERS=2 TP_MAX_WORKERS=2 TP_MIN_IO=2 TP_MAX_IO=4
 ```
 
-Score n=10: 5614 σ=62 p99=2.43ms fn=0.
+Score n=10: **5708 σ=44 p99=1.96ms fn=0** em 1.00 vCPU / 350MB total
+(api 0.37 + api 0.37 + lb 0.26).
 
 ## Knobs principais
 
 | Env | Default | Range testado | Efeito |
 |-----|--------:|---|---|
-| `IVF_NPROBE` | `8` | 4-96 | Cells visitadas por query. Reduzido de 96 quando a hot path passou para `cascade-on`/Q16. |
-| `IVF_RERANK` | `64` (compose) / **24 recomendado** | 16-128 | kPrime: candidatos enviados ao rerank float/Q16. Sweet spot 24 cascade-off. |
+| `IVF_NPROBE` | `8` | 4-96 | Cells visitadas por query. Reduzido após Q16 absorver custo de rerank. |
+| `IVF_RERANK` | `24` | 16-128 | kPrime: candidatos enviados ao rerank Q16. Sweet spot 24. |
 | `IVF_EARLY_STOP` | `1` | 0/1 | Liga early-stop class-aware (J5). Sempre on em prod. |
-| `IVF_EARLY_STOP_PCT` | `72` (compose) / **40 recomendado** | 30-80 | % de cells visitadas antes do checkpoint de early-stop. Cascade-off prefere 40, cheat-mode 72. |
-| `CASCADE` | `1` (compose) / **0 recomendado** | 0/1 | Liga cascade decision-tree. **Default atual = cheat** (treinado em test-data.json). Use 0 para combo defensível. |
+| `IVF_EARLY_STOP_PCT` | `40` | 30-80 | % de cells visitadas antes do checkpoint de early-stop. |
 | `IVF_Q16` | `1` | 0/1 | Rerank em int16 (AVX2 pmaddwd, 16 lanes). Default-on quando `references_q16.bin` existe. |
 | `SCORER` | `ivf` | `ivf`, `q8recheck`, `bruteforce` | Algoritmo. Histórico — `ivf` é o único usado em prod. |
 
@@ -36,11 +37,10 @@ Mantidos para reproduzir investigações; não habilitar em prod sem bench:
 | `IVF_DEADLINE_US` | `0` | J22 — anytime/deadline scan | Opt-in only |
 | `IVF_BATCH_WAIT_US` | `0` | L1 — query batching (microbatch wait) | Opt-in only |
 | `IVF_PREFETCH` | `0` | L2 — DRAM prefetch | Sem ganho consistente |
-| `IVF_BBOX_REPAIR` | `0` | bbox LB exact repair | Rejeitado |
 | `IVF_EARLY_STOP_PCT_EARLY` | `0` | early-stop checkpoint mais cedo (separado) | Não usado |
 | `LIFO_LIMIT` | `0` | J20 — LIFO admission control | Opt-in only |
 | `LIFO_QUEUE` | `32` | tamanho da fila LIFO se ligado | — |
-| `HARDQ_DEADLINE_US` | `1500` | J24 — deadline para queries marcadas hard | Aceito |
+| `HARDQ_DEADLINE_US` | `3000` | J24 — deadline (µs) para queries marcadas hard. Subido de 1500 quando reduzimos api CPU; 1500 abortava queries legítimas → fn=10. | Aceito |
 | `HARDQ_NPROBE_EASY` | `0` | nProbe override para queries easy | Opt-in only |
 | `HARDQ_DUMP_PATH` | `""` | dump de classificações para debug | Debug only |
 
@@ -49,8 +49,10 @@ Mantidos para reproduzir investigações; não habilitar em prod sem bench:
 | Env | Default | Notas |
 |-----|--------:|---|
 | `DOTNET_PROCESSOR_COUNT` | `1` | J19 — pin para 1 vCPU lógico |
-| `TP_MIN_WORKERS` | `1` | J19 — ThreadPool floor |
-| `TP_MAX_WORKERS` | `2` | J19 — ThreadPool teto |
+| `TP_MIN_WORKERS` | `2` | Prewarm workers (evita spawn latency em burst). Subido de 1 com profile sub-1.0 vCPU. |
+| `TP_MAX_WORKERS` | `2` | ThreadPool teto (cap em 2 para 0.37 vCPU/replica) |
+| `TP_MIN_IO` | `2` | IO completion min (env-tunável desde submission prep) |
+| `TP_MAX_IO` | `4` | IO completion teto. Sigma 80→44 quando combinado com TP_MIN=2. |
 | `DATASET_THP` | `1` | L3 — `madvise(MADV_HUGEPAGE)` em mmap |
 | `DATASET_MLOCK` | `0` | mlock em mmap. Off por default (dispensa CAP_IPC_LOCK) |
 | `FAST_JSON` | `0` | Path JSON alternativo. Sem ganho (json ~0.4µs) |
@@ -70,7 +72,6 @@ Mantidos para reproduzir investigações; não habilitar em prod sem bench:
 | `IVF_BBOX_PATH` | `/data/ivf_bbox.bin` | bbox por cell (opcional) |
 | `MCC_RISK_PATH` | `/resources/mcc_risk.json` | tabela MCC |
 | `NORMALIZATION_PATH` | `/resources/normalization.json` | norma por dim |
-| `CASCADE_PATH` | `/data/cascade.bin` | árvore decisão (cheat) |
 | `HARDQ_MODEL_PATH` | `/data/hardq.bin` | predictor de query difícil |
 
 ## Build args (`docker build --build-arg`)
