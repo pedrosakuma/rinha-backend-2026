@@ -1,6 +1,9 @@
 using System.Buffers;
 using System.Buffers.Text;
 using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 
@@ -82,6 +85,10 @@ public sealed class JsonVectorizer
 
     private void VectorizeJsonCore(ReadOnlySpan<byte> body, Span<short> dst)
     {
+        // Length-guard once so the JIT (and our manual ref-add writes below) can elide bounds checks.
+        if (dst.Length < Dataset.Dimensions)
+            throw new ArgumentException("dst too small", nameof(dst));
+
         // Per-request scratch state.
         double txAmount = 0, custAvg = 0, merchAvg = 0, kmHome = 0;
         int installments = 0, txCount24h = 0;
@@ -140,14 +147,16 @@ public sealed class JsonVectorizer
         }
 
         // ---- Compose the 14 features (mirrors Vectorizer.VectorizeCore) ----
+        // Write through ref-add to drop per-store bounds checks (length already validated above).
+        ref short d0 = ref MemoryMarshal.GetReference(dst);
         var n = _norm;
-        dst[0] = Q16(Clamp01((float)(txAmount * n.InvMaxAmount)));
-        dst[1] = Q16(Clamp01(installments * n.InvMaxInstallments));
+        Unsafe.Add(ref d0, 0) = Q16(Clamp01((float)(txAmount * n.InvMaxAmount)));
+        Unsafe.Add(ref d0, 1) = Q16(Clamp01(installments * n.InvMaxInstallments));
         var avg = (float)custAvg;
         var ratio = avg > 0f ? (float)(txAmount / avg) * n.InvAmountVsAvgRatio : 1f;
-        dst[2] = Q16(Clamp01(ratio));
-        dst[3] = Q16(requestedHour * (1f / 23f));
-        dst[4] = Q16(MondayZero(requestedDow) * (1f / 6f));
+        Unsafe.Add(ref d0, 2) = Q16(Clamp01(ratio));
+        Unsafe.Add(ref d0, 3) = Q16(requestedHour * (1f / 23f));
+        Unsafe.Add(ref d0, 4) = Q16(MondayZero(requestedDow) * (1f / 6f));
 
         if (hasLast)
         {
@@ -155,19 +164,19 @@ public sealed class JsonVectorizer
             long deltaTicks = requestedAtTicksUtc - lastTimestampTicksUtc;
             if (deltaTicks < 0) deltaTicks = 0;
             double minutes = deltaTicks * (1.0 / 600_000_000.0);
-            dst[5] = Q16(Clamp01((float)(minutes * n.InvMaxMinutes)));
-            dst[6] = Q16(Clamp01((float)(lastKm * n.InvMaxKm)));
+            Unsafe.Add(ref d0, 5) = Q16(Clamp01((float)(minutes * n.InvMaxMinutes)));
+            Unsafe.Add(ref d0, 6) = Q16(Clamp01((float)(lastKm * n.InvMaxKm)));
         }
         else
         {
-            dst[5] = -10000;
-            dst[6] = -10000;
+            Unsafe.Add(ref d0, 5) = -10000;
+            Unsafe.Add(ref d0, 6) = -10000;
         }
 
-        dst[7] = Q16(Clamp01((float)(kmHome * n.InvMaxKm)));
-        dst[8] = Q16(Clamp01(txCount24h * n.InvMaxTxCount24h));
-        dst[9] = (short)(isOnline ? 10000 : 0);
-        dst[10] = (short)(cardPresent ? 10000 : 0);
+        Unsafe.Add(ref d0, 7) = Q16(Clamp01((float)(kmHome * n.InvMaxKm)));
+        Unsafe.Add(ref d0, 8) = Q16(Clamp01(txCount24h * n.InvMaxTxCount24h));
+        Unsafe.Add(ref d0, 9) = (short)(isOnline ? 10000 : 0);
+        Unsafe.Add(ref d0, 10) = (short)(cardPresent ? 10000 : 0);
 
         // unknown_merchant: scan known_merchants array, byte-compare each entry vs merchant.id slice.
         bool isKnown = false;
@@ -175,12 +184,12 @@ public sealed class JsonVectorizer
         {
             isKnown = ScanKnownMerchants(body.Slice(kmArrStart, kmArrEnd - kmArrStart), body.Slice(merchIdStart, merchIdEnd - merchIdStart));
         }
-        dst[11] = (short)(isKnown ? 0 : 10000);
+        Unsafe.Add(ref d0, 11) = (short)(isKnown ? 0 : 10000);
 
-        dst[12] = mccEnd > mccStart
+        Unsafe.Add(ref d0, 12) = mccEnd > mccStart
             ? _mcc.GetQ16(body.Slice(mccStart, mccEnd - mccStart))
             : MccRiskTable.DefaultQ16;
-        dst[13] = Q16(Clamp01((float)(merchAvg * n.InvMaxMerchantAvgAmount)));
+        Unsafe.Add(ref d0, 13) = Q16(Clamp01((float)(merchAvg * n.InvMaxMerchantAvgAmount)));
     }
 
     /// <summary>Single canonical quantization: <c>(short)Round(v * Q16Scale)</c>.
@@ -458,7 +467,17 @@ public sealed class JsonVectorizer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
+    private static float Clamp01(float v)
+    {
+        if (Sse.IsSupported)
+        {
+            var vv = Vector128.CreateScalarUnsafe(v);
+            vv = Sse.MaxScalar(vv, Vector128<float>.Zero);
+            vv = Sse.MinScalar(vv, Vector128.CreateScalarUnsafe(1f));
+            return vv.ToScalar();
+        }
+        return MathF.Min(MathF.Max(v, 0f), 1f);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int MondayZero(DayOfWeek d) => d == DayOfWeek.Sunday ? 6 : (int)d - 1;

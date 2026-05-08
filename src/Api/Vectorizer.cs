@@ -1,4 +1,6 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace Rinha.Api;
 
@@ -103,7 +105,17 @@ public sealed class Vectorizer
     private static short Q16(float v) => (short)MathF.Round(v * Dataset.Q16Scale);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
+    private static float Clamp01(float v)
+    {
+        if (Sse.IsSupported)
+        {
+            var vv = Vector128.CreateScalarUnsafe(v);
+            vv = Sse.MaxScalar(vv, Vector128<float>.Zero);
+            vv = Sse.MinScalar(vv, Vector128.CreateScalarUnsafe(1f));
+            return vv.ToScalar();
+        }
+        return MathF.Min(MathF.Max(v, 0f), 1f);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int MondayZero(DayOfWeek d) => d == DayOfWeek.Sunday ? 6 : (int)d - 1;

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
@@ -72,23 +73,26 @@ public sealed unsafe class BruteForceQ16Scorer : IQ16FraudScorer
         for (int i = 0; i < K; i++) { bestDist[i] = long.MaxValue; bestIdx[i] = -1; }
 
         fixed (short* qPtr = qq)
+        fixed (long* bdPtr = bestDist)
+        fixed (int* biPtr = bestIdx)
         {
             if (Avx2.IsSupported)
-                ScanAvx2(qPtr, bestDist, bestIdx);
+                ScanAvx2(qPtr, bdPtr, biPtr);
             else
-                ScanScalar(qPtr, bestDist, bestIdx);
-        }
+                ScanScalar(qPtr, bdPtr, biPtr);
 
-        var labels = _dataset.LabelsPtr;
-        int frauds = 0;
-        for (int i = 0; i < K; i++)
-        {
-            if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) frauds++;
+            var labels = _dataset.LabelsPtr;
+            int frauds = 0;
+            for (int i = 0; i < K; i++)
+            {
+                int idx = biPtr[i];
+                if (idx >= 0 && labels[idx] != 0) frauds++;
+            }
+            return frauds / (float)K;
         }
-        return frauds / (float)K;
     }
 
-    private void ScanAvx2(short* qPtr, Span<long> bestDist, Span<int> bestIdx)
+    private void ScanAvx2(short* qPtr, long* bestDist, int* bestIdx)
     {
         long worst = long.MaxValue;
         var vectors = _dataset.Q16VectorsPtr;
@@ -108,13 +112,12 @@ public sealed unsafe class BruteForceQ16Scorer : IQ16FraudScorer
             long dist = HorizontalSumInt64(sq);
             if (dist < worst)
             {
-                InsertTopK(bestDist, bestIdx, dist, i);
-                worst = bestDist[K - 1];
+                worst = InsertTopK(bestDist, bestIdx, dist, i);
             }
         }
     }
 
-    private void ScanScalar(short* qPtr, Span<long> bestDist, Span<int> bestIdx)
+    private void ScanScalar(short* qPtr, long* bestDist, int* bestIdx)
     {
         long worst = long.MaxValue;
         var vectors = _dataset.Q16VectorsPtr;
@@ -131,8 +134,7 @@ public sealed unsafe class BruteForceQ16Scorer : IQ16FraudScorer
             }
             if (dist < worst)
             {
-                InsertTopK(bestDist, bestIdx, dist, i);
-                worst = bestDist[K - 1];
+                worst = InsertTopK(bestDist, bestIdx, dist, i);
             }
         }
     }
@@ -151,13 +153,16 @@ public sealed unsafe class BruteForceQ16Scorer : IQ16FraudScorer
         return pair.ToScalar() + pair.GetElement(1);
     }
 
+    /// <summary>Insert (newDist, newIdx) into the descending Top-K and return the new worst (= dist[K-1]).
+    /// Uses raw pointers — no bounds checks, no Span overhead. Caller guarantees buffers have K elements.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void InsertTopK(Span<long> dist, Span<int> idx, long newDist, int newIdx)
+    private static long InsertTopK(long* dist, int* idx, long newDist, int newIdx)
     {
         int pos = K - 1;
         while (pos > 0 && dist[pos - 1] > newDist) pos--;
         for (int j = K - 1; j > pos; j--) { dist[j] = dist[j - 1]; idx[j] = idx[j - 1]; }
         dist[pos] = newDist;
         idx[pos] = newIdx;
+        return dist[K - 1];
     }
 }
