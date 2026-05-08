@@ -30,7 +30,10 @@ public static class ScorerFactory
         "ivfpq"              => new Rinha.Api.Scorers.IvfPqScorer(dataset,
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_NPROBE"), 96),
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_RERANK"), 64)),
-        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, bruteq16, fma, q8, ivf, ivfpq")
+        "hybrid"             => new Rinha.Api.Scorers.HybridIvfQ16Scorer(
+                                    Create("ivf", dataset),
+                                    Create("bruteq16", dataset)),
+        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, bruteq16, fma, q8, ivf, ivfpq, hybrid")
     };
 
     private static int ParseInt(string? s, int defaultValue)

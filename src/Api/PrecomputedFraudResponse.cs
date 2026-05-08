@@ -13,6 +13,18 @@ namespace Rinha.Api;
 // alocação por request mesmo sendo classe.
 public sealed class PrecomputedFraudResponse : IResult
 {
+    /// <summary>
+    /// Approval threshold: <c>approved = score &lt; ApprovalThreshold</c>. With k=5 the
+    /// six discrete scores are {0, .2, .4, .6, .8, 1}, and 0.6 is the smallest value
+    /// that means &quot;majority of nearest neighbours are fraud&quot;. Shared with
+    /// <see cref="Rinha.Api.Scorers.HybridIvfQ16Scorer"/> so any change here
+    /// automatically updates the borderline-trigger logic.
+    /// </summary>
+    public const float ApprovalThreshold = 0.6f;
+
+    /// <summary>Granularity of the score (1 / K, where K is the kNN k = 5).</summary>
+    public const float ScoreStep = 0.2f;
+
     private static readonly byte[][] Bodies = BuildBodies();
     private static readonly PrecomputedFraudResponse[] Instances = BuildInstances();
 
@@ -45,7 +57,7 @@ public sealed class PrecomputedFraudResponse : IResult
         for (int n = 0; n <= 5; n++)
         {
             float score = n / 5f;
-            var resp = new FraudResponse(score < 0.6f, score);
+            var resp = new FraudResponse(score < ApprovalThreshold, score);
             arr[n] = JsonSerializer.SerializeToUtf8Bytes(resp, AppJsonContext.Default.FraudResponse);
         }
         return arr;
