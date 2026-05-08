@@ -97,11 +97,18 @@ public sealed unsafe class IvfScorer : IFraudScorer
     // Inspired by jairoblatt/rinha-2026-rust two-stage knn (FAST_NPROBE=8 → FULL_NPROBE=24 on count ∈ {2,3}).
     // Default 0 = disabled. Env: IVF_BORDERLINE_NPROBE.
     private readonly int _borderlineNProbe;
+    // L8: borderline-only larger candidate pool. When the borderline expansion fires (count ∈ {2,3}),
+    // re-scan ALL probed cells (stage1 ∪ stage2) into a larger top-K' Q8 buffer before float rerank.
+    // The default K'=32 prunes Q8 candidates whose true float distance would have made top-5; this
+    // is invisible on most queries but on rare borderline ones drops a true fraud neighbor and flips
+    // the threshold (e.g. tx-3173493320: 0.4 → 0.6). Cost: extra Q8 scan only on the ~4% mode=full
+    // queries that hit borderline. Default 0 = use _kPrime (no behavior change). Env: IVF_BORDERLINE_RERANK.
+    private readonly int _borderlineKPrime;
     /// <summary>Per-thread: number of *additional* cells scanned by the borderline second stage in
     /// the last query (0 = stage didn't fire, or no new cells to visit). Useful for tuning sweeps.</summary>
     [ThreadStatic] public static int LastBorderlineRescans;
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false, bool bboxGuided = false)
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false, bool bboxGuided = false, int borderlineKPrime = 0)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -128,6 +135,8 @@ public sealed unsafe class IvfScorer : IFraudScorer
             _borderlineNProbe = Math.Min(bl, dataset.NumCells);
         else
             _borderlineNProbe = 0;
+        // L8: borderline-only larger candidate pool. 0 → use _kPrime (no behavior change).
+        _borderlineKPrime = borderlineKPrime > _kPrime ? Math.Min(borderlineKPrime, 1024) : 0;
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -409,6 +418,11 @@ public sealed unsafe class IvfScorer : IFraudScorer
         // re-ranked (extra cells are a strict superset only of *non-seed* cells; bbox-repair
         // visits all admissible non-seed cells, so re-scanning a subset is wasted work).
         LastBorderlineRescans = 0;
+        // L8: borderline rescan with optional larger K' pool. Original gate (count ∈ {2,3} AND
+        // not early-stopped AND not bbox-repair AND nProbe expansion available) preserved; the
+        // new IVF_BORDERLINE_RERANK env upgrades the rescan to a bigger candidate pool to rescue
+        // true KNN neighbors that Q8 quantization ranked outside the default _kPrime window
+        // (e.g. tx-3173493320: float-rank ≤5, Q8-rank >32).
         if (_borderlineNProbe > n && !earlyStopped && !_bboxRepair && (totalFrauds == 2 || totalFrauds == 3))
         {
             int nlist2 = _dataset.NumCells;
@@ -447,16 +461,41 @@ public sealed unsafe class IvfScorer : IFraudScorer
 
             if (newCount > 0)
             {
-                fixed (sbyte* qPtr = qQ8)
+                if (_borderlineKPrime > 0)
                 {
-                    ScanCellsQ8Avx2Range(qPtr, newCells, 0, newCount, offsets, candDist, candIdx, ref q8Worst);
+                    // L8: re-scan ALL cells (stage1 ∪ stage2) into a larger Q8 candidate pool.
+                    // The default _kPrime is too tight for a fraction of borderline queries:
+                    // a true KNN-3rd fraud may rank > _kPrime in Q8 distance (lossy quant) but
+                    // ≤ K=5 in float distance; with the small pool it's pruned before float rerank.
+                    int bigK = _borderlineKPrime;
+                    Span<int> bigDist = stackalloc int[bigK];
+                    Span<int> bigIdx  = stackalloc int[bigK];
+                    for (int i = 0; i < bigK; i++) { bigDist[i] = int.MaxValue; bigIdx[i] = -1; }
+                    int bigWorst = int.MaxValue;
+                    Span<int> allCells = stackalloc int[nExt];
+                    int allCount = 0;
+                    for (int i = 0; i < nExt; i++) if (cellsExt[i] >= 0) allCells[allCount++] = cellsExt[i];
+                    fixed (sbyte* qPtr = qQ8)
+                    {
+                        ScanCellsQ8Avx2Range(qPtr, allCells, 0, allCount, offsets, bigDist, bigIdx, ref bigWorst);
+                    }
+                    for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+                    RerankFloat(paddedQuery, bigDist, bigIdx, bestDist, bestIdx);
+                    LastBorderlineRescans = allCount;
                 }
-                for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
-                RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+                else
+                {
+                    fixed (sbyte* qPtr = qQ8)
+                    {
+                        ScanCellsQ8Avx2Range(qPtr, newCells, 0, newCount, offsets, candDist, candIdx, ref q8Worst);
+                    }
+                    for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+                    RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+                    LastBorderlineRescans = newCount;
+                }
                 totalFrauds = 0;
                 for (int i = 0; i < K; i++)
                     if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) totalFrauds++;
-                LastBorderlineRescans = newCount;
             }
         }
 
