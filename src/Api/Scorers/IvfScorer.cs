@@ -91,6 +91,16 @@ public sealed unsafe class IvfScorer : IFraudScorer
 
     private readonly bool _bboxGuided; // L5: order/select cells by bbox lower bound (replaces centroid distance)
 
+    // L6: two-stage IVF — when the initial top-K is borderline (count == 2 or 3 frauds out of K=5,
+    // i.e. the only outputs that straddle the approve/decline threshold of 0.6), expand the probe
+    // set from _nProbe → _borderlineNProbe, scan the *delta* cells in Q8, and re-rerank.
+    // Inspired by jairoblatt/rinha-2026-rust two-stage knn (FAST_NPROBE=8 → FULL_NPROBE=24 on count ∈ {2,3}).
+    // Default 0 = disabled. Env: IVF_BORDERLINE_NPROBE.
+    private readonly int _borderlineNProbe;
+    /// <summary>Per-thread: number of *additional* cells scanned by the borderline second stage in
+    /// the last query (0 = stage didn't fire, or no new cells to visit). Useful for tuning sweeps.</summary>
+    [ThreadStatic] public static int LastBorderlineRescans;
+
     public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false, bool bboxGuided = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
@@ -112,6 +122,12 @@ public sealed unsafe class IvfScorer : IFraudScorer
         // J25: enable Q16 rerank if (a) data file present and (b) not explicitly disabled.
         var q16Env = Environment.GetEnvironmentVariable("IVF_Q16");
         _useQ16 = dataset.HasQ16 && q16Env != "0";
+        // L6: borderline expansion (default off). Clamped to (_nProbe, NumCells].
+        var blEnv = Environment.GetEnvironmentVariable("IVF_BORDERLINE_NPROBE");
+        if (int.TryParse(blEnv, out var bl) && bl > _nProbe)
+            _borderlineNProbe = Math.Min(bl, dataset.NumCells);
+        else
+            _borderlineNProbe = 0;
     }
 
     public float Score(ReadOnlySpan<float> query)
@@ -385,6 +401,65 @@ public sealed unsafe class IvfScorer : IFraudScorer
         int totalFrauds = 0;
         for (int i = 0; i < K; i++)
             if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) totalFrauds++;
+
+        // L6: two-stage IVF — only borderline outputs (count ∈ {2,3} → score 0.4 or 0.6) can flip
+        // the approve/decline decision (threshold 0.6). Re-scan the *additional* top cells in Q8
+        // (centroid distances already computed; same K' buffer; same exact rerank). Skipped when
+        // early-stop fired (decision already proven by margin) and when bbox-repair already
+        // re-ranked (extra cells are a strict superset only of *non-seed* cells; bbox-repair
+        // visits all admissible non-seed cells, so re-scanning a subset is wasted work).
+        LastBorderlineRescans = 0;
+        if (_borderlineNProbe > n && !earlyStopped && !_bboxRepair && (totalFrauds == 2 || totalFrauds == 3))
+        {
+            int nlist2 = _dataset.NumCells;
+            int nExt = Math.Min(_borderlineNProbe, nlist2);
+
+            // Pick top-nExt cells from the already-computed centDist (cheap; nlist ≤ 512).
+            Span<int>   cellsExt     = stackalloc int[nExt];
+            Span<float> cellsExtDist = stackalloc float[nExt];
+            for (int i = 0; i < nExt; i++) { cellsExt[i] = -1; cellsExtDist[i] = float.PositiveInfinity; }
+            float worstExt = float.PositiveInfinity;
+            for (int c = 0; c < nlist2; c++)
+            {
+                float d = centDist[c];
+                if (d < worstExt)
+                {
+                    int pos = nExt - 1;
+                    while (pos > 0 && cellsExtDist[pos - 1] > d) pos--;
+                    for (int j = nExt - 1; j > pos; j--) { cellsExtDist[j] = cellsExtDist[j - 1]; cellsExt[j] = cellsExt[j - 1]; }
+                    cellsExtDist[pos] = d;
+                    cellsExt[pos] = c;
+                    worstExt = cellsExtDist[nExt - 1];
+                }
+            }
+
+            // Filter out cells already visited in stage-1 (linear scan; n ≤ ~24, nExt ≤ ~64).
+            Span<int> newCells = stackalloc int[nExt];
+            int newCount = 0;
+            for (int i = 0; i < nExt; i++)
+            {
+                int c = cellsExt[i];
+                if (c < 0) continue;
+                bool seen = false;
+                for (int j = 0; j < n; j++) { if (cells[j] == c) { seen = true; break; } }
+                if (!seen) newCells[newCount++] = c;
+            }
+
+            if (newCount > 0)
+            {
+                fixed (sbyte* qPtr = qQ8)
+                {
+                    ScanCellsQ8Avx2Range(qPtr, newCells, 0, newCount, offsets, candDist, candIdx, ref q8Worst);
+                }
+                for (int i = 0; i < K; i++) { bestDist[i] = float.PositiveInfinity; bestIdx[i] = -1; }
+                RerankFloat(paddedQuery, candDist, candIdx, bestDist, bestIdx);
+                totalFrauds = 0;
+                for (int i = 0; i < K; i++)
+                    if (bestIdx[i] >= 0 && labels[bestIdx[i]] != 0) totalFrauds++;
+                LastBorderlineRescans = newCount;
+            }
+        }
+
         return totalFrauds / (float)K;
     }
 
