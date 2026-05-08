@@ -89,7 +89,9 @@ public sealed unsafe class IvfScorer : IFraudScorer
         return us * System.Diagnostics.Stopwatch.Frequency / 1_000_000L;
     }
 
-    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false)
+    private readonly bool _bboxGuided; // L5: order/select cells by bbox lower bound (replaces centroid distance)
+
+    public IvfScorer(Dataset dataset, int nProbe = 16, int kPrime = 32, int dimFilter = -1, int dimFilter2 = -1, bool earlyStop = false, int earlyStopPct = 75, bool bboxRepair = false, int earlyStopPctEarly = 0, int scalarAbort = 0, bool densityOrder = false, bool bboxGuided = false)
     {
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ8) throw new InvalidOperationException("Dataset has no Q8 view.");
@@ -106,6 +108,7 @@ public sealed unsafe class IvfScorer : IFraudScorer
         if (scalarAbort == 2 && !dataset.HasQ8Soa) scalarAbort = 0;
         _scalarAbort = scalarAbort is >= 0 and <= 2 ? scalarAbort : 0;
         _densityOrder = densityOrder;
+        _bboxGuided = bboxGuided && dataset.HasIvfBbox;
         // J25: enable Q16 rerank if (a) data file present and (b) not explicitly disabled.
         var q16Env = Environment.GetEnvironmentVariable("IVF_Q16");
         _useQ16 = dataset.HasQ16 && q16Env != "0";
@@ -152,21 +155,37 @@ public sealed unsafe class IvfScorer : IFraudScorer
             centDist = new float[nlist];
         }
 
-        // 2) Distances to all centroids.
+        // 2) Distances to all centroids (or bbox lower bound when L5 is on).
+        // L5 (bboxGuided): replace centroid distance with the per-cluster bbox lower
+        // bound LB(c,q) = Σⱼ max(0, max(bmin[c,j]-q[j], q[j]-bmax[c,j]))². LB is a
+        // strict admissible lower bound on the true min distance from q to any point
+        // in cluster c, so it is a *tighter* ranking key than centroid distance and
+        // makes the existing margin-based early-stop (bestDist[K-1] < cellsDist[chk])
+        // strictly safer (any unvisited cluster has true_min_dist ≥ LB).
         fixed (float* qfPtr = paddedQuery)
         {
-            var q0 = Vector256.Load(qfPtr);
-            var q1 = Vector256.Load(qfPtr + 8);
-            var centBase = _dataset.CentroidsPtr;
-            for (int c = 0; c < nlist; c++)
+            if (_bboxGuided)
             {
-                float* cp = centBase + (long)c * PaddedDimensions;
-                var k0 = Vector256.Load(cp);
-                var k1 = Vector256.Load(cp + 8);
-                var d0 = k0 - q0;
-                var d1 = k1 - q1;
-                var s = (d0 * d0) + (d1 * d1);
-                centDist[c] = Vector256.Sum(s);
+                for (int c = 0; c < nlist; c++)
+                {
+                    centDist[c] = BboxLowerBoundSquared(qfPtr, c);
+                }
+            }
+            else
+            {
+                var q0 = Vector256.Load(qfPtr);
+                var q1 = Vector256.Load(qfPtr + 8);
+                var centBase = _dataset.CentroidsPtr;
+                for (int c = 0; c < nlist; c++)
+                {
+                    float* cp = centBase + (long)c * PaddedDimensions;
+                    var k0 = Vector256.Load(cp);
+                    var k1 = Vector256.Load(cp + 8);
+                    var d0 = k0 - q0;
+                    var d1 = k1 - q1;
+                    var s = (d0 * d0) + (d1 * d1);
+                    centDist[c] = Vector256.Sum(s);
+                }
             }
         }
 
