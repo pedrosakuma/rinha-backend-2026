@@ -57,7 +57,31 @@ public sealed class JsonVectorizer
     {
         if (dst.Length < Dataset.Dimensions)
             throw new ArgumentException("Destination too small", nameof(dst));
+        Span<short> q = stackalloc short[Dataset.Dimensions];
+        VectorizeJsonCore(body, q);
+        for (int i = 0; i < Dataset.Dimensions; i++) dst[i] = q[i] * (1f / Dataset.Q16Scale);
+    }
 
+    /// <summary>Q16 path: produces the canonical int16 query directly. See
+    /// <see cref="Vectorizer.VectorizeQ16"/> for semantics.</summary>
+    public void VectorizeJsonQ16(ReadOnlySpan<byte> body, Span<short> dst)
+    {
+        if (dst.Length < Dataset.Dimensions)
+            throw new ArgumentException("Destination too small", nameof(dst));
+        VectorizeJsonCore(body, dst);
+    }
+
+    /// <summary>Combined: float + Q16 in one parse.</summary>
+    public void VectorizeJson(ReadOnlySpan<byte> body, Span<float> floatDst, Span<short> q16Dst)
+    {
+        if (floatDst.Length < Dataset.Dimensions || q16Dst.Length < Dataset.Dimensions)
+            throw new ArgumentException("Destination too small");
+        VectorizeJsonCore(body, q16Dst);
+        for (int i = 0; i < Dataset.Dimensions; i++) floatDst[i] = q16Dst[i] * (1f / Dataset.Q16Scale);
+    }
+
+    private void VectorizeJsonCore(ReadOnlySpan<byte> body, Span<short> dst)
+    {
         // Per-request scratch state.
         double txAmount = 0, custAvg = 0, merchAvg = 0, kmHome = 0;
         int installments = 0, txCount24h = 0;
@@ -115,35 +139,35 @@ public sealed class JsonVectorizer
             }
         }
 
-        // ---- Compose the 14 features (mirrors Vectorizer.Vectorize) ----
+        // ---- Compose the 14 features (mirrors Vectorizer.VectorizeCore) ----
         var n = _norm;
-        dst[0] = Clamp01((float)(txAmount / n.MaxAmount));
-        dst[1] = Clamp01(installments / n.MaxInstallments);
+        dst[0] = Q16(Clamp01((float)(txAmount * n.InvMaxAmount)));
+        dst[1] = Q16(Clamp01(installments * n.InvMaxInstallments));
         var avg = (float)custAvg;
-        var ratio = avg > 0f ? (float)(txAmount / avg) / n.AmountVsAvgRatio : 1f;
-        dst[2] = Clamp01(ratio);
-        dst[3] = requestedHour / 23f;
-        dst[4] = MondayZero(requestedDow) / 6f;
+        var ratio = avg > 0f ? (float)(txAmount / avg) * n.InvAmountVsAvgRatio : 1f;
+        dst[2] = Q16(Clamp01(ratio));
+        dst[3] = Q16(requestedHour * (1f / 23f));
+        dst[4] = Q16(MondayZero(requestedDow) * (1f / 6f));
 
         if (hasLast)
         {
             // Both ticks are in 100ns units (DateTime.Ticks). 1 minute = 600,000,000 ticks.
             long deltaTicks = requestedAtTicksUtc - lastTimestampTicksUtc;
             if (deltaTicks < 0) deltaTicks = 0;
-            double minutes = deltaTicks / 600_000_000.0;
-            dst[5] = Clamp01((float)(minutes / n.MaxMinutes));
-            dst[6] = Clamp01((float)(lastKm / n.MaxKm));
+            double minutes = deltaTicks * (1.0 / 600_000_000.0);
+            dst[5] = Q16(Clamp01((float)(minutes * n.InvMaxMinutes)));
+            dst[6] = Q16(Clamp01((float)(lastKm * n.InvMaxKm)));
         }
         else
         {
-            dst[5] = -1f;
-            dst[6] = -1f;
+            dst[5] = -10000;
+            dst[6] = -10000;
         }
 
-        dst[7] = Clamp01((float)(kmHome / n.MaxKm));
-        dst[8] = Clamp01(txCount24h / n.MaxTxCount24h);
-        dst[9] = isOnline ? 1f : 0f;
-        dst[10] = cardPresent ? 1f : 0f;
+        dst[7] = Q16(Clamp01((float)(kmHome * n.InvMaxKm)));
+        dst[8] = Q16(Clamp01(txCount24h * n.InvMaxTxCount24h));
+        dst[9] = (short)(isOnline ? 10000 : 0);
+        dst[10] = (short)(cardPresent ? 10000 : 0);
 
         // unknown_merchant: scan known_merchants array, byte-compare each entry vs merchant.id slice.
         bool isKnown = false;
@@ -151,25 +175,18 @@ public sealed class JsonVectorizer
         {
             isKnown = ScanKnownMerchants(body.Slice(kmArrStart, kmArrEnd - kmArrStart), body.Slice(merchIdStart, merchIdEnd - merchIdStart));
         }
-        dst[11] = isKnown ? 0f : 1f;
+        dst[11] = (short)(isKnown ? 0 : 10000);
 
         dst[12] = mccEnd > mccStart
-            ? _mcc.Get(body.Slice(mccStart, mccEnd - mccStart))
-            : MccRiskTable.Default;
-        dst[13] = Clamp01((float)(merchAvg / n.MaxMerchantAvgAmount));
-
-        // Match oracle quantization: references in resources/references.json.gz are stored
-        // pre-rounded to 4 decimal places. Round queries the same way so distance
-        // comparisons (and tie-breaks) align with the oracle's k-NN ground truth.
-        for (int i = 0; i < Dataset.Dimensions; i++) dst[i] = Round4dp(dst[i]);
+            ? _mcc.GetQ16(body.Slice(mccStart, mccEnd - mccStart))
+            : MccRiskTable.DefaultQ16;
+        dst[13] = Q16(Clamp01((float)(merchAvg * n.InvMaxMerchantAvgAmount)));
     }
 
+    /// <summary>Single canonical quantization: <c>(short)Round(v * Q16Scale)</c>.
+    /// See <see cref="Vectorizer"/> for rationale.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float Round4dp(float v)
-    {
-        if (v < 0f) return v; // preserve -1 sentinel
-        return MathF.Round(v * 10000f) / 10000f;
-    }
+    private static short Q16(float v) => (short)MathF.Round(v * Dataset.Q16Scale);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool Equals(ref Utf8JsonReader r, ReadOnlySpan<byte> key)

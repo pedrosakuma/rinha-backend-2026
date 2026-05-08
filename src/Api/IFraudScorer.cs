@@ -8,6 +8,15 @@ public interface IFraudScorer
     float Score(ReadOnlySpan<float> query);
 }
 
+/// <summary>Optional capability: scorer accepts an int16-quantized query directly,
+/// skipping the (short)Round(v * Q16Scale) re-quantization on the hot path. The
+/// caller is expected to pass exactly <see cref="Dataset.Dimensions"/> shorts in
+/// canonical units (Round(feature * Dataset.Q16Scale)).</summary>
+public interface IQ16FraudScorer : IFraudScorer
+{
+    float ScoreQ16(ReadOnlySpan<short> query);
+}
+
 public static class ScorerFactory
 {
     public static IFraudScorer Create(string name, Dataset dataset) => name.ToLowerInvariant() switch

@@ -79,6 +79,9 @@ var jsonVectorizer = new JsonVectorizer(normalization, mccRisk);
 var fastJson = Environment.GetEnvironmentVariable("FAST_JSON") == "1";
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
 IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
+// Q16 capability: if the scorer accepts int16 queries directly, the hot path can
+// vectorize straight to short and skip the round+cast inside the scorer.
+IQ16FraudScorer? q16Scorer = scorer as IQ16FraudScorer;
 
 // Pre-touch all mmap pages and run a JIT warm-up so the first user requests
 // don't pay page-fault or tier0->tier1 jit overhead. Disable with WARMUP=0.
@@ -233,11 +236,16 @@ if (profile)
     {
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         Span<float> query = stackalloc float[Dataset.Dimensions];
-        vectorizer.Vectorize(request, query);
+        Span<short> queryQ16 = stackalloc short[Dataset.Dimensions];
+        bool useQ16 = q16Scorer is not null && !whatIfMode;
+        if (useQ16) vectorizer.VectorizeQ16(request, queryQ16);
+        else        vectorizer.Vectorize(request, query);
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         float score;
         if (whatIfMode && scorer is Rinha.Api.Scorers.IvfScorer ivfScorer)
             score = ivfScorer.ScoreWithWhatIf(query);
+        else if (useQ16)
+            score = q16Scorer!.ScoreQ16(queryQ16);
         else
             score = scorer.Score(query);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -479,9 +487,12 @@ else if (fastJson)
         var buffer = rr.Buffer;
 
         Span<float> query = stackalloc float[Dataset.Dimensions];
+        Span<short> queryQ16 = stackalloc short[Dataset.Dimensions];
+        bool useQ16 = q16Scorer is not null;
         if (buffer.IsSingleSegment)
         {
-            jsonVectorizer.VectorizeJson(buffer.FirstSpan, query);
+            if (useQ16) jsonVectorizer.VectorizeJsonQ16(buffer.FirstSpan, queryQ16);
+            else        jsonVectorizer.VectorizeJson(buffer.FirstSpan, query);
         }
         else
         {
@@ -496,7 +507,8 @@ else if (fastJson)
                 seg.Span.CopyTo(scratch[p..]);
                 p += seg.Length;
             }
-            jsonVectorizer.VectorizeJson(scratch[..len], query);
+            if (useQ16) jsonVectorizer.VectorizeJsonQ16(scratch[..len], queryQ16);
+            else        jsonVectorizer.VectorizeJson(scratch[..len], query);
         }
         pipe.AdvanceTo(buffer.End);
 
@@ -504,7 +516,7 @@ else if (fastJson)
         // Cascade-rejected queries are inherently uncertain — apply the hard-query
         // deadline (same one HardQueryClassifier uses) to keep p99 bounded.
         if (hardqDeadlineUs > 0) Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = hardqDeadlineUs;
-        score = scorer.Score(query);
+        score = useQ16 ? q16Scorer!.ScoreQ16(queryQ16) : scorer.Score(query);
         Rinha.Api.Scorers.IvfScorer.CallDeadlineUs = 0;
 
         // J11d: pré-serializa as 6 respostas possíveis (fraud_score = N/5).

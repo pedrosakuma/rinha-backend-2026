@@ -14,20 +14,44 @@ namespace Rinha.Api.Scorers;
 /// so amortised latency stays close to pure IVF while gaining brute's exactness on
 /// every decision that actually matters.
 /// </summary>
-public sealed class HybridIvfQ16Scorer : IFraudScorer
+public sealed class HybridIvfQ16Scorer : IQ16FraudScorer
 {
     private readonly IFraudScorer _ivf;
     private readonly IFraudScorer _brute;
+    private readonly IQ16FraudScorer? _bruteQ16;
 
     public HybridIvfQ16Scorer(IFraudScorer ivf, IFraudScorer brute)
     {
         _ivf = ivf;
         _brute = brute;
+        _bruteQ16 = brute as IQ16FraudScorer;
     }
 
     public float Score(ReadOnlySpan<float> query)
     {
         var s = _ivf.Score(query);
+        if (IsBorderline(s))
+            return _brute.Score(query);
+        return s;
+    }
+
+    /// <summary>Q16 path: caller passes both representations so neither child has to
+    /// re-quantize. IVF still consumes float; brute consumes the canonical short.</summary>
+    public float ScoreQ16(ReadOnlySpan<short> query)
+    {
+        // Convert short → float once for IVF (bit-equal to Round4dp pipeline since
+        // each lane is q / Q16Scale, the same value Round4dp would produce).
+        Span<float> qf = stackalloc float[Dataset.Dimensions];
+        for (int i = 0; i < Dataset.Dimensions; i++) qf[i] = query[i] * (1f / Dataset.Q16Scale);
+        var s = _ivf.Score(qf);
+        if (IsBorderline(s))
+            return _bruteQ16 is { } b ? b.ScoreQ16(query) : _brute.Score(qf);
+        return s;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static bool IsBorderline(float s)
+    {
         // Borderline = the two discrete scores that are one neighbour-flip away from
         // the approval boundary. With K=5 each "vote" is worth ScoreStep (0.2), so the
         // values immediately on each side of ApprovalThreshold can be flipped by a
@@ -36,8 +60,6 @@ public sealed class HybridIvfQ16Scorer : IFraudScorer
         const float Step = PrecomputedFraudResponse.ScoreStep;
         const float T = PrecomputedFraudResponse.ApprovalThreshold;
         const float Eps = Step * 0.5f; // half-step tolerance for float compare
-        if (MathF.Abs(s - (T - Step)) < Eps || MathF.Abs(s - T) < Eps)
-            return _brute.Score(query);
-        return s;
+        return MathF.Abs(s - (T - Step)) < Eps || MathF.Abs(s - T) < Eps;
     }
 }

@@ -17,7 +17,7 @@ namespace Rinha.Api.Scorers;
 /// dist >= worst. With cpuset isolating the core, the 1.7MB Q16 working set fits in L2/L3
 /// without contention, making this competitive with IVF while avoiding any FN.
 /// </summary>
-public sealed unsafe class BruteForceQ16Scorer : IFraudScorer
+public sealed unsafe class BruteForceQ16Scorer : IQ16FraudScorer
 {
     private const int K = 5;
     private const int PaddedDimensions = 16;
@@ -47,7 +47,26 @@ public sealed unsafe class BruteForceQ16Scorer : IFraudScorer
         }
         qq[14] = 0;
         qq[15] = 0;
+        return ScoreQ16Internal(qq);
+    }
 
+    /// <summary>Q16 fast path: caller passes the 14 canonical shorts directly. The
+    /// scorer fills the 2 trailing pad lanes itself (the row layout in
+    /// <see cref="Dataset.Q16VectorsPtr"/> requires exactly 16 lanes per row, with
+    /// lanes 14,15 = 0 in references — so the query also pads with 0 to match).</summary>
+    public float ScoreQ16(ReadOnlySpan<short> query)
+    {
+        if (query.Length < Dataset.Dimensions)
+            throw new ArgumentException("Query vector too small", nameof(query));
+
+        Span<short> qq = stackalloc short[PaddedDimensions];
+        // Copy 14 canonical lanes; lanes 14,15 stay 0 (Span<short> stackalloc is zero-init).
+        query.Slice(0, Dataset.Dimensions).CopyTo(qq);
+        return ScoreQ16Internal(qq);
+    }
+
+    private float ScoreQ16Internal(Span<short> qq)
+    {
         Span<long> bestDist = stackalloc long[K];
         Span<int> bestIdx = stackalloc int[K];
         for (int i = 0; i < K; i++) { bestDist[i] = long.MaxValue; bestIdx[i] = -1; }
