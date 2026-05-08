@@ -1,6 +1,18 @@
 using Rinha.Api;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using System.IO.Pipelines;
+using System.Runtime;
+
+// L7: opt-in low-latency GC mode. Workstation+Concurrent GC defaults to Interactive,
+// which targets pause time but still permits gen2 STW pauses that can blow past 30ms
+// under steady allocation. SustainedLowLatency tells the GC to favor latency over
+// memory by suppressing gen2 collections (allocations grow until the runtime hits
+// memory pressure). Safe here because the hot path (scoring) is largely zero-alloc
+// (~7 MB/s observed in PROFILE_TIMING). Env: GC_LOW_LATENCY=1 (default off).
+if (Environment.GetEnvironmentVariable("GC_LOW_LATENCY") == "1")
+{
+    GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+}
 
 // J19: pin ThreadPool to match cgroup CPU quota (0.45 cpu × 2 replicas).
 // Hill-climbing can inject extra workers that fight over the fractional quota,
