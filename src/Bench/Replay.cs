@@ -23,10 +23,10 @@ namespace Rinha.Bench;
 /// </summary>
 public static class Replay
 {
-    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool BboxRepair = false, bool EarlyStop = true)
+    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool BboxRepair = false, bool EarlyStop = true, int EarlyStopPct = 75, bool Q16 = true)
     {
         public override string ToString()
-            => $"NP={NProbe,3} KP={KPrime,4} BNP={BorderlineNProbe,3} BKP={BorderlineKPrime,4} ES={(EarlyStop ? 1 : 0)} BBG={(BboxGuided ? 1 : 0)} BBR={(BboxRepair ? 1 : 0)}";
+            => $"NP={NProbe,3} KP={KPrime,4} BNP={BorderlineNProbe,3} BKP={BorderlineKPrime,4} ES={(EarlyStop ? 1 : 0)} ESPCT={EarlyStopPct,2} Q16={(Q16 ? 1 : 0)} BBG={(BboxGuided ? 1 : 0)} BBR={(BboxRepair ? 1 : 0)}";
     }
 
     public static int Run(string[] args)
@@ -211,22 +211,28 @@ public static class Replay
             // Inject env so IvfScorer picks them up.
             Environment.SetEnvironmentVariable("IVF_BORDERLINE_NPROBE", cfg.BorderlineNProbe.ToString());
             Environment.SetEnvironmentVariable("IVF_BORDERLINE_RERANK", cfg.BorderlineKPrime.ToString());
-            Environment.SetEnvironmentVariable("IVF_Q16", "1");
+            Environment.SetEnvironmentVariable("IVF_Q16", cfg.Q16 ? "1" : "0");
             var ivf = new IvfScorer(dataset,
                 nProbe: cfg.NProbe,
                 kPrime: cfg.KPrime,
                 earlyStop: cfg.EarlyStop,
-                earlyStopPct: 75,
+                earlyStopPct: cfg.EarlyStopPct,
                 bboxRepair: cfg.BboxRepair,
                 bboxGuided: cfg.BboxGuided);
 
             int fn = 0, fp = 0, disagree = 0;
             int firstFnIdx = -1;
             double diffSum = 0, diffMax = 0;
+            var perQuery = new long[candIdx.Length];
+            var swQ = new System.Diagnostics.Stopwatch();
             swT.Restart();
-            foreach (var i in candIdx)
+            for (int qi = 0; qi < candIdx.Length; qi++)
             {
+                int i = candIdx[qi];
+                swQ.Restart();
                 var s = ivf.Score(queries[i].Vec);
+                swQ.Stop();
+                perQuery[qi] = swQ.ElapsedTicks;
                 bool approved = s < thr;
                 if (approved != gtApproved[i])
                 {
@@ -240,11 +246,17 @@ public static class Replay
             }
             swT.Stop();
 
+            Array.Sort(perQuery);
+            double tickToUs = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double p50 = perQuery[(int)(perQuery.Length * 0.50)] * tickToUs;
+            double p99 = perQuery[(int)(perQuery.Length * 0.99)] * tickToUs;
+            double p999 = perQuery[(int)(perQuery.Length * 0.999)] * tickToUs;
+
             double avg = diffSum / candIdx.Length;
             if (csv)
-                Console.WriteLine($"{cfg.NProbe},{cfg.KPrime},{cfg.BorderlineNProbe},{cfg.BorderlineKPrime},{fn},{fp},{disagree},{diffMax:F4},{avg:F4},{swT.ElapsedMilliseconds}");
+                Console.WriteLine($"{cfg.NProbe},{cfg.KPrime},{cfg.BorderlineNProbe},{cfg.BorderlineKPrime},{fn},{fp},{disagree},{diffMax:F4},{avg:F4},{swT.ElapsedMilliseconds},{p50:F1},{p99:F1},{p999:F1}");
             else
-                Console.WriteLine($"{cfg,-58} {fn,4} {fp,4} {disagree,8} {avg,8:F4} {diffMax,8:F4} {swT.ElapsedMilliseconds,8}{(firstFnIdx >= 0 ? $"  firstFn=#{firstFnIdx} id={queries[firstFnIdx].Id}" : "")}");
+                Console.WriteLine($"{cfg,-86} {fn,4} {fp,4} {disagree,8} {avg,7:F4} {diffMax,7:F4} {swT.ElapsedMilliseconds,7}ms p50={p50,5:F1}us p99={p99,6:F1}us p999={p999,6:F1}us{(firstFnIdx >= 0 ? $"  firstFn=#{firstFnIdx} id={queries[firstFnIdx].Id}" : "")}");
         }
 
         return 0;
@@ -281,6 +293,8 @@ public static class Replay
         int np = 8, kp = 32, bnp = 32, bkp = 0;
         bool bbg = true;
         bool bbr = false;
+        int espct = 75;
+        bool q16 = true;
         foreach (var part in s.Split(','))
         {
             var kv = part.Split('=');
@@ -294,9 +308,11 @@ public static class Replay
                 case "BKP": case "BORDERLINE_RERANK": case "BORDERLINE_KPRIME": bkp = v; break;
                 case "BBG": case "BBOX_GUIDED": bbg = v != 0; break;
                 case "BBR": case "BBOX_REPAIR": bbr = v != 0; break;
+                case "ESPCT": case "EARLY_STOP_PCT": espct = v; break;
+                case "Q16": q16 = v != 0; break;
             }
         }
-        return new Cfg(np, kp, bnp, bkp, BboxGuided: bbg, BboxRepair: bbr);
+        return new Cfg(np, kp, bnp, bkp, BboxGuided: bbg, BboxRepair: bbr, EarlyStopPct: espct, Q16: q16);
     }
 
     private static string FindRepoRoot()
