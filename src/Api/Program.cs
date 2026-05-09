@@ -101,7 +101,7 @@ IQ16FraudScorer? q16Scorer = scorer as IQ16FraudScorer;
 if (Environment.GetEnvironmentVariable("WARMUP") != "0")
 {
     var swPre = System.Diagnostics.Stopwatch.StartNew();
-    long touched = dataset.Prefetch();
+    long touched = dataset.Prefetch(scorerName);
     swPre.Stop();
     var swJit = System.Diagnostics.Stopwatch.StartNew();
     int warmupIters = int.TryParse(Environment.GetEnvironmentVariable("WARMUP_ITERS"), out var _wi) && _wi > 0 ? _wi : 64;

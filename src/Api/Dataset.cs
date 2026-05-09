@@ -201,109 +201,126 @@ public sealed unsafe class Dataset : IDisposable
     /// pages to 2MB hugepages, shrinking the TLB footprint dramatically
     /// (192MB float dataset = 48k 4KB pages → 96 2MB pages).
     /// </summary>
-    public long Prefetch()
+    /// <summary>
+    /// Pre-touch mmap pages for the active scorer to eliminate first-request page-fault overhead.
+    /// scorerHint controls which regions are warmed:
+    ///   "brute" → Q16-SoA only (~84MB). Float32/Q8/IVF files are left demand-paged.
+    ///   other   → Q8, Q8-SoA, IVF centroids/offsets/bbox (~90MB). Q16-SoA left demand-paged.
+    /// Float32 vectors (192MB) are never prefetched — opt-in via PREFETCH_FLOAT=1.
+    /// </summary>
+    public long Prefetch(string? scorerHint = null)
     {
         const int PageSize = 4096;
         long total = 0;
         long sink = 0;
         long hpTotal = 0;
         long mlTotal = 0;
+        bool isBrute = scorerHint == "brute";
 
-        long vBytes = (long)Count * PaddedDimensions * sizeof(float);
-        hpTotal += AdviseHuge((byte*)_vectorsPtr, vBytes);
-        sink += TouchPages((byte*)_vectorsPtr, vBytes, PageSize);
-        // Note: full float vectors (~192MB) exceed cgroup limit; no mlock.
-        total += vBytes;
+        // Float32 vectors (192MB): not needed by IVF or brute-Q16 scorer; skip by default.
+        if (Environment.GetEnvironmentVariable("PREFETCH_FLOAT") == "1" && _vectorsPtr != null)
+        {
+            long vBytes = (long)Count * PaddedDimensions * sizeof(float);
+            hpTotal += AdviseHuge((byte*)_vectorsPtr, vBytes);
+            sink += TouchPages((byte*)_vectorsPtr, vBytes, PageSize);
+            total += vBytes;
+        }
 
+        // Labels: tiny, always prefetch.
         long lBytes = Count;
         hpTotal += AdviseHuge(_labelsPtr, lBytes);
         sink += TouchPages(_labelsPtr, lBytes, PageSize);
         mlTotal += MlockRegion(_labelsPtr, lBytes);
         total += lBytes;
 
-        if (_q8Ptr != null)
+        // Q8/Q8-SoA/IVF: needed by IVF scorer, not by brute-Q16.
+        if (!isBrute)
         {
-            long bytes = (long)Count * 16; // q8 row stride = PaddedDimensions (16)
-            hpTotal += AdviseHuge((byte*)_q8Ptr, bytes);
-            sink += TouchPages((byte*)_q8Ptr, bytes, PageSize);
-            mlTotal += MlockRegion((byte*)_q8Ptr, bytes);
-            total += bytes;
+            if (_q8Ptr != null)
+            {
+                long bytes = (long)Count * 16;
+                hpTotal += AdviseHuge((byte*)_q8Ptr, bytes);
+                sink += TouchPages((byte*)_q8Ptr, bytes, PageSize);
+                mlTotal += MlockRegion((byte*)_q8Ptr, bytes);
+                total += bytes;
+            }
+            if (_q8SoaPtr != null)
+            {
+                long bytes = (long)Count * Dimensions;
+                hpTotal += AdviseHuge((byte*)_q8SoaPtr, bytes);
+                sink += TouchPages((byte*)_q8SoaPtr, bytes, PageSize);
+                total += bytes;
+            }
+            if (_centroidsPtr != null)
+            {
+                long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+                hpTotal += AdviseHuge((byte*)_centroidsPtr, bytes);
+                sink += TouchPages((byte*)_centroidsPtr, bytes, PageSize);
+                mlTotal += MlockRegion((byte*)_centroidsPtr, bytes);
+                total += bytes;
+            }
+            if (_offsetsPtr != null)
+            {
+                long bytes = (long)(NumCells + 1) * sizeof(int);
+                hpTotal += AdviseHuge((byte*)_offsetsPtr, bytes);
+                sink += TouchPages((byte*)_offsetsPtr, bytes, PageSize);
+                mlTotal += MlockRegion((byte*)_offsetsPtr, bytes);
+                total += bytes;
+            }
+            if (_bboxMinPtr != null)
+            {
+                long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+                hpTotal += AdviseHuge((byte*)_bboxMinPtr, bytes);
+                sink += TouchPages((byte*)_bboxMinPtr, bytes, PageSize);
+                total += bytes;
+            }
+            if (_bboxMaxPtr != null)
+            {
+                long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
+                hpTotal += AdviseHuge((byte*)_bboxMaxPtr, bytes);
+                sink += TouchPages((byte*)_bboxMaxPtr, bytes, PageSize);
+                total += bytes;
+            }
         }
-        if (_q8SoaPtr != null)
+        // PQ: not used in brute or standard IVF modes; skip to save RSS.
+        if (!isBrute && Environment.GetEnvironmentVariable("PREFETCH_PQ") == "1")
         {
-            long bytes = (long)Count * Dimensions;
-            hpTotal += AdviseHuge((byte*)_q8SoaPtr, bytes);
-            sink += TouchPages((byte*)_q8SoaPtr, bytes, PageSize);
-            // Q8-SoA unused by default scorer; skip mlock.
-            total += bytes;
-        }
-        if (_centroidsPtr != null)
-        {
-            long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
-            hpTotal += AdviseHuge((byte*)_centroidsPtr, bytes);
-            sink += TouchPages((byte*)_centroidsPtr, bytes, PageSize);
-            mlTotal += MlockRegion((byte*)_centroidsPtr, bytes);
-            total += bytes;
-        }
-        if (_offsetsPtr != null)
-        {
-            long bytes = (long)(NumCells + 1) * sizeof(int);
-            hpTotal += AdviseHuge((byte*)_offsetsPtr, bytes);
-            sink += TouchPages((byte*)_offsetsPtr, bytes, PageSize);
-            mlTotal += MlockRegion((byte*)_offsetsPtr, bytes);
-            total += bytes;
-        }
-        if (_bboxMinPtr != null)
-        {
-            long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
-            hpTotal += AdviseHuge((byte*)_bboxMinPtr, bytes);
-            sink += TouchPages((byte*)_bboxMinPtr, bytes, PageSize);
-            total += bytes;
-        }
-        if (_bboxMaxPtr != null)
-        {
-            long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
-            hpTotal += AdviseHuge((byte*)_bboxMaxPtr, bytes);
-            sink += TouchPages((byte*)_bboxMaxPtr, bytes, PageSize);
-            total += bytes;
-        }
-        if (_pqCodebooksPtr != null)
-        {
-            long bytes = (long)PqM * PqKsub * (Dimensions / PqM) * sizeof(float);
-            hpTotal += AdviseHuge((byte*)_pqCodebooksPtr, bytes);
-            sink += TouchPages((byte*)_pqCodebooksPtr, bytes, PageSize);
-            total += bytes;
-        }
-        if (_pqCodesPtr != null)
-        {
-            long bytes = (long)Count * PqM;
-            hpTotal += AdviseHuge(_pqCodesPtr, bytes);
-            sink += TouchPages(_pqCodesPtr, bytes, PageSize);
-            total += bytes;
+            if (_pqCodebooksPtr != null)
+            {
+                long bytes = (long)PqM * PqKsub * (Dimensions / PqM) * sizeof(float);
+                hpTotal += AdviseHuge((byte*)_pqCodebooksPtr, bytes);
+                sink += TouchPages((byte*)_pqCodebooksPtr, bytes, PageSize);
+                total += bytes;
+            }
+            if (_pqCodesPtr != null)
+            {
+                long bytes = (long)Count * PqM;
+                hpTotal += AdviseHuge(_pqCodesPtr, bytes);
+                sink += TouchPages(_pqCodesPtr, bytes, PageSize);
+                total += bytes;
+            }
         }
 
-        // Q16-SoA (column-major) for brute-force AVX2 scan.
-        // If pre-mmapped from a file, just warm up the pages.
-        // If not, build from the row-major Q16 mmap (tiled to keep peak RSS low).
+        // Q16-SoA (column-major): needed by brute-force scorer only.
+        // If pre-mmapped from a file, warm up pages. Otherwise transpose from Q16 AoS.
         long soaBytes = (long)Dimensions * Count * sizeof(short);
-        if (_q16SoaPtr != null)
+        if (isBrute && _q16SoaPtr != null)
         {
-            // Pre-mmapped: touch pages to bring them into RSS.
             hpTotal += AdviseHuge((byte*)_q16SoaPtr, soaBytes);
             sink += TouchPages((byte*)_q16SoaPtr, soaBytes, PageSize);
             mlTotal += MlockRegion((byte*)_q16SoaPtr, soaBytes);
             total += soaBytes;
         }
-        else if (_q16Ptr != null)
+        else if (isBrute && _q16Ptr != null)
         {
-            // Allocate and transpose from Q16 AoS (tiled to limit peak RSS).
+            // Fallback: allocate and transpose from Q16 AoS (tiled to limit peak RSS).
             _q16SoaPtr = (short*)NativeMemory.AlignedAlloc((nuint)soaBytes, 64);
             _q16SoaIsAllocated = true;
             short* src = _q16Ptr;
             short* dst = _q16SoaPtr;
             int count = Count;
             int paddedDims = PaddedDimensions;
-            const int TileRows = 16384; // 14 × 32KB SoA writes fit in L3 per tile
+            const int TileRows = 16384;
             const int MADV_DONTNEED = 4;
             for (int tileStart = 0; tileStart < count; tileStart += TileRows)
             {
