@@ -11,6 +11,9 @@ if (args.Length > 0 && args[0] == "--recall")
 if (args.Length > 0 && args[0] == "--replay")
     return Rinha.Bench.Replay.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--dump-fn")
+    return Rinha.Bench.DumpFn.Run(args[1..]);
+
 var config = ManualConfig.CreateMinimumViable()
     .AddJob(Job.Default)
     .AddDiagnoser(MemoryDiagnoser.Default);

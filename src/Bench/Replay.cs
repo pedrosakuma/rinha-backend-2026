@@ -39,6 +39,12 @@ public static class Replay
         bool csv = false;
         bool candidatesOnly = false;
         float candLow = 0.30f, candHigh = 0.80f;
+        float jitter = 0f;
+        int jitterSeed = 42;
+        int randomN = 0;
+        int randomSeed = 7;
+        int edgeN = 0;
+        int edgeSeed = 13;
 
         foreach (var a in args)
         {
@@ -51,6 +57,12 @@ public static class Replay
             else if (a == "--candidates-only") candidatesOnly = true;
             else if (a.StartsWith("--cand-low=")) candLow = float.Parse(a[11..], CultureInfo.InvariantCulture);
             else if (a.StartsWith("--cand-high=")) candHigh = float.Parse(a[12..], CultureInfo.InvariantCulture);
+            else if (a.StartsWith("--jitter=")) jitter = float.Parse(a[9..], CultureInfo.InvariantCulture);
+            else if (a.StartsWith("--jitter-seed=")) jitterSeed = int.Parse(a[14..]);
+            else if (a.StartsWith("--random=")) randomN = int.Parse(a[9..]);
+            else if (a.StartsWith("--random-seed=")) randomSeed = int.Parse(a[14..]);
+            else if (a.StartsWith("--edge=")) edgeN = int.Parse(a[7..]);
+            else if (a.StartsWith("--edge-seed=")) edgeSeed = int.Parse(a[12..]);
         }
 
         var vec = Path.Combine(dataDir, "references.bin");
@@ -87,11 +99,33 @@ public static class Replay
         var queries = LoadQueries(testData, jvec, limit);
         Console.Error.WriteLine($"Loaded {queries.Count} queries.");
 
+        // Stress: optionally synthesize / perturb queries for robustness testing (#3).
+        // Cache key incorporates stress params so each variant has its own GT cache.
+        string stressTag = "";
+        if (jitter > 0f)
+        {
+            queries = ApplyJitter(queries, jitter, jitterSeed);
+            stressTag = $"-jitter{jitter:F3}-s{jitterSeed}";
+            Console.Error.WriteLine($"Jittered {queries.Count} queries with σ={jitter} seed={jitterSeed}");
+        }
+        if (randomN > 0)
+        {
+            queries = SynthRandom(randomN, randomSeed);
+            stressTag = $"-random{randomN}-s{randomSeed}";
+            Console.Error.WriteLine($"Synthetic random {queries.Count} queries seed={randomSeed}");
+        }
+        if (edgeN > 0)
+        {
+            queries = SynthEdge(dataset, edgeN, edgeSeed);
+            stressTag = $"-edge{edgeN}-s{edgeSeed}";
+            Console.Error.WriteLine($"Edge-case {queries.Count} queries seed={edgeSeed}");
+        }
+
         var brute = new BruteForceScorer(dataset);
         const float thr = 0.6f;
 
         // Ground truth (brute-force) — cache to disk so we don't pay 10min/run.
-        var gtPath = Path.Combine(dataDir, $".gt-cache-{queries.Count}.bin");
+        var gtPath = Path.Combine(dataDir, $".gt-cache-{queries.Count}{stressTag}.bin");
         var gtScore = new float[queries.Count];
         var gtApproved = new bool[queries.Count];
         if (File.Exists(gtPath) && new FileInfo(gtPath).Length == queries.Count * sizeof(float))
@@ -103,14 +137,20 @@ public static class Replay
         }
         else
         {
-            Console.Error.WriteLine("Computing brute-force ground truth (will cache) ...");
+            Console.Error.WriteLine($"Computing brute-force ground truth (parallel, {Environment.ProcessorCount} threads) ...");
             var sw = Stopwatch.StartNew();
-            for (int i = 0; i < queries.Count; i++)
-            {
-                var s = brute.Score(queries[i].Vec);
-                gtScore[i] = s;
-                gtApproved[i] = s < thr;
-            }
+            // Each thread builds its own scorer (state-free, but instances are cheap and
+            // avoid any sharing concerns).
+            var queriesArr = queries;
+            Parallel.For(0, queriesArr.Count, () => new BruteForceScorer(dataset),
+                (i, _, local) =>
+                {
+                    var s = local.Score(queriesArr[i].Vec);
+                    gtScore[i] = s;
+                    gtApproved[i] = s < thr;
+                    return local;
+                },
+                _ => { });
             sw.Stop();
             Console.Error.WriteLine($"Brute done in {sw.ElapsedMilliseconds}ms.");
             var raw = new byte[queries.Count * sizeof(float)];
@@ -260,5 +300,88 @@ public static class Replay
         while (dir is not null && !File.Exists(Path.Combine(dir, "Rinha.slnx")))
             dir = Path.GetDirectoryName(dir);
         return dir ?? throw new InvalidOperationException("Could not locate repo root");
+    }
+
+    // -------------------- Stress distributions (#3) --------------------
+    // Box-Muller Normal(0,1) sample.
+    private static float NextGaussian(Random rng)
+    {
+        double u1 = 1.0 - rng.NextDouble();
+        double u2 = 1.0 - rng.NextDouble();
+        return (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
+    }
+
+    /// <summary>
+    /// Per-query Normal(0, σ) perturbation on every dimension. Deterministic per
+    /// query index by using a per-query Random seeded with (globalSeed ^ index).
+    /// Output features are clamped to [0,1] (most preprocessor outputs live there).
+    /// </summary>
+    private static List<QueryRow> ApplyJitter(List<QueryRow> input, float sigma, int seed)
+    {
+        var output = new List<QueryRow>(input.Count);
+        for (int i = 0; i < input.Count; i++)
+        {
+            var rng = new Random(seed ^ unchecked((int)(i * 2654435761L)));
+            var v = new float[Dataset.Dimensions];
+            var src = input[i].Vec;
+            for (int d = 0; d < Dataset.Dimensions; d++)
+            {
+                float val = src[d] + sigma * NextGaussian(rng);
+                if (val < 0f) val = 0f;
+                else if (val > 1f) val = 1f;
+                v[d] = val;
+            }
+            output.Add(new QueryRow(input[i].Id + ".jit", v, false, 0f));
+        }
+        return output;
+    }
+
+    /// <summary>
+    /// Synthetic uniform queries in [0,1]^D. Stress-tests degenerate configs that
+    /// only work on realistic distributions.
+    /// </summary>
+    private static List<QueryRow> SynthRandom(int n, int seed)
+    {
+        var rng = new Random(seed);
+        var output = new List<QueryRow>(n);
+        for (int i = 0; i < n; i++)
+        {
+            var v = new float[Dataset.Dimensions];
+            for (int d = 0; d < Dataset.Dimensions; d++) v[d] = (float)rng.NextDouble();
+            output.Add(new QueryRow($"rnd-{i}", v, false, 0f));
+        }
+        return output;
+    }
+
+    /// <summary>
+    /// Edge-case queries: linear interpolation between two random centroid pairs at
+    /// t∈[0.4, 0.6]. These maximize the chance of borderline IVF gates firing
+    /// (queries equidistant to two cluster centers).
+    /// </summary>
+    private static unsafe List<QueryRow> SynthEdge(Dataset dataset, int n, int seed)
+    {
+        var rng = new Random(seed);
+        var output = new List<QueryRow>(n);
+        int nlist = dataset.NumCells;
+        var centBase = dataset.CentroidsPtr;
+        for (int i = 0; i < n; i++)
+        {
+            int a = rng.Next(nlist);
+            int b = rng.Next(nlist);
+            while (b == a) b = rng.Next(nlist);
+            float t = 0.4f + 0.2f * (float)rng.NextDouble();
+            var v = new float[Dataset.Dimensions];
+            float* ca = centBase + (long)a * Dataset.PaddedDimensions;
+            float* cb = centBase + (long)b * Dataset.PaddedDimensions;
+            for (int d = 0; d < Dataset.Dimensions; d++)
+            {
+                float val = (1f - t) * ca[d] + t * cb[d];
+                if (val < 0f) val = 0f;
+                else if (val > 1f) val = 1f;
+                v[d] = val;
+            }
+            output.Add(new QueryRow($"edge-{a}-{b}-t{t:F2}", v, false, 0f));
+        }
+        return output;
     }
 }
