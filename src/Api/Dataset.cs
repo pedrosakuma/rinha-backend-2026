@@ -37,10 +37,6 @@ public sealed unsafe class Dataset : IDisposable
     private readonly MemoryMappedViewAccessor? _bboxMinView;
     private readonly MemoryMappedFile? _bboxMaxMmf;
     private readonly MemoryMappedViewAccessor? _bboxMaxView;
-    private readonly MemoryMappedFile? _pqCodebooksMmf;
-    private readonly MemoryMappedViewAccessor? _pqCodebooksView;
-    private readonly MemoryMappedFile? _pqCodesMmf;
-    private readonly MemoryMappedViewAccessor? _pqCodesView;
     private readonly float* _vectorsPtr;
     private readonly byte* _labelsPtr;
     private readonly sbyte* _q8Ptr;
@@ -50,8 +46,6 @@ public sealed unsafe class Dataset : IDisposable
     private readonly int* _offsetsPtr;
     private readonly float* _bboxMinPtr;
     private readonly float* _bboxMaxPtr;
-    private readonly float* _pqCodebooksPtr;
-    private readonly byte* _pqCodesPtr;
     // Column-major (SoA) transposed Q16 layout: Dimensions columns of Count shorts each.
     // Either pre-mmapped from a file (built at image-build time) or allocated lazily in
     // Prefetch() from the row-major Q16 mmap. Layout: _q16SoaPtr[d * Count + i].
@@ -60,15 +54,12 @@ public sealed unsafe class Dataset : IDisposable
 
     public int Count { get; }
     public int NumCells { get; }
-    public int PqM { get; }
-    public int PqKsub { get; }
     public bool HasQ8 => _q8Ptr != null;
     public bool HasQ8Soa => _q8SoaPtr != null;
     public bool HasQ16 => _q16Ptr != null;
     public bool HasQ16Soa => _q16SoaPtr != null;
     public bool HasIvf => _centroidsPtr != null && _offsetsPtr != null;
     public bool HasIvfBbox => _bboxMinPtr != null && _bboxMaxPtr != null;
-    public bool HasPq => _pqCodebooksPtr != null && _pqCodesPtr != null;
 
     private Dataset(
         MemoryMappedFile vectorsMmf, MemoryMappedViewAccessor vectorsView,
@@ -81,9 +72,7 @@ public sealed unsafe class Dataset : IDisposable
         MemoryMappedFile? offsetsMmf, MemoryMappedViewAccessor? offsetsView,
         MemoryMappedFile? bboxMinMmf, MemoryMappedViewAccessor? bboxMinView,
         MemoryMappedFile? bboxMaxMmf, MemoryMappedViewAccessor? bboxMaxView,
-        MemoryMappedFile? pqCodebooksMmf, MemoryMappedViewAccessor? pqCodebooksView,
-        MemoryMappedFile? pqCodesMmf, MemoryMappedViewAccessor? pqCodesView,
-        int count, int numCells, int pqM, int pqKsub)
+        int count, int numCells)
     {
         _vectorsMmf = vectorsMmf;
         _vectorsView = vectorsView;
@@ -105,14 +94,8 @@ public sealed unsafe class Dataset : IDisposable
         _bboxMinView = bboxMinView;
         _bboxMaxMmf = bboxMaxMmf;
         _bboxMaxView = bboxMaxView;
-        _pqCodebooksMmf = pqCodebooksMmf;
-        _pqCodebooksView = pqCodebooksView;
-        _pqCodesMmf = pqCodesMmf;
-        _pqCodesView = pqCodesView;
         Count = count;
         NumCells = numCells;
-        PqM = pqM;
-        PqKsub = pqKsub;
 
         byte* basePtr = null;
         _vectorsView.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
@@ -176,20 +159,6 @@ public sealed unsafe class Dataset : IDisposable
             byte* bMaxBase = null;
             _bboxMaxView.SafeMemoryMappedViewHandle.AcquirePointer(ref bMaxBase);
             _bboxMaxPtr = (float*)bMaxBase;
-        }
-
-        if (_pqCodebooksView is not null)
-        {
-            byte* cbBase = null;
-            _pqCodebooksView.SafeMemoryMappedViewHandle.AcquirePointer(ref cbBase);
-            _pqCodebooksPtr = (float*)cbBase;
-        }
-
-        if (_pqCodesView is not null)
-        {
-            byte* codesBase = null;
-            _pqCodesView.SafeMemoryMappedViewHandle.AcquirePointer(ref codesBase);
-            _pqCodesPtr = codesBase;
         }
     }
 
@@ -282,24 +251,6 @@ public sealed unsafe class Dataset : IDisposable
                 total += bytes;
             }
         }
-        // PQ: not used in brute or standard IVF modes; skip to save RSS.
-        if (!isBrute && Environment.GetEnvironmentVariable("PREFETCH_PQ") == "1")
-        {
-            if (_pqCodebooksPtr != null)
-            {
-                long bytes = (long)PqM * PqKsub * (Dimensions / PqM) * sizeof(float);
-                hpTotal += AdviseHuge((byte*)_pqCodebooksPtr, bytes);
-                sink += TouchPages((byte*)_pqCodebooksPtr, bytes, PageSize);
-                total += bytes;
-            }
-            if (_pqCodesPtr != null)
-            {
-                long bytes = (long)Count * PqM;
-                hpTotal += AdviseHuge(_pqCodesPtr, bytes);
-                sink += TouchPages(_pqCodesPtr, bytes, PageSize);
-                total += bytes;
-            }
-        }
 
         // Q16-SoA (column-major): needed by brute-force scorer only.
         // If pre-mmapped from a file, warm up pages. Otherwise transpose from Q16 AoS.
@@ -359,12 +310,8 @@ public sealed unsafe class Dataset : IDisposable
     [DllImport("libc", EntryPoint = "mlock", SetLastError = true)]
     private static extern int LinuxMlock(IntPtr addr, UIntPtr length);
     private const int MADV_HUGEPAGE = 14;
-    private static readonly bool s_thpEnabled =
-        Environment.GetEnvironmentVariable("DATASET_THP") != "0" &&
-        OperatingSystem.IsLinux();
-    private static readonly bool s_mlockEnabled =
-        Environment.GetEnvironmentVariable("DATASET_MLOCK") == "1" &&
-        OperatingSystem.IsLinux();
+    private static readonly bool s_thpEnabled = OperatingSystem.IsLinux();
+    private static readonly bool s_mlockEnabled = false;
 
     private static long AdviseHuge(byte* p, long bytes)
     {
@@ -420,11 +367,7 @@ public sealed unsafe class Dataset : IDisposable
         string? ivfCentroidsPath = null,
         string? ivfOffsetsPath = null,
         string? ivfBboxMinPath = null,
-        string? ivfBboxMaxPath = null,
-        string? pqCodebooksPath = null,
-        string? pqCodesPath = null,
-        int pqM = 7,
-        int pqKsub = 256)
+        string? ivfBboxMaxPath = null)
     {
         var vectorsLen = new FileInfo(vectorsPath).Length;
         var labelsLen = new FileInfo(labelsPath).Length;
@@ -537,48 +480,13 @@ public sealed unsafe class Dataset : IDisposable
             bboxMaxView = bboxMaxMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         }
 
-        MemoryMappedFile? pqCodebooksMmf = null;
-        MemoryMappedViewAccessor? pqCodebooksView = null;
-        MemoryMappedFile? pqCodesMmf = null;
-        MemoryMappedViewAccessor? pqCodesView = null;
-        if (!string.IsNullOrEmpty(pqCodebooksPath) && File.Exists(pqCodebooksPath)
-            && !string.IsNullOrEmpty(pqCodesPath) && File.Exists(pqCodesPath))
-        {
-            int dsub = Dimensions / pqM;
-            long expectedCb = (long)pqM * pqKsub * dsub * sizeof(float);
-            long cbLen = new FileInfo(pqCodebooksPath).Length;
-            if (cbLen != expectedCb)
-                throw new InvalidDataException($"PQ codebooks size {cbLen} != expected {expectedCb} (M={pqM} ksub={pqKsub} dsub={dsub})");
-            long expectedCodes = (long)count * pqM;
-            long codesLen = new FileInfo(pqCodesPath).Length;
-            if (codesLen != expectedCodes)
-                throw new InvalidDataException($"PQ codes size {codesLen} != expected {expectedCodes}");
-            pqCodebooksMmf = MemoryMappedFile.CreateFromFile(pqCodebooksPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-            pqCodebooksView = pqCodebooksMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-            pqCodesMmf = MemoryMappedFile.CreateFromFile(pqCodesPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-            pqCodesView = pqCodesMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-        }
-
         return new Dataset(
             vectorsMmf, vectorsView, labelsMmf, labelsView,
             q8Mmf, q8View, q8SoaMmf, q8SoaView,
             q16Mmf, q16View, q16SoaMmf, q16SoaView,
             centroidsMmf, centroidsView, offsetsMmf, offsetsView,
             bboxMinMmf, bboxMinView, bboxMaxMmf, bboxMaxView,
-            pqCodebooksMmf, pqCodebooksView, pqCodesMmf, pqCodesView,
-            (int)count, numCells, pqM, pqKsub);
-    }
-
-    public float* PqCodebooksPtr
-    {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _pqCodebooksPtr;
-    }
-
-    public byte* PqCodesPtr
-    {
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _pqCodesPtr;
+            (int)count, numCells);
     }
 
     public float* VectorsPtr
@@ -659,8 +567,6 @@ public sealed unsafe class Dataset : IDisposable
         try { _offsetsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _bboxMinView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _bboxMaxView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
-        try { _pqCodebooksView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
-        try { _pqCodesView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         if (_q16SoaPtr != null && _q16SoaIsAllocated)
         {
             NativeMemory.AlignedFree(_q16SoaPtr);
@@ -686,9 +592,5 @@ public sealed unsafe class Dataset : IDisposable
         _bboxMinMmf?.Dispose();
         _bboxMaxView?.Dispose();
         _bboxMaxMmf?.Dispose();
-        _pqCodebooksView?.Dispose();
-        _pqCodebooksMmf?.Dispose();
-        _pqCodesView?.Dispose();
-        _pqCodesMmf?.Dispose();
     }
 }

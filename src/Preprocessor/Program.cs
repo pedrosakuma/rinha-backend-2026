@@ -7,9 +7,6 @@ using Rinha.Preprocessor;
 if (args.Length > 0 && args[0] == "--ivf")
     return IvfBuilder.Run(args[1..]);
 
-if (args.Length > 0 && args[0] == "--pq")
-    return PqBuilder.Run(args[1..]);
-
 if (args.Length < 3 || args.Length > 4)
 {
     Console.Error.WriteLine("Usage: Rinha.Preprocessor <references.json.gz> <out-vectors.bin> <out-labels.bin> [<out-vectors-q8.bin>]");

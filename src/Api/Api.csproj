@@ -24,4 +24,7 @@
     <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
     <XmlResolverIsNetworkingEnabledByDefault>false</XmlResolverIsNetworkingEnabledByDefault>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Kestrel.Transport.IoUring" Version="2.2.2" />
+  </ItemGroup>
 </Project>

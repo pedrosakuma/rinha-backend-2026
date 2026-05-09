@@ -23,28 +23,16 @@ public static class ScorerFactory
     {
         "brute" or ""        => new Rinha.Api.Scorers.BruteForceScorer(dataset),
         "bruteq16" or "q16"  => new Rinha.Api.Scorers.BruteForceQ16Scorer(dataset),
-        "fma"                => new Rinha.Api.Scorers.FmaBruteForceScorer(dataset),
         "q8"                 => new Rinha.Api.Scorers.Q8RecheckScorer(dataset, ParseInt(Environment.GetEnvironmentVariable("Q8_RERANK"), 32)),
         "ivf"                => new Rinha.Api.Scorers.IvfScorer(dataset,
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_NPROBE"), 16),
+                                    ParseInt(Environment.GetEnvironmentVariable("IVF_NPROBE"), 8),
                                     ParseInt(Environment.GetEnvironmentVariable("IVF_RERANK"), 32),
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_DIM_FILTER"), -1),
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_DIM_FILTER2"), -1),
-                                    Environment.GetEnvironmentVariable("IVF_EARLY_STOP") == "1",
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_EARLY_STOP_PCT"), 75),
-                                    Environment.GetEnvironmentVariable("IVF_BBOX_REPAIR") == "1",
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_EARLY_STOP_PCT_EARLY"), 0),
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_SCALAR_ABORT"), 0),
-                                    Environment.GetEnvironmentVariable("IVF_DENSITY_ORDER") == "1",
-                                    Environment.GetEnvironmentVariable("IVF_BBOX_GUIDED") == "1",
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_BORDERLINE_RERANK"), 0)),
-        "ivfpq"              => new Rinha.Api.Scorers.IvfPqScorer(dataset,
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_NPROBE"), 96),
-                                    ParseInt(Environment.GetEnvironmentVariable("IVF_RERANK"), 64)),
-        "hybrid"             => new Rinha.Api.Scorers.HybridIvfQ16Scorer(
-                                    Create("ivf", dataset),
-                                    Create("bruteq16", dataset)),
-        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, bruteq16, fma, q8, ivf, ivfpq, hybrid")
+                                    earlyStop: Environment.GetEnvironmentVariable("IVF_EARLY_STOP") != "0",
+                                    earlyStopPct: ParseInt(Environment.GetEnvironmentVariable("IVF_EARLY_STOP_PCT"), 75),
+                                    bboxRepair: Environment.GetEnvironmentVariable("IVF_BBOX_REPAIR") == "1",
+                                    earlyStopPctEarly: ParseInt(Environment.GetEnvironmentVariable("IVF_EARLY_STOP_PCT_EARLY"), 0),
+                                    bboxGuided: Environment.GetEnvironmentVariable("IVF_BBOX_GUIDED") == "1"),
+        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, bruteq16, q8, ivf")
     };
 
     private static int ParseInt(string? s, int defaultValue)

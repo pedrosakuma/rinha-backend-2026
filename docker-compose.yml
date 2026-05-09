@@ -21,43 +21,23 @@ services:
       DOTNET_gcServer: "${DOTNET_GCSERVER:-0}"
       DOTNET_GCConserveMemory: "${DOTNET_GCCONSERVE:-9}"
       DOTNET_PROCESSOR_COUNT: "${DOTNET_PROCESSOR_COUNT:-1}"
-      LIFO_LIMIT: "${LIFO_LIMIT:-0}"
-      LIFO_QUEUE: "${LIFO_QUEUE:-32}"
-      IVF_EARLY_MAJORITY: "${IVF_EARLY_MAJORITY:-0}"
-      IVF_DEADLINE_US: "${IVF_DEADLINE_US:-0}"
-      HARDQ_DUMP_PATH: "${HARDQ_DUMP_PATH:-}"
-      HARDQ_DEADLINE_US: "${HARDQ_DEADLINE_US:-3000}"
-      HARDQ_NPROBE_EASY: "${HARDQ_NPROBE_EASY:-0}"
-      IVF_BATCH_WAIT_US: "${IVF_BATCH_WAIT_US:-0}"
-      DATASET_THP: "${DATASET_THP:-1}"
-      DATASET_MLOCK: "${DATASET_MLOCK:-0}"
-      IVF_PREFETCH: "${IVF_PREFETCH:-0}"
       TP_MIN_WORKERS: "${TP_MIN_WORKERS:-2}"
       TP_MAX_WORKERS: "${TP_MAX_WORKERS:-2}"
-      TP_MIN_IO: "${TP_MIN_IO:-2}"
-      TP_MAX_IO: "${TP_MAX_IO:-4}"
       SCORER: "${SCORER:-ivf}"
       IVF_NPROBE: "${IVF_NPROBE:-8}"
       # IVF_RERANK (kPrime): 24 é sweet spot cascade-off Q16 (sweep 16-128).
       IVF_RERANK: "${IVF_RERANK:-24}"
-      Q8_RERANK: "${Q8_RERANK:-32}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
       # IVF_EARLY_STOP_PCT: 40 vence cascade-off (checkpoint cedo poupa cells
       # restantes quando margem de pruning é boa). Cascade-on prefere 72.
-      # Histórico do sweep antigo (cascade-on, J14) preservado em git log.
       IVF_EARLY_STOP_PCT: "${IVF_EARLY_STOP_PCT:-40}"
       IVF_EARLY_STOP_PCT_EARLY: "${IVF_EARLY_STOP_PCT_EARLY:-0}"
       IVF_BBOX_REPAIR: "${IVF_BBOX_REPAIR:-0}"
-      # Dormant toggles (rejected experiments, kept as 0 to preserve tested behavior).
-      # Ver docs/tuning-knobs.md e docs/perf-journal.md para detalhes.
-      IVF_SCALAR_ABORT: "${IVF_SCALAR_ABORT:-0}"
-      IVF_DENSITY_ORDER: "${IVF_DENSITY_ORDER:-0}"
-      FAST_JSON: "${FAST_JSON:-0}"
-      PROFILE_TIMING: "${PROFILE_TIMING:-0}"
-      ALLOC_TRACE: "${ALLOC_TRACE:-0}"
+      IVF_BBOX_GUIDED: "${IVF_BBOX_GUIDED:-0}"
+      IO_URING_ENABLED: "${IO_URING_ENABLED:-0}"
+      IO_URING_SIZE: "${IO_URING_SIZE:-256}"
+      IO_URING_MAX_CONN: "${IO_URING_MAX_CONN:-1024}"
     networks: [app]
-    volumes:
-      - ./tools/hq-data:/hq
     ulimits:
       memlock: -1
     deploy:

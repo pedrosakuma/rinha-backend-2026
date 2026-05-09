@@ -17,7 +17,7 @@ public sealed class PrecomputedFraudResponse : IResult
     /// Approval threshold: <c>approved = score &lt; ApprovalThreshold</c>. With k=5 the
     /// six discrete scores are {0, .2, .4, .6, .8, 1}, and 0.6 is the smallest value
     /// that means &quot;majority of nearest neighbours are fraud&quot;. Shared with
-    /// <see cref="Rinha.Api.Scorers.HybridIvfQ16Scorer"/> so any change here
+    /// <see cref="Rinha.Api.Scorers.IvfScorer"/> so any change here
     /// automatically updates the borderline-trigger logic.
     /// </summary>
     public const float ApprovalThreshold = 0.6f;
@@ -34,12 +34,23 @@ public sealed class PrecomputedFraudResponse : IResult
 
     public static PrecomputedFraudResponse FromScore(float score)
     {
+        return Instances[ScoreToIndex(score)];
+    }
+
+    public static int ScoreToIndex(float score)
+    {
         // score deve ser N/5 com N ∈ 0..5; clamp + round defensivos.
         int n = (int)MathF.Round(score * 5f);
         if (n < 0) n = 0;
         else if (n > 5) n = 5;
-        return Instances[n];
+        return n;
     }
+
+    /// <summary>
+    /// Returns the pre-serialized JSON body for the given score index (0..5).
+    /// Used by the KESTREL_FAST hot path that writes directly to BodyWriter.
+    /// </summary>
+    public static ReadOnlyMemory<byte> BodyForIndex(int index) => Bodies[index];
 
     public Task ExecuteAsync(HttpContext httpContext)
     {

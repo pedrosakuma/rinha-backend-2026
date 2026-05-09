@@ -23,7 +23,7 @@ namespace Rinha.Bench;
 /// </summary>
 public static class Replay
 {
-    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool BboxRepair = false, bool EarlyStop = true, int EarlyStopPct = 75, bool Q16 = true, int ScalarAbort = 0, bool DensityOrder = false)
+    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool BboxRepair = false, bool EarlyStop = true, int EarlyStopPct = 75, bool Q16 = true)
     {
         public override string ToString()
             => $"NP={NProbe,3} KP={KPrime,4} BNP={BorderlineNProbe,3} BKP={BorderlineKPrime,4} ES={(EarlyStop ? 1 : 0)} ESPCT={EarlyStopPct,2} Q16={(Q16 ? 1 : 0)} BBG={(BboxGuided ? 1 : 0)} BBR={(BboxRepair ? 1 : 0)}";
@@ -45,6 +45,7 @@ public static class Replay
         int randomSeed = 7;
         int edgeN = 0;
         int edgeSeed = 13;
+        string? scorerName = null;
 
         foreach (var a in args)
         {
@@ -63,7 +64,10 @@ public static class Replay
             else if (a.StartsWith("--random-seed=")) randomSeed = int.Parse(a[14..]);
             else if (a.StartsWith("--edge=")) edgeN = int.Parse(a[7..]);
             else if (a.StartsWith("--edge-seed=")) edgeSeed = int.Parse(a[12..]);
+            else if (a.StartsWith("--scorer=")) scorerName = a[9..];
         }
+        // null/empty → IvfScorer (default).
+        scorerName ??= "";
 
         var vec = Path.Combine(dataDir, "references.bin");
         var lab = Path.Combine(dataDir, "labels.bin");
@@ -85,6 +89,7 @@ public static class Replay
             File.Exists(q8) ? q8 : null,
             File.Exists(q8Soa) ? q8Soa : null,
             File.Exists(q16) ? q16 : null,
+            null, // q16-soa (brute-only artifact, not needed for IVF replay)
             cents,
             File.Exists(offs) ? offs : null,
             File.Exists(bbmin) ? bbmin : null,
@@ -212,15 +217,13 @@ public static class Replay
             Environment.SetEnvironmentVariable("IVF_BORDERLINE_NPROBE", cfg.BorderlineNProbe.ToString());
             Environment.SetEnvironmentVariable("IVF_BORDERLINE_RERANK", cfg.BorderlineKPrime.ToString());
             Environment.SetEnvironmentVariable("IVF_Q16", cfg.Q16 ? "1" : "0");
-            var ivf = new IvfScorer(dataset,
+            IFraudScorer ivf = new IvfScorer(dataset,
                 nProbe: cfg.NProbe,
                 kPrime: cfg.KPrime,
                 earlyStop: cfg.EarlyStop,
                 earlyStopPct: cfg.EarlyStopPct,
                 bboxRepair: cfg.BboxRepair,
-                bboxGuided: cfg.BboxGuided,
-                scalarAbort: cfg.ScalarAbort,
-                densityOrder: cfg.DensityOrder);
+                bboxGuided: cfg.BboxGuided);
 
             int fn = 0, fp = 0, disagree = 0;
             int firstFnIdx = -1;
@@ -297,8 +300,6 @@ public static class Replay
         bool bbr = false;
         int espct = 75;
         bool q16 = true;
-        int sa = 0;
-        bool dens = false;
         foreach (var part in s.Split(','))
         {
             var kv = part.Split('=');
@@ -314,11 +315,9 @@ public static class Replay
                 case "BBR": case "BBOX_REPAIR": bbr = v != 0; break;
                 case "ESPCT": case "EARLY_STOP_PCT": espct = v; break;
                 case "Q16": q16 = v != 0; break;
-                case "SA": case "SCALAR_ABORT": sa = v; break;
-                case "DENS": case "DENSITY_ORDER": dens = v != 0; break;
             }
         }
-        return new Cfg(np, kp, bnp, bkp, BboxGuided: bbg, BboxRepair: bbr, EarlyStopPct: espct, Q16: q16, ScalarAbort: sa, DensityOrder: dens);
+        return new Cfg(np, kp, bnp, bkp, BboxGuided: bbg, BboxRepair: bbr, EarlyStopPct: espct, Q16: q16);
     }
 
     private static string FindRepoRoot()
