@@ -23,10 +23,10 @@ namespace Rinha.Bench;
 /// </summary>
 public static class Replay
 {
-    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool EarlyStop = true)
+    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool BboxRepair = false, bool EarlyStop = true)
     {
         public override string ToString()
-            => $"NP={NProbe,3} KP={KPrime,4} BNP={BorderlineNProbe,3} BKP={BorderlineKPrime,4} ES={(EarlyStop ? 1 : 0)} BBG={(BboxGuided ? 1 : 0)}";
+            => $"NP={NProbe,3} KP={KPrime,4} BNP={BorderlineNProbe,3} BKP={BorderlineKPrime,4} ES={(EarlyStop ? 1 : 0)} BBG={(BboxGuided ? 1 : 0)} BBR={(BboxRepair ? 1 : 0)}";
     }
 
     public static int Run(string[] args)
@@ -217,6 +217,7 @@ public static class Replay
                 kPrime: cfg.KPrime,
                 earlyStop: cfg.EarlyStop,
                 earlyStopPct: 75,
+                bboxRepair: cfg.BboxRepair,
                 bboxGuided: cfg.BboxGuided);
 
             int fn = 0, fp = 0, disagree = 0;
@@ -278,6 +279,8 @@ public static class Replay
     private static Cfg ParseConfig(string s)
     {
         int np = 8, kp = 32, bnp = 32, bkp = 0;
+        bool bbg = true;
+        bool bbr = false;
         foreach (var part in s.Split(','))
         {
             var kv = part.Split('=');
@@ -289,9 +292,11 @@ public static class Replay
                 case "KP": case "KPRIME": kp = v; break;
                 case "BNP": case "BORDERLINE_NPROBE": bnp = v; break;
                 case "BKP": case "BORDERLINE_RERANK": case "BORDERLINE_KPRIME": bkp = v; break;
+                case "BBG": case "BBOX_GUIDED": bbg = v != 0; break;
+                case "BBR": case "BBOX_REPAIR": bbr = v != 0; break;
             }
         }
-        return new Cfg(np, kp, bnp, bkp);
+        return new Cfg(np, kp, bnp, bkp, BboxGuided: bbg, BboxRepair: bbr);
     }
 
     private static string FindRepoRoot()
