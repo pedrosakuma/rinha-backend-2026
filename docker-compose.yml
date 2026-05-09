@@ -21,10 +21,10 @@ services:
       DOTNET_gcServer: "${DOTNET_GCSERVER:-0}"
       DOTNET_GCConserveMemory: "${DOTNET_GCCONSERVE:-9}"
       DOTNET_PROCESSOR_COUNT: "${DOTNET_PROCESSOR_COUNT:-1}"
-      TP_MIN_WORKERS: "${TP_MIN_WORKERS:-2}"
-      TP_MAX_WORKERS: "${TP_MAX_WORKERS:-2}"
+      TP_MIN_WORKERS: "${TP_MIN_WORKERS:-1}"
+      TP_MAX_WORKERS: "${TP_MAX_WORKERS:-1}"
       SCORER: "${SCORER:-ivf}"
-      IVF_NPROBE: "${IVF_NPROBE:-8}"
+      IVF_NPROBE: "${IVF_NPROBE:-2}"
       # IVF_RERANK (kPrime): 24 é sweet spot cascade-off Q16 (sweep 16-128).
       IVF_RERANK: "${IVF_RERANK:-24}"
       IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
