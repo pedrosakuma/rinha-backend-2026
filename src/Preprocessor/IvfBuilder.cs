@@ -41,6 +41,7 @@ public static unsafe class IvfBuilder
         string? bboxMinPath = null, bboxMaxPath = null;
         string? q8SoaPath = null; // J11: SoA layout for scalar early-abort
         string? q16Path = null;   // J25: int16 rerank (replaces float on hot path)
+        string? q16SoaPath = null; // column-major Q16 for brute-force AVX2 scan (pre-transposed)
         int positional = 5;
         if (args.Length > 5 && args[5].EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
             && args.Length > 6 && args[6].EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
@@ -56,6 +57,11 @@ public static unsafe class IvfBuilder
                 {
                     q16Path = args[8];
                     positional = 9;
+                    if (args.Length > 9 && args[9].EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+                    {
+                        q16SoaPath = args[9];
+                        positional = 10;
+                    }
                 }
             }
         }
@@ -190,6 +196,23 @@ public static unsafe class IvfBuilder
             }
             WriteAll(q16Path, MemoryMarshal.AsBytes(q16.AsSpan()));
             Console.Error.WriteLine($"  q16 in {sw.Elapsed.TotalSeconds:F2}s ({n}x{PaddedDimensions} shorts = {(long)n * PaddedDimensions * 2:N0} bytes)");
+
+            // Column-major (SoA) Q16 for brute-force AVX2 scan.
+            // Layout: q16Soa[d * n + r] = Q16 value of vector r at dimension d.
+            // Size: Dimensions * n * sizeof(short) = 14 * n * 2 (no padding cols).
+            if (q16SoaPath is not null)
+            {
+                sw.Restart();
+                var q16Soa = new short[(long)Dimensions * n];
+                for (int d = 0; d < Dimensions; d++)
+                {
+                    long colBase = (long)d * n;
+                    for (int r = 0; r < n; r++)
+                        q16Soa[colBase + r] = q16[(long)r * PaddedDimensions + d];
+                }
+                WriteAll(q16SoaPath, MemoryMarshal.AsBytes(q16Soa.AsSpan()));
+                Console.Error.WriteLine($"  q16-soa in {sw.Elapsed.TotalSeconds:F2}s ({Dimensions}x{n} shorts = {(long)Dimensions * n * 2:N0} bytes)");
+            }
         }
 
         // Stats

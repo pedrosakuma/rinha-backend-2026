@@ -27,6 +27,8 @@ public sealed unsafe class Dataset : IDisposable
     private readonly MemoryMappedViewAccessor? _q8SoaView;
     private readonly MemoryMappedFile? _q16Mmf;
     private readonly MemoryMappedViewAccessor? _q16View;
+    private readonly MemoryMappedFile? _q16SoaMmf;
+    private readonly MemoryMappedViewAccessor? _q16SoaView;
     private readonly MemoryMappedFile? _centroidsMmf;
     private readonly MemoryMappedViewAccessor? _centroidsView;
     private readonly MemoryMappedFile? _offsetsMmf;
@@ -51,9 +53,10 @@ public sealed unsafe class Dataset : IDisposable
     private readonly float* _pqCodebooksPtr;
     private readonly byte* _pqCodesPtr;
     // Column-major (SoA) transposed Q16 layout: Dimensions columns of Count shorts each.
-    // Allocated lazily in Prefetch() from the row-major Q16 mmap.
-    // Layout: _q16SoaPtr[d * Count + i] = Q16 value of vector i at dimension d.
+    // Either pre-mmapped from a file (built at image-build time) or allocated lazily in
+    // Prefetch() from the row-major Q16 mmap. Layout: _q16SoaPtr[d * Count + i].
     private short* _q16SoaPtr;
+    private bool _q16SoaIsAllocated; // true = AlignedAlloc; false = mmap (do not free)
 
     public int Count { get; }
     public int NumCells { get; }
@@ -73,6 +76,7 @@ public sealed unsafe class Dataset : IDisposable
         MemoryMappedFile? q8Mmf, MemoryMappedViewAccessor? q8View,
         MemoryMappedFile? q8SoaMmf, MemoryMappedViewAccessor? q8SoaView,
         MemoryMappedFile? q16Mmf, MemoryMappedViewAccessor? q16View,
+        MemoryMappedFile? q16SoaMmf, MemoryMappedViewAccessor? q16SoaView,
         MemoryMappedFile? centroidsMmf, MemoryMappedViewAccessor? centroidsView,
         MemoryMappedFile? offsetsMmf, MemoryMappedViewAccessor? offsetsView,
         MemoryMappedFile? bboxMinMmf, MemoryMappedViewAccessor? bboxMinView,
@@ -91,6 +95,8 @@ public sealed unsafe class Dataset : IDisposable
         _q8SoaView = q8SoaView;
         _q16Mmf = q16Mmf;
         _q16View = q16View;
+        _q16SoaMmf = q16SoaMmf;
+        _q16SoaView = q16SoaView;
         _centroidsMmf = centroidsMmf;
         _centroidsView = centroidsView;
         _offsetsMmf = offsetsMmf;
@@ -135,6 +141,13 @@ public sealed unsafe class Dataset : IDisposable
             byte* q16Base = null;
             _q16View.SafeMemoryMappedViewHandle.AcquirePointer(ref q16Base);
             _q16Ptr = (short*)q16Base;
+        }
+
+        if (_q16SoaView is not null)
+        {
+            byte* q16SoaBase = null;
+            _q16SoaView.SafeMemoryMappedViewHandle.AcquirePointer(ref q16SoaBase);
+            _q16SoaPtr = (short*)q16SoaBase;
         }
 
         if (_centroidsView is not null)
@@ -269,18 +282,23 @@ public sealed unsafe class Dataset : IDisposable
             total += bytes;
         }
 
-        // Build SoA (column-major) transposed Q16 layout for brute-force AVX2 scan.
-        // Layout: _q16SoaPtr[d * Count + i] = Q16 value of vector i at dimension d.
-        // Memory: Dimensions * Count * sizeof(short) = 14 * ~3M * 2 ≈ 84MB.
-        //
-        // Tiled transpose (16K rows per tile) keeps 14 SoA column slices (14*32KB=448KB)
-        // hot in L3 while reading Q16 sequentially. After each tile, MADV_DONTNEED on
-        // the Q16 pages frees physical frames, keeping peak RSS well under the 150MB limit:
-        //   peak = 84MB SoA (anon) + ~2MB Q16 tile (file-backed, then freed) + overhead.
-        if (_q16Ptr != null && _q16SoaPtr == null)
+        // Q16-SoA (column-major) for brute-force AVX2 scan.
+        // If pre-mmapped from a file, just warm up the pages.
+        // If not, build from the row-major Q16 mmap (tiled to keep peak RSS low).
+        long soaBytes = (long)Dimensions * Count * sizeof(short);
+        if (_q16SoaPtr != null)
         {
-            long soaBytes = (long)Dimensions * Count * sizeof(short);
+            // Pre-mmapped: touch pages to bring them into RSS.
+            hpTotal += AdviseHuge((byte*)_q16SoaPtr, soaBytes);
+            sink += TouchPages((byte*)_q16SoaPtr, soaBytes, PageSize);
+            mlTotal += MlockRegion((byte*)_q16SoaPtr, soaBytes);
+            total += soaBytes;
+        }
+        else if (_q16Ptr != null)
+        {
+            // Allocate and transpose from Q16 AoS (tiled to limit peak RSS).
             _q16SoaPtr = (short*)NativeMemory.AlignedAlloc((nuint)soaBytes, 64);
+            _q16SoaIsAllocated = true;
             short* src = _q16Ptr;
             short* dst = _q16SoaPtr;
             int count = Count;
@@ -296,8 +314,6 @@ public sealed unsafe class Dataset : IDisposable
                     for (int d = 0; d < Dimensions; d++)
                         dst[(long)d * count + i] = row[d];
                 }
-                // Release Q16 pages for this tile — they're file-backed so the kernel
-                // can evict them immediately, keeping peak RSS ≈ 84MB.
                 if (OperatingSystem.IsLinux())
                 {
                     byte* tileBase = (byte*)(src + (long)tileStart * paddedDims);
@@ -383,6 +399,7 @@ public sealed unsafe class Dataset : IDisposable
         string? vectorsQ8Path = null,
         string? vectorsQ8SoaPath = null,
         string? vectorsQ16Path = null,
+        string? vectorsQ16SoaPath = null,
         string? ivfCentroidsPath = null,
         string? ivfOffsetsPath = null,
         string? ivfBboxMinPath = null,
@@ -446,6 +463,18 @@ public sealed unsafe class Dataset : IDisposable
                 throw new InvalidDataException($"Q16 file size {q16Len} != expected {q16Expected}");
             q16Mmf = MemoryMappedFile.CreateFromFile(vectorsQ16Path, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
             q16View = q16Mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        }
+
+        MemoryMappedFile? q16SoaMmf = null;
+        MemoryMappedViewAccessor? q16SoaView = null;
+        if (!string.IsNullOrEmpty(vectorsQ16SoaPath) && File.Exists(vectorsQ16SoaPath))
+        {
+            var q16SoaLen = new FileInfo(vectorsQ16SoaPath).Length;
+            long q16SoaExpected = count * Dimensions * sizeof(short);
+            if (q16SoaLen != q16SoaExpected)
+                throw new InvalidDataException($"Q16-SoA file size {q16SoaLen} != expected {q16SoaExpected}");
+            q16SoaMmf = MemoryMappedFile.CreateFromFile(vectorsQ16SoaPath, FileMode.Open, mapName: null, capacity: 0, MemoryMappedFileAccess.Read);
+            q16SoaView = q16SoaMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         }
 
         MemoryMappedFile? centroidsMmf = null;
@@ -516,7 +545,7 @@ public sealed unsafe class Dataset : IDisposable
         return new Dataset(
             vectorsMmf, vectorsView, labelsMmf, labelsView,
             q8Mmf, q8View, q8SoaMmf, q8SoaView,
-            q16Mmf, q16View,
+            q16Mmf, q16View, q16SoaMmf, q16SoaView,
             centroidsMmf, centroidsView, offsetsMmf, offsetsView,
             bboxMinMmf, bboxMinView, bboxMaxMmf, bboxMaxView,
             pqCodebooksMmf, pqCodebooksView, pqCodesMmf, pqCodesView,
@@ -608,13 +637,14 @@ public sealed unsafe class Dataset : IDisposable
         try { _q8View?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _q8SoaView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _q16View?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        try { _q16SoaView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _centroidsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _offsetsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _bboxMinView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _bboxMaxView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _pqCodebooksView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _pqCodesView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
-        if (_q16SoaPtr != null)
+        if (_q16SoaPtr != null && _q16SoaIsAllocated)
         {
             NativeMemory.AlignedFree(_q16SoaPtr);
             _q16SoaPtr = null;
@@ -629,6 +659,8 @@ public sealed unsafe class Dataset : IDisposable
         _q8SoaMmf?.Dispose();
         _q16View?.Dispose();
         _q16Mmf?.Dispose();
+        _q16SoaView?.Dispose();
+        _q16SoaMmf?.Dispose();
         _centroidsView?.Dispose();
         _centroidsMmf?.Dispose();
         _offsetsView?.Dispose();

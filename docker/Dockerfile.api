@@ -47,6 +47,7 @@ RUN dotnet /preprocessor/Rinha.Preprocessor.dll \
         /work/ivf_bbox_max.bin \
         /work/references_q8_soa.bin \
         /work/references_q16.bin \
+        /work/references_q16_soa.bin \
         ${IVF_NLIST_BUILD:-256} 15 42 ${IVF_BAL_SLACK_BUILD:-0.0} \
  && dotnet /preprocessor/Rinha.Preprocessor.dll --pq \
         /work/references.bin \
@@ -74,6 +75,7 @@ ENV DOTNET_EnableDiagnostics=0 \
     VECTORS_Q8_PATH=/data/references_q8.bin \
     VECTORS_Q8_SOA_PATH=/data/references_q8_soa.bin \
     VECTORS_Q16_PATH=/data/references_q16.bin \
+    VECTORS_Q16_SOA_PATH=/data/references_q16_soa.bin \
     IVF_CENTROIDS_PATH=/data/ivf_centroids.bin \
     IVF_OFFSETS_PATH=/data/ivf_offsets.bin \
     IVF_BBOX_MIN_PATH=/data/ivf_bbox_min.bin \
@@ -92,6 +94,7 @@ COPY --from=dataprep /work/labels.bin /data/labels.bin
 COPY --from=dataprep /work/references_q8.bin /data/references_q8.bin
 COPY --from=dataprep /work/references_q8_soa.bin /data/references_q8_soa.bin
 COPY --from=dataprep /work/references_q16.bin /data/references_q16.bin
+COPY --from=dataprep /work/references_q16_soa.bin /data/references_q16_soa.bin
 COPY --from=dataprep /work/ivf_centroids.bin /data/ivf_centroids.bin
 COPY --from=dataprep /work/ivf_offsets.bin /data/ivf_offsets.bin
 COPY --from=dataprep /work/ivf_bbox_min.bin /data/ivf_bbox_min.bin
