@@ -272,8 +272,11 @@ public sealed unsafe class Dataset : IDisposable
         // Build SoA (column-major) transposed Q16 layout for brute-force AVX2 scan.
         // Layout: _q16SoaPtr[d * Count + i] = Q16 value of vector i at dimension d.
         // Memory: Dimensions * Count * sizeof(short) = 14 * ~3M * 2 ≈ 84MB.
-        // The original Q16 mmap (row-major, 96MB) is demand-paged and not mlocked,
-        // so its pages can be evicted after transposition.
+        //
+        // Tiled transpose (16K rows per tile) keeps 14 SoA column slices (14*32KB=448KB)
+        // hot in L3 while reading Q16 sequentially. After each tile, MADV_DONTNEED on
+        // the Q16 pages frees physical frames, keeping peak RSS well under the 150MB limit:
+        //   peak = 84MB SoA (anon) + ~2MB Q16 tile (file-backed, then freed) + overhead.
         if (_q16Ptr != null && _q16SoaPtr == null)
         {
             long soaBytes = (long)Dimensions * Count * sizeof(short);
@@ -282,11 +285,26 @@ public sealed unsafe class Dataset : IDisposable
             short* dst = _q16SoaPtr;
             int count = Count;
             int paddedDims = PaddedDimensions;
-            for (int d = 0; d < Dimensions; d++)
+            const int TileRows = 16384; // 14 × 32KB SoA writes fit in L3 per tile
+            const int MADV_DONTNEED = 4;
+            for (int tileStart = 0; tileStart < count; tileStart += TileRows)
             {
-                long colBase = (long)d * count;
-                for (int i = 0; i < count; i++)
-                    dst[colBase + i] = src[(long)i * paddedDims + d];
+                int tileEnd = Math.Min(tileStart + TileRows, count);
+                for (int i = tileStart; i < tileEnd; i++)
+                {
+                    short* row = src + (long)i * paddedDims;
+                    for (int d = 0; d < Dimensions; d++)
+                        dst[(long)d * count + i] = row[d];
+                }
+                // Release Q16 pages for this tile — they're file-backed so the kernel
+                // can evict them immediately, keeping peak RSS ≈ 84MB.
+                if (OperatingSystem.IsLinux())
+                {
+                    byte* tileBase = (byte*)(src + (long)tileStart * paddedDims);
+                    int tileLen = tileEnd - tileStart;
+                    long tileBytes = (long)tileLen * paddedDims * sizeof(short);
+                    LinuxMadvise((IntPtr)tileBase, (UIntPtr)tileBytes, MADV_DONTNEED);
+                }
             }
             hpTotal += AdviseHuge((byte*)_q16SoaPtr, soaBytes);
             sink += TouchPages((byte*)_q16SoaPtr, soaBytes, PageSize);
