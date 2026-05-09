@@ -23,7 +23,7 @@ namespace Rinha.Bench;
 /// </summary>
 public static class Replay
 {
-    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool BboxRepair = false, bool EarlyStop = true, int EarlyStopPct = 75, bool Q16 = true)
+    private record Cfg(int NProbe, int KPrime, int BorderlineNProbe, int BorderlineKPrime, bool BboxGuided = true, bool BboxRepair = false, bool EarlyStop = true, int EarlyStopPct = 75, bool Q16 = true, int ScalarAbort = 0, bool DensityOrder = false)
     {
         public override string ToString()
             => $"NP={NProbe,3} KP={KPrime,4} BNP={BorderlineNProbe,3} BKP={BorderlineKPrime,4} ES={(EarlyStop ? 1 : 0)} ESPCT={EarlyStopPct,2} Q16={(Q16 ? 1 : 0)} BBG={(BboxGuided ? 1 : 0)} BBR={(BboxRepair ? 1 : 0)}";
@@ -218,7 +218,9 @@ public static class Replay
                 earlyStop: cfg.EarlyStop,
                 earlyStopPct: cfg.EarlyStopPct,
                 bboxRepair: cfg.BboxRepair,
-                bboxGuided: cfg.BboxGuided);
+                bboxGuided: cfg.BboxGuided,
+                scalarAbort: cfg.ScalarAbort,
+                densityOrder: cfg.DensityOrder);
 
             int fn = 0, fp = 0, disagree = 0;
             int firstFnIdx = -1;
@@ -295,6 +297,8 @@ public static class Replay
         bool bbr = false;
         int espct = 75;
         bool q16 = true;
+        int sa = 0;
+        bool dens = false;
         foreach (var part in s.Split(','))
         {
             var kv = part.Split('=');
@@ -310,9 +314,11 @@ public static class Replay
                 case "BBR": case "BBOX_REPAIR": bbr = v != 0; break;
                 case "ESPCT": case "EARLY_STOP_PCT": espct = v; break;
                 case "Q16": q16 = v != 0; break;
+                case "SA": case "SCALAR_ABORT": sa = v; break;
+                case "DENS": case "DENSITY_ORDER": dens = v != 0; break;
             }
         }
-        return new Cfg(np, kp, bnp, bkp, BboxGuided: bbg, BboxRepair: bbr, EarlyStopPct: espct, Q16: q16);
+        return new Cfg(np, kp, bnp, bkp, BboxGuided: bbg, BboxRepair: bbr, EarlyStopPct: espct, Q16: q16, ScalarAbort: sa, DensityOrder: dens);
     }
 
     private static string FindRepoRoot()
