@@ -50,6 +50,10 @@ public sealed unsafe class Dataset : IDisposable
     private readonly float* _bboxMaxPtr;
     private readonly float* _pqCodebooksPtr;
     private readonly byte* _pqCodesPtr;
+    // Column-major (SoA) transposed Q16 layout: Dimensions columns of Count shorts each.
+    // Allocated lazily in Prefetch() from the row-major Q16 mmap.
+    // Layout: _q16SoaPtr[d * Count + i] = Q16 value of vector i at dimension d.
+    private short* _q16SoaPtr;
 
     public int Count { get; }
     public int NumCells { get; }
@@ -58,6 +62,7 @@ public sealed unsafe class Dataset : IDisposable
     public bool HasQ8 => _q8Ptr != null;
     public bool HasQ8Soa => _q8SoaPtr != null;
     public bool HasQ16 => _q16Ptr != null;
+    public bool HasQ16Soa => _q16SoaPtr != null;
     public bool HasIvf => _centroidsPtr != null && _offsetsPtr != null;
     public bool HasIvfBbox => _bboxMinPtr != null && _bboxMaxPtr != null;
     public bool HasPq => _pqCodebooksPtr != null && _pqCodesPtr != null;
@@ -262,6 +267,31 @@ public sealed unsafe class Dataset : IDisposable
             hpTotal += AdviseHuge(_pqCodesPtr, bytes);
             sink += TouchPages(_pqCodesPtr, bytes, PageSize);
             total += bytes;
+        }
+
+        // Build SoA (column-major) transposed Q16 layout for brute-force AVX2 scan.
+        // Layout: _q16SoaPtr[d * Count + i] = Q16 value of vector i at dimension d.
+        // Memory: Dimensions * Count * sizeof(short) = 14 * ~3M * 2 ≈ 84MB.
+        // The original Q16 mmap (row-major, 96MB) is demand-paged and not mlocked,
+        // so its pages can be evicted after transposition.
+        if (_q16Ptr != null && _q16SoaPtr == null)
+        {
+            long soaBytes = (long)Dimensions * Count * sizeof(short);
+            _q16SoaPtr = (short*)NativeMemory.AlignedAlloc((nuint)soaBytes, 64);
+            short* src = _q16Ptr;
+            short* dst = _q16SoaPtr;
+            int count = Count;
+            int paddedDims = PaddedDimensions;
+            for (int d = 0; d < Dimensions; d++)
+            {
+                long colBase = (long)d * count;
+                for (int i = 0; i < count; i++)
+                    dst[colBase + i] = src[(long)i * paddedDims + d];
+            }
+            hpTotal += AdviseHuge((byte*)_q16SoaPtr, soaBytes);
+            sink += TouchPages((byte*)_q16SoaPtr, soaBytes, PageSize);
+            mlTotal += MlockRegion((byte*)_q16SoaPtr, soaBytes);
+            total += soaBytes;
         }
 
         GC.KeepAlive(sink);
@@ -521,6 +551,14 @@ public sealed unsafe class Dataset : IDisposable
         get => _q16Ptr;
     }
 
+    /// <summary>Column-major (SoA) transposed Q16 layout built in Prefetch().
+    /// Dim d's column: &amp;Q16SoaPtr[d * Count]. Populated only if HasQ16Soa is true.</summary>
+    public short* Q16SoaPtr
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _q16SoaPtr;
+    }
+
     public float* CentroidsPtr
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -558,6 +596,11 @@ public sealed unsafe class Dataset : IDisposable
         try { _bboxMaxView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _pqCodebooksView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _pqCodesView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        if (_q16SoaPtr != null)
+        {
+            NativeMemory.AlignedFree(_q16SoaPtr);
+            _q16SoaPtr = null;
+        }
         _vectorsView.Dispose();
         _vectorsMmf.Dispose();
         _labelsView.Dispose();

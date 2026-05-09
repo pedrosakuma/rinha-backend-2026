@@ -76,7 +76,9 @@ public sealed unsafe class BruteForceQ16Scorer : IQ16FraudScorer
         fixed (long* bdPtr = bestDist)
         fixed (int* biPtr = bestIdx)
         {
-            if (Avx2.IsSupported)
+            if (Avx2.IsSupported && _dataset.HasQ16Soa)
+                ScanAvx2Soa(qPtr, bdPtr, biPtr);
+            else if (Avx2.IsSupported)
                 ScanAvx2(qPtr, bdPtr, biPtr);
             else
                 ScanScalar(qPtr, bdPtr, biPtr);
@@ -89,6 +91,64 @@ public sealed unsafe class BruteForceQ16Scorer : IQ16FraudScorer
                 if (idx >= 0 && labels[idx] != 0) frauds++;
             }
             return frauds / (float)K;
+        }
+    }
+
+    private void ScanAvx2Soa(short* qPtr, long* bestDist, int* bestIdx)
+    {
+        long worst = long.MaxValue;
+        short* soaPtr = _dataset.Q16SoaPtr;
+        int count = _dataset.Count;
+        int fullBatches = count & ~15; // round down to multiple of 16
+
+        Span<int> dists = stackalloc int[16];
+        fixed (int* distsPtr = dists)
+        {
+            int batchStart = 0;
+            for (; batchStart < fullBatches; batchStart += 16)
+            {
+                var acc0 = Vector256<int>.Zero; // distances for candidates 0-7
+                var acc1 = Vector256<int>.Zero; // distances for candidates 8-15
+
+                for (int d = 0; d < Dataset.Dimensions; d++)
+                {
+                    // Broadcast single query dim to all 16 lanes (vpbroadcastw).
+                    var qd = Vector256.Create(qPtr[d]);
+                    // Load 16 reference shorts from the column for dim d (vpsubw target).
+                    short* col = soaPtr + (long)d * count + batchStart;
+                    var refs = Vector256.Load(col);
+                    // vpsubw: diff[k] = ref[k] - query[d]
+                    var diff = Avx2.Subtract(refs, qd);
+                    // Sign-extend 16 shorts → two Vector256<int> of 8 int32s each (vpmovsxwd).
+                    var (lo, hi) = Vector256.Widen(diff);
+                    // vpmulld + vpaddd: square and accumulate in int32.
+                    // Max diff=10000 → diff²=1e8 → 14×1e8=1.4e9 < int32.MaxValue ✓
+                    acc0 = Avx2.Add(acc0, Avx2.MultiplyLow(lo, lo));
+                    acc1 = Avx2.Add(acc1, Avx2.MultiplyLow(hi, hi));
+                }
+
+                Vector256.Store(acc0, distsPtr);
+                Vector256.Store(acc1, distsPtr + 8);
+
+                for (int k = 0; k < 16; k++)
+                {
+                    long dist = distsPtr[k];
+                    if (dist < worst)
+                        worst = InsertTopK(bestDist, bestIdx, dist, batchStart + k);
+                }
+            }
+            // Scalar tail for remaining count % 16 elements.
+            for (int i = batchStart; i < count; i++)
+            {
+                long dist = 0;
+                for (int d = 0; d < Dataset.Dimensions; d++)
+                {
+                    int diff = soaPtr[(long)d * count + i] - qPtr[d];
+                    dist += (long)diff * diff;
+                }
+                if (dist < worst)
+                    worst = InsertTopK(bestDist, bestIdx, dist, i);
+            }
         }
     }
 
