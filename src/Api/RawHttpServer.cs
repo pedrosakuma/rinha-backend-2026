@@ -14,9 +14,12 @@ namespace Rinha.Api;
 ///   * Pre-built <em>full</em> response buffers (status line + headers + body) — single
 ///     <see cref="Socket.Send(ReadOnlySpan{byte})"/> per request.
 ///   * Stack-allocated 4 KiB recv buffer — no <see cref="System.Buffers.ArrayPool{T}"/> ceremony.
-///   * One dedicated thread per accepted connection (long-running keep-alive). With
-///     CFS pinning to one logical CPU per replica, scheduler cost stays tiny;
-///     k6 reuses connections so threads are typically a handful.
+///   * Accept threads do <em>only</em> Accept and dispatch each new connection to the
+///     CLR ThreadPool via <see cref="ThreadPool.UnsafeQueueUserWorkItem{TState}"/>; the
+///     pool worker then runs the entire keep-alive loop for that connection. This
+///     avoids the blocking-accept failure mode where every accept thread gets grudado
+///     in a long-lived keep-alive socket and the listen backlog overflows under burst
+///     (eval #2813/#2833 with the inline model timed out 72-89% of requests).
 ///   * Branch-light dispatch — happy path is a single <see cref="ReadOnlySpan{T}.StartsWith"/>
 ///     check on <c>"POST /fraud-score "</c>.
 /// </summary>
@@ -62,39 +65,66 @@ internal static class RawHttpServer
         listener.Bind(new UnixDomainSocketEndPoint(udsPath));
         listener.Listen(Backlog);
 
-        // Worker pool: N threads each block on listener.Accept(); the Linux kernel
-        // load-balances incoming connections across waiters. The same thread that
-        // accepts also runs the keep-alive handler to completion — no socket
-        // handover, no work-queue, no scheduler ping-pong. With CPU pinned to one
-        // core per replica, idle accept-blocked threads cost effectively nothing
-        // until a connection arrives.
+        // Accept threads only do Accept and dispatch the new connection to the
+        // ThreadPool — they NEVER run the keepalive loop inline. This was the bug
+        // behind eval #2813 (W=2) and #2833 (W=8): under k6 burst (250 VUs ramping
+        // to 900 RPS), every accept thread gets grudado serving an existing
+        // long-lived keep-alive connection, the listen backlog fills, and new
+        // arrivals time out (we saw 88.8% / 72.3% timeout rates respectively).
         //
-        // Connection-vs-worker arithmetic: if k6 opens M concurrent VUs and N workers
-        // are busy on existing keep-alive connections, the M-N excedents wait in the
-        // kernel's listen backlog (no CPU/RSS in our process). KEEPALIVE_MAX bounds
-        // how long a worker stays grudado in the same connection so backlog gets drained.
-        int workers = ParseInt(Environment.GetEnvironmentVariable("RAW_HTTP_WORKERS"), 4);
+        // Dispatch granularity is per CONNECTION, not per request: once a TP
+        // worker picks up a socket it owns the whole keep-alive lifetime (read
+        // headers → score → respond → wait next request → … until close).
+        // Handover cost is amortized to zero by the keepalive loop.
+        int workers = ParseInt(Environment.GetEnvironmentVariable("RAW_HTTP_WORKERS"), 1);
         if (workers < 1) workers = 1;
         _keepAliveMax  = Math.Max(0, ParseInt(Environment.GetEnvironmentVariable("RAW_HTTP_KEEPALIVE_MAX"),  0));
         _recvTimeoutMs = Math.Max(0, ParseInt(Environment.GetEnvironmentVariable("RAW_HTTP_RECV_TIMEOUT_MS"), 0));
 
-        Console.WriteLine($"RawHttpServer: listening on unix:{udsPath}, workers={workers}, keepalive_max={_keepAliveMax}, recv_timeout_ms={_recvTimeoutMs}");
+        Console.WriteLine($"RawHttpServer: listening on unix:{udsPath}, accept_threads={workers}, keepalive_max={_keepAliveMax}, recv_timeout_ms={_recvTimeoutMs}");
+
+        var ctx = new AcceptContext(listener, scorer, vectorizer);
 
         for (int i = 1; i < workers; i++)
         {
-            var t = new Thread(() => WorkerLoop(listener, scorer, vectorizer))
+            var t = new Thread(AcceptLoop)
             {
                 IsBackground = true,
-                Name = $"raw-http-{i}",
+                Name = $"raw-http-accept-{i}",
             };
-            t.Start();
+            t.Start(ctx);
         }
-        // Run worker 0 on the calling thread (Main) so the process stays alive without an extra blocker.
-        WorkerLoop(listener, scorer, vectorizer);
+        // Run accept-loop 0 on the calling thread (Main) so the process stays alive without an extra blocker.
+        AcceptLoop(ctx);
     }
 
-    private static void WorkerLoop(Socket listener, IFraudScorer scorer, JsonVectorizer vectorizer)
+    private sealed class AcceptContext
     {
+        public readonly Socket Listener;
+        public readonly IFraudScorer Scorer;
+        public readonly JsonVectorizer Vectorizer;
+        public AcceptContext(Socket l, IFraudScorer s, JsonVectorizer v) { Listener = l; Scorer = s; Vectorizer = v; }
+    }
+
+    private sealed class ConnectionState
+    {
+        public readonly Socket Socket;
+        public readonly IFraudScorer Scorer;
+        public readonly JsonVectorizer Vectorizer;
+        public ConnectionState(Socket s, IFraudScorer sc, JsonVectorizer v) { Socket = s; Scorer = sc; Vectorizer = v; }
+    }
+
+    private static readonly Action<ConnectionState> s_handleConnectionDelegate = HandleConnectionTp;
+
+    private static void AcceptLoop(object? state)
+    {
+        var ctx = (AcceptContext)state!;
+        AcceptLoop(ctx);
+    }
+
+    private static void AcceptLoop(AcceptContext ctx)
+    {
+        var listener = ctx.Listener;
         while (true)
         {
             Socket conn;
@@ -107,11 +137,16 @@ internal static class RawHttpServer
                 try { conn.ReceiveTimeout = _recvTimeoutMs; } catch { /* best-effort */ }
             }
 
-            // Same thread: accept → handle → loop. The connection is kept alive across
-            // many requests; only on close (or error) do we go back to Accept().
-            HandleConnection(conn, scorer, vectorizer);
+            // Hand the socket off to the CLR ThreadPool; accept thread loops back immediately.
+            ThreadPool.UnsafeQueueUserWorkItem(
+                s_handleConnectionDelegate,
+                new ConnectionState(conn, ctx.Scorer, ctx.Vectorizer),
+                preferLocal: false);
         }
     }
+
+    private static void HandleConnectionTp(ConnectionState state)
+        => HandleConnection(state.Socket, state.Scorer, state.Vectorizer);
 
     private static int ParseInt(string? s, int fallback)
         => int.TryParse(s, out var v) ? v : fallback;
