@@ -82,6 +82,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
 
     // Partial-prune dim count (env IVF_BLOCKED_PARTIAL_DIMS, default 8). Must be even, ≤14.
     private readonly int _partialDims;
+    private readonly int _maxBboxCells; // 0 = unlimited; otherwise cap cells scanned in bbox-LB pass
 
     public IvfBlockedScorer(Dataset dataset, int nProbe = 4)
     {
@@ -94,6 +95,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         _sorted = Environment.GetEnvironmentVariable("IVF_BLOCKED_SORTED") == "1";
         var pd = Environment.GetEnvironmentVariable("IVF_BLOCKED_PARTIAL_DIMS");
         _partialDims = (pd is not null && int.TryParse(pd, out var v) && v >= 2 && v <= 14 && (v & 1) == 0) ? v : 6;
+        var mbc = Environment.GetEnvironmentVariable("IVF_BLOCKED_MAX_BBOX_CELLS");
+        _maxBboxCells = (mbc is not null && int.TryParse(mbc, out var vmbc) && vmbc >= 0) ? vmbc : 2;
         if (_sorted)
             BuildSortedLayout(out _sortedBlocks, out _sortedLabels, out _blockDcMin);
     }
@@ -298,6 +301,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
 
             fixed (float* qPtr = qfPad)
             {
+                int bboxScanned = 0;
+                int maxScan = _maxBboxCells;
                 for (int c = 0; c < nlist; c++)
                 {
                     if (isSeed[c]) continue;
@@ -307,6 +312,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                     if (InstrumentationEnabled) CountCellsBboxScanned++;
                     ScanCellBlocks(c, effBlocks, blockOffs, effLabels, cellOffsPtr, qVecs,
                         topDist, topLab, topIdx, ref worstIdx, effDcMin, centDist[c], partialDims);
+                    bboxScanned++;
+                    if (maxScan > 0 && bboxScanned >= maxScan) break;
                 }
             }
         }
