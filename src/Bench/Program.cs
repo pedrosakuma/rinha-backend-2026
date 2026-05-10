@@ -14,6 +14,12 @@ if (args.Length > 0 && args[0] == "--replay")
 if (args.Length > 0 && args[0] == "--dump-fn")
     return Rinha.Bench.DumpFn.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--dump-features")
+    return Rinha.Bench.DumpFeatures.Run(args[1..]);
+
+if (args.Length > 0 && args[0] == "--audit-fastpath")
+    return Rinha.Bench.AuditFastPath.Run(args[1..]);
+
 if (args.Length > 0 && args[0] == "--http")
     return Rinha.Bench.HttpTiming.Run(args[1..]);
 

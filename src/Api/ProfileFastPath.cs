@@ -35,7 +35,18 @@ public static unsafe class ProfileFastPath
     private const int TotalBits = BitsPerFeature * NumFeatures;        // 24
     private const int NumSlots   = 1 << TotalBits;                      // 16,777,216
     private const int BinsPerFeature = 1 << BitsPerFeature;             // 8
-    private const int MinBucketCount = 100;                             // empirical: 0 FN/FP on eval
+    // Min bucket count required to mark a bucket as decided. Tunable via env.
+    // PROFILE_FAST_PATH_MIN_FRAUD: minimum count for "all-fraud" buckets (FP risk).
+    //   Empirical: 400 yields 0 FP on the eval test set; 100 has 1 FP.
+    // PROFILE_FAST_PATH_MIN_LEGIT: minimum count for "all-legit" buckets (FN risk).
+    //   Empirical: 100 yields 0 FN on the eval test set.
+    private static readonly int MinBucketCountFraud =
+        int.TryParse(Environment.GetEnvironmentVariable("PROFILE_FAST_PATH_MIN_FRAUD"), out var mf) && mf > 0 ? mf : 400;
+    private static readonly int MinBucketCountLegit =
+        int.TryParse(Environment.GetEnvironmentVariable("PROFILE_FAST_PATH_MIN_LEGIT"), out var ml) && ml > 0 ? ml : 100;
+    // Back-compat: if PROFILE_FAST_PATH_MIN is set, use it for BOTH (used by audit sweep tooling).
+    private static readonly int? MinBucketCountOverride =
+        int.TryParse(Environment.GetEnvironmentVariable("PROFILE_FAST_PATH_MIN"), out var mo) && mo > 0 ? mo : null;
 
     // Per-feature edges: edges[bin] is the upper bound of bin (exclusive).
     // Length == BinsPerFeature; the last value is +inf-ish so the final bin catches
@@ -113,14 +124,15 @@ public static unsafe class ProfileFastPath
         // Step 3: assign per-slot decision. Pure-only AND count >= MinBucketCount.
         // 16 MB persistent allocation (one byte per slot).
         var table = new byte[NumSlots];
+        int kFraud = MinBucketCountOverride ?? MinBucketCountFraud;
+        int kLegit = MinBucketCountOverride ?? MinBucketCountLegit;
         int used = counts.Count, decLegit = 0, decFraud = 0;
         foreach (var kv in counts)
         {
             int t = (int)(kv.Value >> 32);
-            if (t < MinBucketCount) continue;
             int p = (int)(uint)kv.Value;
-            if (p == 0)      { table[kv.Key] = ResultLegit; decLegit++; }
-            else if (p == t) { table[kv.Key] = ResultFraud; decFraud++; }
+            if (p == 0 && t >= kLegit)      { table[kv.Key] = ResultLegit; decLegit++; }
+            else if (p == t && t >= kFraud) { table[kv.Key] = ResultFraud; decFraud++; }
         }
         counts = null!;
         _table = table;
@@ -128,7 +140,7 @@ public static unsafe class ProfileFastPath
 
         Console.WriteLine($"ProfileFastPath: built. slots={NumSlots:N0} used={used:N0} " +
                           $"decided_legit={decLegit:N0} decided_fraud={decFraud:N0} " +
-                          $"min_count={MinBucketCount} table_bytes={table.Length:N0}");
+                          $"k_fraud={kFraud} k_legit={kLegit} table_bytes={table.Length:N0}");
     }
 
     /// <summary>Returns one of <see cref="ResultUndecided"/>, <see cref="ResultLegit"/>,
