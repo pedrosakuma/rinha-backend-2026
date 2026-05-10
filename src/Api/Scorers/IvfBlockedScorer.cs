@@ -301,19 +301,65 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
 
             fixed (float* qPtr = qfPad)
             {
-                int bboxScanned = 0;
                 int maxScan = _maxBboxCells;
-                for (int c = 0; c < nlist; c++)
+                int bboxScanned = 0;
+
+                if (maxScan > 0)
                 {
-                    if (isSeed[c]) continue;
-                    float worst = topDist[worstIdx];
-                    float lb = BboxLowerBoundSquared(qPtr, bbMin, bbMax, c);
-                    if (lb >= worst) { if (InstrumentationEnabled) CountCellsBboxSkipped++; continue; }
-                    if (InstrumentationEnabled) CountCellsBboxScanned++;
-                    ScanCellBlocks(c, effBlocks, blockOffs, effLabels, cellOffsPtr, qVecs,
-                        topDist, topLab, topIdx, ref worstIdx, effDcMin, centDist[c], partialDims);
-                    bboxScanned++;
-                    if (maxScan > 0 && bboxScanned >= maxScan) break;
+                    // Partial sort: select the (maxScan + headroom) closest non-seed cells by
+                    // centDist. Cheaper than a full sort of all 254 cells (~1µs vs ~12µs) and
+                    // gives bbox-LB enough candidates to fill the cap even if a few are pruned.
+                    int headroom = 6;
+                    int topCap = maxScan + headroom;
+                    if (topCap > nlist) topCap = nlist;
+                    Span<int> top = stackalloc int[topCap];
+                    Span<float> topD = stackalloc float[topCap];
+                    for (int i = 0; i < topCap; i++) topD[i] = float.PositiveInfinity;
+                    int topN = 0;
+                    for (int c = 0; c < nlist; c++)
+                    {
+                        if (isSeed[c]) continue;
+                        float d = centDist[c];
+                        if (topN < topCap)
+                        {
+                            int pos = topN;
+                            while (pos > 0 && topD[pos - 1] > d) { topD[pos] = topD[pos - 1]; top[pos] = top[pos - 1]; pos--; }
+                            topD[pos] = d; top[pos] = c;
+                            topN++;
+                        }
+                        else if (d < topD[topCap - 1])
+                        {
+                            int pos = topCap - 1;
+                            while (pos > 0 && topD[pos - 1] > d) { topD[pos] = topD[pos - 1]; top[pos] = top[pos - 1]; pos--; }
+                            topD[pos] = d; top[pos] = c;
+                        }
+                    }
+                    for (int oi = 0; oi < topN; oi++)
+                    {
+                        int c = top[oi];
+                        float worst = topDist[worstIdx];
+                        float lb = BboxLowerBoundSquared(qPtr, bbMin, bbMax, c);
+                        if (lb >= worst) { if (InstrumentationEnabled) CountCellsBboxSkipped++; continue; }
+                        if (InstrumentationEnabled) CountCellsBboxScanned++;
+                        ScanCellBlocks(c, effBlocks, blockOffs, effLabels, cellOffsPtr, qVecs,
+                            topDist, topLab, topIdx, ref worstIdx, effDcMin, centDist[c], partialDims);
+                        bboxScanned++;
+                        if (bboxScanned >= maxScan) break;
+                    }
+                }
+                else
+                {
+                    // Unlimited: simple unsorted scan with bbox-LB filter.
+                    for (int c = 0; c < nlist; c++)
+                    {
+                        if (isSeed[c]) continue;
+                        float worst = topDist[worstIdx];
+                        float lb = BboxLowerBoundSquared(qPtr, bbMin, bbMax, c);
+                        if (lb >= worst) { if (InstrumentationEnabled) CountCellsBboxSkipped++; continue; }
+                        if (InstrumentationEnabled) CountCellsBboxScanned++;
+                        ScanCellBlocks(c, effBlocks, blockOffs, effLabels, cellOffsPtr, qVecs,
+                            topDist, topLab, topIdx, ref worstIdx, effDcMin, centDist[c], partialDims);
+                    }
                 }
             }
         }
