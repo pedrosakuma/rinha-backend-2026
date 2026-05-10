@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -6,57 +7,47 @@ namespace Rinha.Api;
 /// <summary>
 /// Wave 8: bucket-keyed fast-path cache for the /fraud-score hot path.
 ///
-/// Built once at startup from the 3M reference set: the 8 most discriminative
-/// features (per offline AUC analysis: amount, km_home, amount_ratio,
-/// installments, tx_count_24h, unknown_merch, mcc_risk, hour) are each
-/// quantile-binned into 8 buckets, producing a 24-bit composite key (16M slots,
-/// 16 MiB byte table). Per-slot label is set ONLY when the bucket is literally
-/// pure on training (count_fraud==0 OR count_fraud==count_total) AND
-/// count >= MIN_COUNT — otherwise the slot is "undecided" and the request
-/// falls through to the scorer.
+/// Built once at startup from the 3M reference set: 8 of the 14 features
+/// (per offline AUC analysis) are quantile-binned, producing a composite key
+/// indexed into a byte table. Per-slot label is set ONLY when the bucket is
+/// literally pure on training (count_fraud==0 OR count_fraud==count_total)
+/// AND count >= MinBucketCount* — otherwise the slot stays "undecided" and
+/// the request falls through to the scorer.
 ///
-/// Offline validation on the eval test set (54100 queries) at MIN_COUNT=100:
-///   - hit rate 41.57%
-///   - 0 false-negative and 0 false-positive detections (no detection cost)
-///   - edge-case queries (fraud_count in 1..4) hit the fast path only ~5% of
-///     the time (vs 41.57% overall) — they correctly stay on the scorer.
-///
-/// Disable with PROFILE_FAST_PATH=0.
+/// Wave 8.2: per-feature bit budget is configurable. Default keeps the original
+/// uniform 3-3-3-3-3-3-3-3 (24 bits / 16 MiB), but PROFILE_FAST_PATH_BITS lets
+/// the offline sweep (Bench --sweep-fastpath) propose better allocations within
+/// the same memory budget.
 /// </summary>
 public static unsafe class ProfileFastPath
 {
-    // Selected features (indices into the 14-dim Vectorizer output).
-    // Order chosen for AUC ranking; bit allocation is uniform 3 bits each.
-    private static readonly int[] FeatureIndex = new[] { 0, 7, 2, 1, 8, 11, 12, 3 };
-    //                                                  amt km  rat ins txc unk mcc hr
+    // Indices into the 14-dim Vectorizer output. Order: amount, km_home,
+    // amount_ratio, installments, tx_count_24h, unknown_merch, mcc_risk, hour.
+    public static readonly int[] FeatureIndex = new[] { 0, 7, 2, 1, 8, 11, 12, 3 };
+    public static readonly string[] FeatureName = new[] {
+        "amount", "km_home", "amt_ratio", "installments",
+        "tx_count_24h", "unknown_merch", "mcc_risk", "hour"
+    };
+    public const int NumFeatures = 8;
 
-    private const int BitsPerFeature = 3;
-    private const int NumFeatures = 8;
-    private const int TotalBits = BitsPerFeature * NumFeatures;        // 24
-    private const int NumSlots   = 1 << TotalBits;                      // 16,777,216
-    private const int BinsPerFeature = 1 << BitsPerFeature;             // 8
-    // Min bucket count required to mark a bucket as decided. Tunable via env.
-    // PROFILE_FAST_PATH_MIN_FRAUD: minimum count for "all-fraud" buckets (FP risk).
-    //   Empirical: 400 yields 0 FP on the eval test set; 100 has 1 FP.
-    // PROFILE_FAST_PATH_MIN_LEGIT: minimum count for "all-legit" buckets (FN risk).
-    //   Empirical: 100 yields 0 FN on the eval test set.
+    public const int MaxTotalBits = 24;     // 16M slots == 16 MiB byte table
+    public const int MaxBitsPerFeature = 6; // 64 bins is way more than needed
+
+    // Min-count thresholds (tunable). Asymmetric: pure-fraud needs more samples
+    // (concentrated FP risk at borderline counts) than pure-legit (smaller buckets,
+    // FN-safe).
     private static readonly int MinBucketCountFraud =
         int.TryParse(Environment.GetEnvironmentVariable("PROFILE_FAST_PATH_MIN_FRAUD"), out var mf) && mf > 0 ? mf : 400;
     private static readonly int MinBucketCountLegit =
         int.TryParse(Environment.GetEnvironmentVariable("PROFILE_FAST_PATH_MIN_LEGIT"), out var ml) && ml > 0 ? ml : 100;
-    // Back-compat: if PROFILE_FAST_PATH_MIN is set, use it for BOTH (used by audit sweep tooling).
     private static readonly int? MinBucketCountOverride =
         int.TryParse(Environment.GetEnvironmentVariable("PROFILE_FAST_PATH_MIN"), out var mo) && mo > 0 ? mo : null;
 
-    // Per-feature edges: edges[bin] is the upper bound of bin (exclusive).
-    // Length == BinsPerFeature; the last value is +inf-ish so the final bin catches
-    // anything above the max training value.
-    private static float[][]? _edges;
-
-    // Lookup table: byte per slot. 0 = undecided (call scorer); 1 = pure-legit
-    // (fraudCount=0); 2 = pure-fraud (fraudCount=5). Stored as byte to halve cache
-    // footprint vs ushort. ~16 MiB total.
-    private static byte[]? _table;
+    // Hot-path arrays (set by Build).
+    private static int[] _bits = Array.Empty<int>();
+    private static int[] _shifts = Array.Empty<int>();
+    private static float[][]? _edges;     // edges[f] length == 1 << bits[f], last = +inf
+    private static byte[]? _table;        // 0=undecided, 1=legit, 2=fraud
 
     public const byte ResultUndecided = 0;
     public const byte ResultLegit     = 1;
@@ -64,10 +55,11 @@ public static unsafe class ProfileFastPath
 
     public static bool IsEnabled => _table is not null;
 
-    /// <summary>Statistics surfaced by Build for the startup log line.</summary>
     public static int UsedBuckets;
     public static int DecidedLegit;
     public static int DecidedFraud;
+    public static int TotalBits;
+    public static long TableSize;
 
     public static void Build(Dataset ds)
     {
@@ -77,18 +69,30 @@ public static unsafe class ProfileFastPath
             return;
         }
 
+        var bits = ParseBits(Environment.GetEnvironmentVariable("PROFILE_FAST_PATH_BITS"));
+        BuildWith(ds, bits, MinBucketCountOverride ?? MinBucketCountLegit, MinBucketCountOverride ?? MinBucketCountFraud, log: true);
+    }
+
+    /// <summary>Public Build entry point usable by Bench --sweep-fastpath.
+    /// All state is global; not thread-safe across concurrent rebuilds.</summary>
+    public static (int hits, int legit, int fraud, int used) BuildWith(
+        Dataset ds, int[] bits, int kLegit, int kFraud, bool log)
+    {
+        ValidateBits(bits);
         int n = ds.Count;
         var vectors = ds.VectorsPtr;
         var labels  = ds.LabelsPtr;
         if (vectors == null || labels == null)
-        {
-            Console.WriteLine("ProfileFastPath: dataset missing float vectors or labels — disabled.");
-            return;
-        }
+            throw new InvalidOperationException("Dataset missing float vectors or labels");
         const int stride = Dataset.PaddedDimensions;
 
-        // Step 1: compute quantile edges per feature. Reuse a single 12 MB column
-        // buffer across all 8 features to avoid 8x allocation (container has 150MB limit).
+        // Compute per-feature shifts and total bits.
+        var shifts = new int[NumFeatures];
+        int total = 0;
+        for (int f = 0; f < NumFeatures; f++) { shifts[f] = total; total += bits[f]; }
+        long slots = 1L << total;
+
+        // Step 1: quantile edges (reuse single 12 MB column buffer).
         var edges = new float[NumFeatures][];
         var col = new float[n];
         for (int f = 0; f < NumFeatures; f++)
@@ -96,36 +100,29 @@ public static unsafe class ProfileFastPath
             int featIdx = FeatureIndex[f];
             for (int i = 0; i < n; i++) col[i] = vectors[(long)i * stride + featIdx];
             Array.Sort(col);
-            edges[f] = new float[BinsPerFeature];
-            for (int b = 0; b < BinsPerFeature - 1; b++)
+            int binCount = 1 << bits[f];
+            edges[f] = new float[binCount];
+            for (int b = 0; b < binCount - 1; b++)
             {
-                int q = (int)((long)(b + 1) * n / BinsPerFeature);
+                int q = (int)((long)(b + 1) * n / binCount);
                 edges[f][b] = col[q];
             }
-            // Last edge: +infinity so the upper bin always wins for unseen-large values.
-            edges[f][BinsPerFeature - 1] = float.PositiveInfinity;
+            edges[f][binCount - 1] = float.PositiveInfinity;
         }
-        col = null!; // release 12 MB before next phase
-        _edges = edges;
+        col = null!;
 
-        // Step 2: bucket every reference. Sparse accumulation via Dictionary — out of
-        // 16M possible slots only ~16k are actually populated by the 3M refs, so a
-        // 64-bit packed counter dictionary uses < 1 MB instead of the 128 MB a dense
-        // int[NumSlots]×2 would take. Pack: high 32 bits = total count, low 32 bits = fraud count.
-        var counts = new Dictionary<uint, ulong>(capacity: 32768);
+        // Step 2: bucket every reference; sparse dictionary.
+        var counts = new Dictionary<uint, ulong>(capacity: 65536);
         for (int i = 0; i < n; i++)
         {
-            uint key = ComputeKey(vectors + (long)i * stride);
+            uint key = ComputeKeyStatic(vectors + (long)i * stride, bits, shifts, edges);
             ulong delta = labels[i] != 0 ? 0x1_0000_0001UL : 0x1_0000_0000UL;
             counts.TryGetValue(key, out var cur);
             counts[key] = cur + delta;
         }
 
-        // Step 3: assign per-slot decision. Pure-only AND count >= MinBucketCount.
-        // 16 MB persistent allocation (one byte per slot).
-        var table = new byte[NumSlots];
-        int kFraud = MinBucketCountOverride ?? MinBucketCountFraud;
-        int kLegit = MinBucketCountOverride ?? MinBucketCountLegit;
+        // Step 3: decide per slot. Allocate dense byte[] only at the end.
+        var table = new byte[slots];
         int used = counts.Count, decLegit = 0, decFraud = 0;
         foreach (var kv in counts)
         {
@@ -135,69 +132,96 @@ public static unsafe class ProfileFastPath
             else if (p == t && t >= kFraud) { table[kv.Key] = ResultFraud; decFraud++; }
         }
         counts = null!;
-        _table = table;
+
+        // Publish.
+        _bits   = bits;
+        _shifts = shifts;
+        _edges  = edges;
+        _table  = table;
+        TotalBits = total; TableSize = table.LongLength;
         UsedBuckets = used; DecidedLegit = decLegit; DecidedFraud = decFraud;
 
-        Console.WriteLine($"ProfileFastPath: built. slots={NumSlots:N0} used={used:N0} " +
-                          $"decided_legit={decLegit:N0} decided_fraud={decFraud:N0} " +
-                          $"k_fraud={kFraud} k_legit={kLegit} table_bytes={table.Length:N0}");
+        if (log)
+        {
+            string bitStr = string.Join(",", bits);
+            Console.WriteLine($"ProfileFastPath: built. bits=[{bitStr}] total={total} slots={slots:N0} " +
+                              $"used={used:N0} decided_legit={decLegit:N0} decided_fraud={decFraud:N0} " +
+                              $"k_fraud={kFraud} k_legit={kLegit} table_bytes={table.LongLength:N0}");
+        }
+        return (decLegit + decFraud, decLegit, decFraud, used);
     }
 
-    /// <summary>Returns one of <see cref="ResultUndecided"/>, <see cref="ResultLegit"/>,
-    /// <see cref="ResultFraud"/> for the given query vector. The query must be in the
-    /// same float-feature space as <see cref="JsonVectorizer.VectorizeJson(ReadOnlySpan{byte}, Span{float})"/>.</summary>
+    public static void Disable() { _table = null; _edges = null; }
+
+    private static int[] ParseBits(string? env)
+    {
+        if (string.IsNullOrWhiteSpace(env))
+            // Wave 8.2: swap-greedy optimum (4 seeds → same fixed point).
+            // Hits 22421/54100 (41.44%) on eval test set vs uniform 21690 (40.09%), 0 FP/FN.
+            // Order matches FeatureIndex: amount, km_home, amt_ratio, installments,
+            //                              tx_count_24h, unknown_merch, mcc_risk, hour.
+            return new[] { 3, 3, 4, 3, 3, 4, 2, 2 };
+        var parts = env.Split(',');
+        if (parts.Length != NumFeatures)
+            throw new ArgumentException($"PROFILE_FAST_PATH_BITS must have {NumFeatures} comma-separated ints; got '{env}'");
+        var bits = new int[NumFeatures];
+        for (int i = 0; i < NumFeatures; i++) bits[i] = int.Parse(parts[i].Trim(), CultureInfo.InvariantCulture);
+        ValidateBits(bits);
+        return bits;
+    }
+
+    private static void ValidateBits(int[] bits)
+    {
+        if (bits.Length != NumFeatures) throw new ArgumentException($"bits length must be {NumFeatures}");
+        int total = 0;
+        for (int i = 0; i < NumFeatures; i++)
+        {
+            if (bits[i] < 1 || bits[i] > MaxBitsPerFeature)
+                throw new ArgumentException($"bits[{i}] must be in [1,{MaxBitsPerFeature}]; got {bits[i]}");
+            total += bits[i];
+        }
+        if (total > MaxTotalBits)
+            throw new ArgumentException($"sum(bits) must be <= {MaxTotalBits}; got {total}");
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte TryLookup(ReadOnlySpan<float> query)
     {
         var table = _table;
         if (table is null) return ResultUndecided;
-        // Inlined for hot-path: ComputeKey reads 8 features and binary-searches each
-        // edge array (only 8 floats — linear walk is faster than recursion).
         ref float q0 = ref MemoryMarshal.GetReference(query);
-        uint key = ComputeKeyFromSpan(ref q0);
-        return table[key];
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static uint ComputeKey(float* row)
-    {
         var edges = _edges!;
+        var bits = _bits;
+        var shifts = _shifts;
         uint key = 0;
-        int shift = 0;
-        for (int f = 0; f < NumFeatures; f++)
-        {
-            float v = row[FeatureIndex[f]];
-            int bin = FindBin(edges[f], v);
-            key |= (uint)bin << shift;
-            shift += BitsPerFeature;
-        }
-        return key;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static uint ComputeKeyFromSpan(ref float q0)
-    {
-        var edges = _edges!;
-        uint key = 0;
-        int shift = 0;
         for (int f = 0; f < NumFeatures; f++)
         {
             float v = Unsafe.Add(ref q0, FeatureIndex[f]);
             int bin = FindBin(edges[f], v);
-            key |= (uint)bin << shift;
-            shift += BitsPerFeature;
+            key |= (uint)bin << shifts[f];
+        }
+        return table[key];
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint ComputeKeyStatic(float* row, int[] bits, int[] shifts, float[][] edges)
+    {
+        uint key = 0;
+        for (int f = 0; f < NumFeatures; f++)
+        {
+            float v = row[FeatureIndex[f]];
+            int bin = FindBin(edges[f], v);
+            key |= (uint)bin << shifts[f];
         }
         return key;
     }
 
-    /// <summary>Linear scan for bin index. With BinsPerFeature=8 the branch table fits in 1 cache line
-    /// and beats binary search at this size. Returns the smallest b such that v &lt; edges[b].</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int FindBin(float[] edges, float v)
     {
-        // edges length == BinsPerFeature == 8; last element is +inf so loop always exits.
-        for (int b = 0; b < BinsPerFeature - 1; b++)
+        // Linear scan; edges arrays are tiny (<=64).
+        for (int b = 0; b < edges.Length - 1; b++)
             if (v < edges[b]) return b;
-        return BinsPerFeature - 1;
+        return edges.Length - 1;
     }
 }

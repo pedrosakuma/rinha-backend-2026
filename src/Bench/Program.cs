@@ -20,6 +20,9 @@ if (args.Length > 0 && args[0] == "--dump-features")
 if (args.Length > 0 && args[0] == "--audit-fastpath")
     return Rinha.Bench.AuditFastPath.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--sweep-fastpath")
+    return Rinha.Bench.SweepFastPath.Run(args[1..]);
+
 if (args.Length > 0 && args[0] == "--http")
     return Rinha.Bench.HttpTiming.Run(args[1..]);
 
