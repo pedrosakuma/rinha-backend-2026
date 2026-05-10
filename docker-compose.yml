@@ -1,64 +1,102 @@
 name: rinha-backend-2026
 
-# Both api replicas use the SAME image. Because Docker's overlayfs layers
-# point to the same lower-layer inode for /data/references.bin on the host,
-# the kernel page cache for that file is shared between containers — i.e.
-# the dataset costs ~192 MB of RAM total, not per replica.
+# Submission stack — usa imagem pública do GHCR (sem build local).
+# Dataset (~192MB) é baked dentro da imagem; ambas as réplicas compartilham
+# a mesma layer overlayfs → kernel page cache é único.
+#
+# Recursos: 2× api (0.37 vCPU / 150MB) + lb nginx (0.26 vCPU / 50MB).
+# Total: 1.00 vCPU + 350 MB.
+#
+# Eval-2026-05: lb e api comunicam via Unix Domain Socket em tmpfs (sem TCP
+# loopback overhead) e cada container tem cpuset isolado pra eliminar
+# contenção CFS entre lb e api (era o caso quando lb=0,2 sobreposto a
+# api1=0,1 e api2=2,3).
 
 services:
   api1: &api
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.api
     image: ghcr.io/pedrosakuma/rinha-backend-2026-api:latest
-    # J25: pin a réplica em 2 logical CPUs para reduzir CFS migration jitter
-    # (insight do repo zan-dotnet). api1=cpus 0,1; api2=2,3; lb=0,2.
-    # Requer host com ≥4 logical CPUs (típico em qualquer máquina de avaliação).
-    cpuset: "0,1"
+    pull_policy: always
+    cpuset: "0"
+    security_opt:
+      - seccomp=unconfined
     environment:
-      PORT: "9999"
+      UDS_PATH: "/run/uds/api1.sock"
       DOTNET_GCHeapCount: "1"
-      DOTNET_gcServer: "${DOTNET_GCSERVER:-0}"
-      DOTNET_GCConserveMemory: "${DOTNET_GCCONSERVE:-9}"
-      DOTNET_PROCESSOR_COUNT: "${DOTNET_PROCESSOR_COUNT:-1}"
-      TP_MIN_WORKERS: "${TP_MIN_WORKERS:-1}"
-      TP_MAX_WORKERS: "${TP_MAX_WORKERS:-1}"
-      SCORER: "${SCORER:-ivf}"
-      IVF_NPROBE: "${IVF_NPROBE:-2}"
-      # IVF_RERANK (kPrime): 24 é sweet spot cascade-off Q16 (sweep 16-128).
-      IVF_RERANK: "${IVF_RERANK:-24}"
-      IVF_EARLY_STOP: "${IVF_EARLY_STOP:-1}"
-      # IVF_EARLY_STOP_PCT: 40 vence cascade-off (checkpoint cedo poupa cells
-      # restantes quando margem de pruning é boa). Cascade-on prefere 72.
-      IVF_EARLY_STOP_PCT: "${IVF_EARLY_STOP_PCT:-40}"
-      IVF_EARLY_STOP_PCT_EARLY: "${IVF_EARLY_STOP_PCT_EARLY:-0}"
-      IVF_BBOX_REPAIR: "${IVF_BBOX_REPAIR:-0}"
-      IVF_BBOX_GUIDED: "${IVF_BBOX_GUIDED:-0}"
-      IO_URING_ENABLED: "${IO_URING_ENABLED:-0}"
-      IO_URING_SIZE: "${IO_URING_SIZE:-256}"
-      IO_URING_MAX_CONN: "${IO_URING_MAX_CONN:-1024}"
+      DOTNET_PROCESSOR_COUNT: "1"
+      TP_MIN_WORKERS: "2"
+      TP_MAX_WORKERS: "2"
+      SCORER: "ivf-blocked"
+      IVF_NPROBE: "1"
+      IVF_BLOCKED_NPROBE: "2"
+      RAW_HTTP: "0"
+      RAW_HTTP_WORKERS: "1"
+      RAW_HTTP_KEEPALIVE_MAX: "0"
+      RAW_HTTP_RECV_TIMEOUT_MS: "0"
+      IVF_RERANK: "48"
+      IVF_EARLY_STOP: "1"
+      IVF_EARLY_STOP_PCT: "25"
+      IVF_BORDERLINE_NPROBE: "32"
+      IVF_BORDERLINE_RERANK: "128"
+      IVF_BBOX_GUIDED: "0"
+      IVF_BBOX_REPAIR: "1"
+      IO_URING_ENABLED: "0"
+      IO_URING_SIZE: "4096"
+      IO_URING_MAX_CONN: "1024"
     networks: [app]
+    volumes:
+      - uds:/run/uds
     ulimits:
       memlock: -1
     deploy:
       resources:
         limits:
-          cpus: "0.37"
+          cpus: "0.40"
           memory: "150MB"
 
   api2:
     <<: *api
-    cpuset: "2,3"
+    cpuset: "1"
+    environment:
+      UDS_PATH: "/run/uds/api2.sock"
+      DOTNET_GCHeapCount: "1"
+      DOTNET_PROCESSOR_COUNT: "1"
+      TP_MIN_WORKERS: "2"
+      TP_MAX_WORKERS: "2"
+      SCORER: "ivf-blocked"
+      IVF_NPROBE: "1"
+      IVF_BLOCKED_NPROBE: "2"
+      RAW_HTTP: "0"
+      RAW_HTTP_WORKERS: "1"
+      RAW_HTTP_KEEPALIVE_MAX: "0"
+      RAW_HTTP_RECV_TIMEOUT_MS: "0"
+      IVF_RERANK: "48"
+      IVF_EARLY_STOP: "1"
+      IVF_EARLY_STOP_PCT: "25"
+      IVF_BORDERLINE_NPROBE: "32"
+      IVF_BORDERLINE_RERANK: "128"
+      IVF_BBOX_GUIDED: "0"
+      IVF_BBOX_REPAIR: "1"
+      IO_URING_ENABLED: "0"
+      IO_URING_SIZE: "4096"
+      IO_URING_MAX_CONN: "1024"
     depends_on:
       - api1
 
   lb:
-    image: nginx:1.27-alpine
-    cpuset: "0,2"
+    image: jrblatt/so-no-forevis:v0.0.2
+    pull_policy: always
+    cpuset: "2,3"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      PORT: "9999"
+      UPSTREAMS: "/run/uds/api1.sock,/run/uds/api2.sock"
+      BUF_SIZE: "4096"
+      WORKERS: "1"
     ports:
       - "9999:9999"
     volumes:
-      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - uds:/run/uds
     depends_on:
       - api1
       - api2
@@ -66,8 +104,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.26"
-          memory: "50MB"
+          cpus: "0.20"
+          memory: "30MB"
+
+volumes:
+  uds:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
 
 networks:
   app:

@@ -76,13 +76,13 @@ public static unsafe class ProfileFastPath
         }
         const int stride = Dataset.PaddedDimensions;
 
-        // Step 1: compute quantile edges per feature.
-        // Allocates 8 × N floats temporarily (~92 MB for 3M); freed after step 1.
+        // Step 1: compute quantile edges per feature. Reuse a single 12 MB column
+        // buffer across all 8 features to avoid 8x allocation (container has 150MB limit).
         var edges = new float[NumFeatures][];
+        var col = new float[n];
         for (int f = 0; f < NumFeatures; f++)
         {
             int featIdx = FeatureIndex[f];
-            var col = new float[n];
             for (int i = 0; i < n; i++) col[i] = vectors[(long)i * stride + featIdx];
             Array.Sort(col);
             edges[f] = new float[BinsPerFeature];
@@ -91,35 +91,38 @@ public static unsafe class ProfileFastPath
                 int q = (int)((long)(b + 1) * n / BinsPerFeature);
                 edges[f][b] = col[q];
             }
-            // Last edge: use +infinity so the upper bin always wins for unseen-large values.
+            // Last edge: +infinity so the upper bin always wins for unseen-large values.
             edges[f][BinsPerFeature - 1] = float.PositiveInfinity;
         }
+        col = null!; // release 12 MB before next phase
         _edges = edges;
 
-        // Step 2: bucket every reference, accumulate per-slot count and fraud-count.
-        // Use int[] (not ushort): a single bucket can have >65k references in our data.
-        var cntTotal = new int[NumSlots];
-        var cntFraud = new int[NumSlots];
+        // Step 2: bucket every reference. Sparse accumulation via Dictionary — out of
+        // 16M possible slots only ~16k are actually populated by the 3M refs, so a
+        // 64-bit packed counter dictionary uses < 1 MB instead of the 128 MB a dense
+        // int[NumSlots]×2 would take. Pack: high 32 bits = total count, low 32 bits = fraud count.
+        var counts = new Dictionary<uint, ulong>(capacity: 32768);
         for (int i = 0; i < n; i++)
         {
             uint key = ComputeKey(vectors + (long)i * stride);
-            cntTotal[key]++;
-            if (labels[i] != 0) cntFraud[key]++;
+            ulong delta = labels[i] != 0 ? 0x1_0000_0001UL : 0x1_0000_0000UL;
+            counts.TryGetValue(key, out var cur);
+            counts[key] = cur + delta;
         }
 
         // Step 3: assign per-slot decision. Pure-only AND count >= MinBucketCount.
+        // 16 MB persistent allocation (one byte per slot).
         var table = new byte[NumSlots];
-        int used = 0, decLegit = 0, decFraud = 0;
-        for (int s = 0; s < NumSlots; s++)
+        int used = counts.Count, decLegit = 0, decFraud = 0;
+        foreach (var kv in counts)
         {
-            int t = cntTotal[s];
-            if (t == 0) continue;
-            used++;
+            int t = (int)(kv.Value >> 32);
             if (t < MinBucketCount) continue;
-            int p = cntFraud[s];
-            if (p == 0)        { table[s] = ResultLegit; decLegit++; }
-            else if (p == t)   { table[s] = ResultFraud; decFraud++; }
+            int p = (int)(uint)kv.Value;
+            if (p == 0)      { table[kv.Key] = ResultLegit; decLegit++; }
+            else if (p == t) { table[kv.Key] = ResultFraud; decFraud++; }
         }
+        counts = null!;
         _table = table;
         UsedBuckets = used; DecidedLegit = decLegit; DecidedFraud = decFraud;
 
