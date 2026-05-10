@@ -74,6 +74,8 @@ public static class Replay
         var q8 = Path.Combine(dataDir, "references_q8.bin");
         var q8Soa = Path.Combine(dataDir, "references_q8_soa.bin");
         var q16 = Path.Combine(dataDir, "references_q16.bin");
+        var q16Blocked = Path.Combine(dataDir, "references_q16_blocked.bin");
+        var blockOffs = Path.Combine(dataDir, "ivf_block_offsets.bin");
         var cents = Path.Combine(dataDir, "ivf_centroids.bin");
         var offs = Path.Combine(dataDir, "ivf_offsets.bin");
         var bbmin = Path.Combine(dataDir, "ivf_bbox_min.bin");
@@ -93,7 +95,9 @@ public static class Replay
             cents,
             File.Exists(offs) ? offs : null,
             File.Exists(bbmin) ? bbmin : null,
-            File.Exists(bbmax) ? bbmax : null);
+            File.Exists(bbmax) ? bbmax : null,
+            File.Exists(q16Blocked) ? q16Blocked : null,
+            File.Exists(blockOffs) ? blockOffs : null);
 
         var root = FindRepoRoot();
         var norm = NormalizationConstants.Load(Path.Combine(root, "resources/normalization.json"));
@@ -217,13 +221,21 @@ public static class Replay
             Environment.SetEnvironmentVariable("IVF_BORDERLINE_NPROBE", cfg.BorderlineNProbe.ToString());
             Environment.SetEnvironmentVariable("IVF_BORDERLINE_RERANK", cfg.BorderlineKPrime.ToString());
             Environment.SetEnvironmentVariable("IVF_Q16", cfg.Q16 ? "1" : "0");
-            IFraudScorer ivf = new IvfScorer(dataset,
-                nProbe: cfg.NProbe,
-                kPrime: cfg.KPrime,
-                earlyStop: cfg.EarlyStop,
-                earlyStopPct: cfg.EarlyStopPct,
-                bboxRepair: cfg.BboxRepair,
-                bboxGuided: cfg.BboxGuided);
+            IFraudScorer ivf;
+            if (scorerName == "ivf-blocked" || scorerName == "ivfblocked")
+            {
+                ivf = new IvfBlockedScorer(dataset, nProbe: cfg.NProbe);
+            }
+            else
+            {
+                ivf = new IvfScorer(dataset,
+                    nProbe: cfg.NProbe,
+                    kPrime: cfg.KPrime,
+                    earlyStop: cfg.EarlyStop,
+                    earlyStopPct: cfg.EarlyStopPct,
+                    bboxRepair: cfg.BboxRepair,
+                    bboxGuided: cfg.BboxGuided);
+            }
 
             int fn = 0, fp = 0, disagree = 0;
             int firstFnIdx = -1;

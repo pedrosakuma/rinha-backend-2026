@@ -32,7 +32,10 @@ public static class ScorerFactory
                                     bboxRepair: Environment.GetEnvironmentVariable("IVF_BBOX_REPAIR") == "1",
                                     earlyStopPctEarly: ParseInt(Environment.GetEnvironmentVariable("IVF_EARLY_STOP_PCT_EARLY"), 0),
                                     bboxGuided: Environment.GetEnvironmentVariable("IVF_BBOX_GUIDED") == "1"),
-        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, bruteq16, q8, ivf")
+        "ivf-blocked" or "ivfblocked"
+                             => new Rinha.Api.Scorers.IvfBlockedScorer(dataset,
+                                    ParseInt(Environment.GetEnvironmentVariable("IVF_BLOCKED_NPROBE"), 4)),
+        _ => throw new ArgumentException($"Unknown scorer '{name}'. Known: brute, bruteq16, q8, ivf, ivf-blocked")
     };
 
     private static int ParseInt(string? s, int defaultValue)

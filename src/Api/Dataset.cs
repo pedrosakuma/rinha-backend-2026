@@ -29,6 +29,12 @@ public sealed unsafe class Dataset : IDisposable
     private readonly MemoryMappedViewAccessor? _q16View;
     private readonly MemoryMappedFile? _q16SoaMmf;
     private readonly MemoryMappedViewAccessor? _q16SoaView;
+    // Block-SoA Q16 layout: (TotalBlocks × 8 lanes × 14 dims) i16, dim-major within block.
+    // Block b dim d lane l: ptr[(long)b * 112 + d * 8 + l].
+    private readonly MemoryMappedFile? _q16BlockedMmf;
+    private readonly MemoryMappedViewAccessor? _q16BlockedView;
+    private readonly MemoryMappedFile? _blockOffsetsMmf;
+    private readonly MemoryMappedViewAccessor? _blockOffsetsView;
     private readonly MemoryMappedFile? _centroidsMmf;
     private readonly MemoryMappedViewAccessor? _centroidsView;
     private readonly MemoryMappedFile? _offsetsMmf;
@@ -42,6 +48,8 @@ public sealed unsafe class Dataset : IDisposable
     private readonly sbyte* _q8Ptr;
     private readonly sbyte* _q8SoaPtr;
     private readonly short* _q16Ptr;
+    private readonly short* _q16BlockedPtr;
+    private readonly int* _blockOffsetsPtr;
     private readonly float* _centroidsPtr;
     private readonly int* _offsetsPtr;
     private readonly float* _bboxMinPtr;
@@ -58,6 +66,7 @@ public sealed unsafe class Dataset : IDisposable
     public bool HasQ8Soa => _q8SoaPtr != null;
     public bool HasQ16 => _q16Ptr != null;
     public bool HasQ16Soa => _q16SoaPtr != null;
+    public bool HasQ16Blocked => _q16BlockedPtr != null && _blockOffsetsPtr != null;
     public bool HasIvf => _centroidsPtr != null && _offsetsPtr != null;
     public bool HasIvfBbox => _bboxMinPtr != null && _bboxMaxPtr != null;
 
@@ -68,6 +77,8 @@ public sealed unsafe class Dataset : IDisposable
         MemoryMappedFile? q8SoaMmf, MemoryMappedViewAccessor? q8SoaView,
         MemoryMappedFile? q16Mmf, MemoryMappedViewAccessor? q16View,
         MemoryMappedFile? q16SoaMmf, MemoryMappedViewAccessor? q16SoaView,
+        MemoryMappedFile? q16BlockedMmf, MemoryMappedViewAccessor? q16BlockedView,
+        MemoryMappedFile? blockOffsetsMmf, MemoryMappedViewAccessor? blockOffsetsView,
         MemoryMappedFile? centroidsMmf, MemoryMappedViewAccessor? centroidsView,
         MemoryMappedFile? offsetsMmf, MemoryMappedViewAccessor? offsetsView,
         MemoryMappedFile? bboxMinMmf, MemoryMappedViewAccessor? bboxMinView,
@@ -86,6 +97,10 @@ public sealed unsafe class Dataset : IDisposable
         _q16View = q16View;
         _q16SoaMmf = q16SoaMmf;
         _q16SoaView = q16SoaView;
+        _q16BlockedMmf = q16BlockedMmf;
+        _q16BlockedView = q16BlockedView;
+        _blockOffsetsMmf = blockOffsetsMmf;
+        _blockOffsetsView = blockOffsetsView;
         _centroidsMmf = centroidsMmf;
         _centroidsView = centroidsView;
         _offsetsMmf = offsetsMmf;
@@ -131,6 +146,20 @@ public sealed unsafe class Dataset : IDisposable
             byte* q16SoaBase = null;
             _q16SoaView.SafeMemoryMappedViewHandle.AcquirePointer(ref q16SoaBase);
             _q16SoaPtr = (short*)q16SoaBase;
+        }
+
+        if (_q16BlockedView is not null)
+        {
+            byte* qbBase = null;
+            _q16BlockedView.SafeMemoryMappedViewHandle.AcquirePointer(ref qbBase);
+            _q16BlockedPtr = (short*)qbBase;
+        }
+
+        if (_blockOffsetsView is not null)
+        {
+            byte* boBase = null;
+            _blockOffsetsView.SafeMemoryMappedViewHandle.AcquirePointer(ref boBase);
+            _blockOffsetsPtr = (int*)boBase;
         }
 
         if (_centroidsView is not null)
@@ -185,6 +214,7 @@ public sealed unsafe class Dataset : IDisposable
         long hpTotal = 0;
         long mlTotal = 0;
         bool isBrute = scorerHint == "brute";
+        bool isBlocked = scorerHint == "ivf-blocked";
 
         // Float32 vectors (192MB): not needed by IVF or brute-Q16 scorer; skip by default.
         if (Environment.GetEnvironmentVariable("PREFETCH_FLOAT") == "1" && _vectorsPtr != null)
@@ -202,8 +232,8 @@ public sealed unsafe class Dataset : IDisposable
         mlTotal += MlockRegion(_labelsPtr, lBytes);
         total += lBytes;
 
-        // Q8/Q8-SoA/IVF: needed by IVF scorer, not by brute-Q16.
-        if (!isBrute)
+        // Q8/Q8-SoA: needed by IVF (Q8) scorer, not by brute or ivf-blocked.
+        if (!isBrute && !isBlocked)
         {
             if (_q8Ptr != null)
             {
@@ -220,6 +250,11 @@ public sealed unsafe class Dataset : IDisposable
                 sink += TouchPages((byte*)_q8SoaPtr, bytes, PageSize);
                 total += bytes;
             }
+        }
+
+        // Centroids/offsets/bbox: needed by both Q8 IVF and ivf-blocked.
+        if (!isBrute)
+        {
             if (_centroidsPtr != null)
             {
                 long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
@@ -250,6 +285,23 @@ public sealed unsafe class Dataset : IDisposable
                 sink += TouchPages((byte*)_bboxMaxPtr, bytes, PageSize);
                 total += bytes;
             }
+        }
+
+        // Block-SoA Q16 + block_offsets: needed only by ivf-blocked.
+        if (isBlocked && _q16BlockedPtr != null && _blockOffsetsPtr != null)
+        {
+            long boBytes = (long)(NumCells + 1) * sizeof(int);
+            hpTotal += AdviseHuge((byte*)_blockOffsetsPtr, boBytes);
+            sink += TouchPages((byte*)_blockOffsetsPtr, boBytes, PageSize);
+            total += boBytes;
+
+            // Total blocks = block_offsets[NumCells]; read directly to size the warm.
+            int totalBlocks = _blockOffsetsPtr[NumCells];
+            long bbBytes = (long)totalBlocks * 8 * Dimensions * sizeof(short);
+            hpTotal += AdviseHuge((byte*)_q16BlockedPtr, bbBytes);
+            sink += TouchPages((byte*)_q16BlockedPtr, bbBytes, PageSize);
+            mlTotal += MlockRegion((byte*)_q16BlockedPtr, bbBytes);
+            total += bbBytes;
         }
 
         // Q16-SoA (column-major): needed by brute-force scorer only.
@@ -367,7 +419,9 @@ public sealed unsafe class Dataset : IDisposable
         string? ivfCentroidsPath = null,
         string? ivfOffsetsPath = null,
         string? ivfBboxMinPath = null,
-        string? ivfBboxMaxPath = null)
+        string? ivfBboxMaxPath = null,
+        string? vectorsQ16BlockedPath = null,
+        string? ivfBlockOffsetsPath = null)
     {
         var vectorsLen = new FileInfo(vectorsPath).Length;
         var labelsLen = new FileInfo(labelsPath).Length;
@@ -437,6 +491,28 @@ public sealed unsafe class Dataset : IDisposable
             q16SoaView = q16SoaMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         }
 
+        // Block-SoA Q16: built by Rinha.Preprocessor --block; layout 8 lanes × 14 dims = 112 i16/block.
+        // Padding lanes filled with short.MaxValue so they always lose top-K race.
+        MemoryMappedFile? q16BlockedMmf = null;
+        MemoryMappedViewAccessor? q16BlockedView = null;
+        MemoryMappedFile? blockOffsetsMmf = null;
+        MemoryMappedViewAccessor? blockOffsetsView = null;
+        if (!string.IsNullOrEmpty(vectorsQ16BlockedPath) && File.Exists(vectorsQ16BlockedPath)
+            && !string.IsNullOrEmpty(ivfBlockOffsetsPath) && File.Exists(ivfBlockOffsetsPath))
+        {
+            var bLen = new FileInfo(vectorsQ16BlockedPath).Length;
+            long perBlock = (long)8 * Dimensions * sizeof(short); // 224 bytes
+            if (bLen % perBlock != 0)
+                throw new InvalidDataException($"Q16-blocked size {bLen} not multiple of {perBlock}");
+            var boLen = new FileInfo(ivfBlockOffsetsPath).Length;
+            if (boLen % sizeof(int) != 0)
+                throw new InvalidDataException($"Block-offsets size {boLen} not multiple of 4");
+            q16BlockedMmf = MemoryMappedFile.CreateFromFile(vectorsQ16BlockedPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            q16BlockedView = q16BlockedMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            blockOffsetsMmf = MemoryMappedFile.CreateFromFile(ivfBlockOffsetsPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            blockOffsetsView = blockOffsetsMmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        }
+
         MemoryMappedFile? centroidsMmf = null;
         MemoryMappedViewAccessor? centroidsView = null;
         MemoryMappedFile? offsetsMmf = null;
@@ -484,6 +560,7 @@ public sealed unsafe class Dataset : IDisposable
             vectorsMmf, vectorsView, labelsMmf, labelsView,
             q8Mmf, q8View, q8SoaMmf, q8SoaView,
             q16Mmf, q16View, q16SoaMmf, q16SoaView,
+            q16BlockedMmf, q16BlockedView, blockOffsetsMmf, blockOffsetsView,
             centroidsMmf, centroidsView, offsetsMmf, offsetsView,
             bboxMinMmf, bboxMinView, bboxMaxMmf, bboxMaxView,
             (int)count, numCells);
@@ -531,6 +608,22 @@ public sealed unsafe class Dataset : IDisposable
         get => _q16SoaPtr;
     }
 
+    /// <summary>Block-SoA Q16 layout (8 lanes × 14 dims = 112 i16 per block, dim-major within block).
+    /// Used by IvfBlockedScorer. Populated only if HasQ16Blocked is true.</summary>
+    public short* Q16BlockedPtr
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _q16BlockedPtr;
+    }
+
+    /// <summary>Per-cell prefix sum of block counts (length NumCells+1). Cell c covers
+    /// blocks [BlockOffsetsPtr[c], BlockOffsetsPtr[c+1]). Populated only if HasQ16Blocked is true.</summary>
+    public int* BlockOffsetsPtr
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _blockOffsetsPtr;
+    }
+
     public float* CentroidsPtr
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -563,6 +656,8 @@ public sealed unsafe class Dataset : IDisposable
         try { _q8SoaView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _q16View?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _q16SoaView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        try { _q16BlockedView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+        try { _blockOffsetsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _centroidsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _offsetsView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
         try { _bboxMinView?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
@@ -584,6 +679,10 @@ public sealed unsafe class Dataset : IDisposable
         _q16Mmf?.Dispose();
         _q16SoaView?.Dispose();
         _q16SoaMmf?.Dispose();
+        _q16BlockedView?.Dispose();
+        _q16BlockedMmf?.Dispose();
+        _blockOffsetsView?.Dispose();
+        _blockOffsetsMmf?.Dispose();
         _centroidsView?.Dispose();
         _centroidsMmf?.Dispose();
         _offsetsView?.Dispose();

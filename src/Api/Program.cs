@@ -77,6 +77,8 @@ var vectorsQ8Path = Environment.GetEnvironmentVariable("VECTORS_Q8_PATH"); // op
 var vectorsQ8SoaPath = Environment.GetEnvironmentVariable("VECTORS_Q8_SOA_PATH"); // optional
 var vectorsQ16Path = Environment.GetEnvironmentVariable("VECTORS_Q16_PATH"); // optional
 var vectorsQ16SoaPath = Environment.GetEnvironmentVariable("VECTORS_Q16_SOA_PATH"); // optional (pre-transposed SoA for brute)
+var vectorsQ16BlockedPath = Environment.GetEnvironmentVariable("VECTORS_Q16_BLOCKED_PATH"); // optional (block-SoA for ivf-blocked)
+var ivfBlockOffsetsPath = Environment.GetEnvironmentVariable("IVF_BLOCK_OFFSETS_PATH"); // optional (block prefix sums)
 var ivfCentroidsPath = Environment.GetEnvironmentVariable("IVF_CENTROIDS_PATH");
 var ivfOffsetsPath = Environment.GetEnvironmentVariable("IVF_OFFSETS_PATH");
 var ivfBboxMinPath = Environment.GetEnvironmentVariable("IVF_BBOX_MIN_PATH");
@@ -86,7 +88,7 @@ var normalizationPath = Environment.GetEnvironmentVariable("NORMALIZATION_PATH")
 
 var normalization = NormalizationConstants.Load(normalizationPath);
 var mccRisk = MccRiskTable.Load(mccRiskPath);
-var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, vectorsQ8SoaPath, vectorsQ16Path, vectorsQ16SoaPath, ivfCentroidsPath, ivfOffsetsPath, ivfBboxMinPath, ivfBboxMaxPath);
+var dataset = Dataset.Open(vectorsPath, labelsPath, vectorsQ8Path, vectorsQ8SoaPath, vectorsQ16Path, vectorsQ16SoaPath, ivfCentroidsPath, ivfOffsetsPath, ivfBboxMinPath, ivfBboxMaxPath, vectorsQ16BlockedPath, ivfBlockOffsetsPath);
 var vectorizer = new Vectorizer(normalization, mccRisk);
 var jsonVectorizer = new JsonVectorizer(normalization, mccRisk);
 var scorerName = Environment.GetEnvironmentVariable("SCORER") ?? "brute";
