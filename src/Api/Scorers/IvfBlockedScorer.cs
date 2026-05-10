@@ -43,10 +43,45 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
     private const int BlockShorts = BlockSize * Dimensions; // 112 i16/block
     private const int BlockBytes = BlockShorts * sizeof(short); // 224 B/block
 
+    // Diagnostics counters. Only updated when InstrumentationEnabled is true.
+    // Single-threaded, intended for offline bench runs only.
+    public static bool InstrumentationEnabled = false;
+    public static long CountCellsConsidered;     // == nlist per query
+    public static long CountCellsSeed;           // == nProbe per query
+    public static long CountCellsBboxScanned;    // bbox-LB pass: cells that passed and were scanned
+    public static long CountCellsBboxSkipped;    // bbox-LB pass: cells skipped (lb >= worst)
+    public static long CountBlocksConsidered;    // total blocks entered
+    public static long CountBlocksAllPass;       // partial_mask == 0xFF (no pruning at partial check)
+    public static long CountBlocksPartialPruned; // partial-check skipped block
+    public static long CountBlocksFullPruned;    // full-distance ≥ worst, no candidate
+    public static long CountBlocksAccepted;      // at least 1 lane updated top-K
+    public static long CountBlocksTriPruned;     // sort+TI: skipped via dc_min[b] > d_qc + sqrt(worst)
+    public static long CountQueries;
+    public static void ResetCounters()
+    {
+        CountCellsConsidered = CountCellsSeed = CountCellsBboxScanned = CountCellsBboxSkipped = 0;
+        CountBlocksConsidered = CountBlocksAllPass = CountBlocksPartialPruned = CountBlocksFullPruned = CountBlocksAccepted = CountBlocksTriPruned = 0;
+        CountQueries = 0;
+    }
+
     private readonly Dataset _dataset;
     private readonly int _nProbe;
     private readonly bool _fastGate; // OOD-fragile cascade (jairoblatt's behaviour); default off
     private readonly bool _hasBbox;
+
+    // Sort+TI early-termination layout (env IVF_BLOCKED_SORTED=1).
+    // Within each cell, vectors are reordered by ascending |v - centroid|; block contents and
+    // labels are repacked accordingly. dc_min[b] is the smallest |v - c| in block b (= dc of
+    // lane 0 since sorted). At scan time, when dc_min[b] > d_qc + sqrt(worst), all subsequent
+    // blocks of the cell can be skipped (admissible reverse-triangle inequality).
+    // Backed by NativeMemory.AlignedAlloc (no GC pinning, stable address for object lifetime).
+    private readonly bool _sorted;
+    private readonly short* _sortedBlocks;
+    private readonly byte* _sortedLabels;
+    private readonly float* _blockDcMin;
+
+    // Partial-prune dim count (env IVF_BLOCKED_PARTIAL_DIMS, default 8). Must be even, ≤14.
+    private readonly int _partialDims;
 
     public IvfBlockedScorer(Dataset dataset, int nProbe = 4)
     {
@@ -56,6 +91,116 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         _nProbe = Math.Clamp(nProbe, 1, dataset.NumCells);
         _fastGate = Environment.GetEnvironmentVariable("IVF_BLOCKED_FAST_GATE") == "1";
         _hasBbox = dataset.HasIvfBbox;
+        _sorted = Environment.GetEnvironmentVariable("IVF_BLOCKED_SORTED") == "1";
+        var pd = Environment.GetEnvironmentVariable("IVF_BLOCKED_PARTIAL_DIMS");
+        _partialDims = (pd is not null && int.TryParse(pd, out var v) && v >= 2 && v <= 14 && (v & 1) == 0) ? v : 6;
+        if (_sorted)
+            BuildSortedLayout(out _sortedBlocks, out _sortedLabels, out _blockDcMin);
+    }
+
+    private void BuildSortedLayout(out short* sortedBlocks, out byte* sortedLabels, out float* blockDcMin)
+    {
+        int nlist = _dataset.NumCells;
+        int* blockOffs = _dataset.BlockOffsetsPtr;
+        int* cellOffs = _dataset.CellOffsetsPtr;
+        short* srcBlocks = _dataset.Q16BlockedPtr;
+        byte* srcLabels = _dataset.LabelsPtr;
+        float* centBase = _dataset.CentroidsPtr;
+        int totalBlocks = blockOffs[nlist];
+        int totalRows = cellOffs[nlist];
+        nuint blocksBytes = (nuint)((long)totalBlocks * BlockShorts * sizeof(short));
+        nuint labelsBytes = (nuint)totalRows;
+        nuint dcMinBytes = (nuint)((long)totalBlocks * sizeof(float));
+        sortedBlocks = (short*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(blocksBytes, 64);
+        sortedLabels = (byte*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(labelsBytes, 64);
+        blockDcMin = (float*)System.Runtime.InteropServices.NativeMemory.AlignedAlloc(dcMinBytes, 64);
+        new Span<byte>(sortedBlocks, (int)Math.Min(blocksBytes, int.MaxValue)).Clear();
+        if (blocksBytes > int.MaxValue)
+        {
+            // Defensive: clear in chunks if >2GB. Not expected at our scale (84MB).
+            byte* p = (byte*)sortedBlocks; nuint rem = blocksBytes;
+            while (rem > 0) { int chunk = (int)Math.Min(rem, (nuint)int.MaxValue); new Span<byte>(p, chunk).Clear(); p += chunk; rem -= (nuint)chunk; }
+        }
+        new Span<byte>(sortedLabels, totalRows).Clear();
+        new Span<byte>(blockDcMin, totalBlocks * sizeof(float)).Clear();
+        float invScale = 1f / Dataset.Q16Scale;
+
+        // Per-cell working buffer (max possible cell size). Avoid stackalloc — cells can be large.
+        // We size to the largest cell on demand.
+        int maxCellRows = 0;
+        for (int c = 0; c < nlist; c++)
+        {
+            int sz = cellOffs[c + 1] - cellOffs[c];
+            if (sz > maxCellRows) maxCellRows = sz;
+        }
+        var dc = new float[maxCellRows];
+        var perm = new int[maxCellRows];
+
+        for (int c = 0; c < nlist; c++)
+        {
+            int rowStart = cellOffs[c];
+            int rowEnd = cellOffs[c + 1];
+            int cellSize = rowEnd - rowStart;
+            int blockStart = blockOffs[c];
+            int blockEnd = blockOffs[c + 1];
+            int nBlocksCell = blockEnd - blockStart;
+            float* cp = centBase + (long)c * PaddedDimensions;
+
+            // 1) Compute dc for each row in this cell, gathering from blocked layout.
+            for (int r = 0; r < cellSize; r++)
+            {
+                int blockIRel = r >> 3;            // r / 8
+                int lane = r & 7;                  // r % 8
+                short* bp = srcBlocks + (long)(blockStart + blockIRel) * BlockShorts;
+                float sum = 0f;
+                for (int d = 0; d < Dimensions; d++)
+                {
+                    float v = bp[d * BlockSize + lane] * invScale;
+                    float diff = v - cp[d];
+                    sum += diff * diff;
+                }
+                dc[r] = MathF.Sqrt(sum);
+                perm[r] = r;
+            }
+
+            // 2) Sort row indices by ascending dc. Stable would be nice; Array.Sort is fine for prototype.
+            var dcSlice = dc.AsSpan(0, cellSize);
+            var permSlice = perm.AsSpan(0, cellSize);
+            // Use Array.Sort overload that sorts perm[] by dc[] keys (we copy keys to avoid mutating dc[] order).
+            var dcKeys = new float[cellSize];
+            dcSlice.CopyTo(dcKeys);
+            var permArr = permSlice.ToArray();
+            Array.Sort(dcKeys, permArr);
+
+            // 3) Pack into sorted block layout + permute labels + compute dc_min[b].
+            for (int r = 0; r < cellSize; r++)
+            {
+                int srcRow = permArr[r];
+                int srcBlockI = blockStart + (srcRow >> 3);
+                int srcLane = srcRow & 7;
+                int dstBlockI = blockStart + (r >> 3);
+                int dstLane = r & 7;
+                short* sBp = srcBlocks + (long)srcBlockI * BlockShorts;
+                long dstBase = (long)dstBlockI * BlockShorts;
+                for (int d = 0; d < Dimensions; d++)
+                    sortedBlocks[dstBase + d * BlockSize + dstLane] = sBp[d * BlockSize + srcLane];
+                sortedLabels[rowStart + r] = srcLabels[rowStart + srcRow];
+                if (dstLane == 0)
+                    blockDcMin[dstBlockI] = dcKeys[r]; // smallest dc in block (sorted: r at lane 0)
+            }
+            // Pad: if last block has fewer than 8 lanes used (cellSize % 8 != 0), pad lanes hold
+            // whatever the source had (BlockBuilder pads with short.MaxValue → effective inf dist).
+            int packedLanes = cellSize;
+            int lastBlockI = blockEnd - 1;
+            for (int r = packedLanes; r < (lastBlockI - blockStart + 1) * BlockSize; r++)
+            {
+                int dstLane = r & 7;
+                long dstBase = (long)lastBlockI * BlockShorts;
+                for (int d = 0; d < Dimensions; d++)
+                    sortedBlocks[dstBase + d * BlockSize + dstLane] = short.MaxValue;
+                // labels for padding lanes are unreachable (mask-driven), leave zero.
+            }
+        }
     }
 
     public float Score(ReadOnlySpan<float> query) => ScoreCount(query) / (float)K;
@@ -64,6 +209,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
     {
         if (query.Length < Dimensions)
             throw new ArgumentException("Query vector too small", nameof(query));
+
+        if (InstrumentationEnabled) { CountQueries++; CountCellsConsidered += _dataset.NumCells; CountCellsSeed += _nProbe; }
 
         int nlist = _dataset.NumCells;
         Span<float> centDist = stackalloc float[512];
@@ -126,21 +273,24 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         var labelsPtr = _dataset.LabelsPtr;
         var cellOffsPtr = _dataset.CellOffsetsPtr;
 
+        // Sort+TI pointers (long-lived NativeMemory, no pinning needed).
+        short* effBlocks = _sorted ? _sortedBlocks : blocksPtr;
+        byte* effLabels = _sorted ? _sortedLabels : labelsPtr;
+        float* effDcMin = _sorted ? _blockDcMin : null;
+        int partialDims = _partialDims;
+
         // Scan FAST cells.
         for (int i = 0; i < n; i++)
         {
             int c = cells[i];
             if (c < 0) continue;
-            ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
-                topDist, topLab, topIdx, ref worstIdx);
+            ScanCellBlocks(c, effBlocks, blockOffs, effLabels, cellOffsPtr, qVecs,
+                topDist, topLab, topIdx, ref worstIdx, effDcMin, centDist[c], partialDims);
         }
 
         // 4) Exact bbox-LB pass over remaining cells (when bbox available and fast-gate disabled).
-        // Mathematically equivalent to brute-force top-K: every cluster whose lower bound exceeds
-        // the current worst-top-5 cannot contain a closer neighbour and is provably safe to skip.
         if (_hasBbox && !_fastGate)
         {
-            // Build seed mask in stack (small): nlist ≤ 512 by config.
             Span<bool> isSeed = stackalloc bool[nlist];
             for (int i = 0; i < n; i++) { int sc = cells[i]; if (sc >= 0) isSeed[sc] = true; }
             float* bbMin = _dataset.IvfBboxMinPtr;
@@ -153,21 +303,19 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                     if (isSeed[c]) continue;
                     float worst = topDist[worstIdx];
                     float lb = BboxLowerBoundSquared(qPtr, bbMin, bbMax, c);
-                    if (lb >= worst) continue; // exact: cluster cannot beat top-5
-                    ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
-                        topDist, topLab, topIdx, ref worstIdx);
+                    if (lb >= worst) { if (InstrumentationEnabled) CountCellsBboxSkipped++; continue; }
+                    if (InstrumentationEnabled) CountCellsBboxScanned++;
+                    ScanCellBlocks(c, effBlocks, blockOffs, effLabels, cellOffsPtr, qVecs,
+                        topDist, topLab, topIdx, ref worstIdx, effDcMin, centDist[c], partialDims);
                 }
             }
         }
         else if (_fastGate)
         {
-            // Heuristic cascade (jairoblatt original): only escalate when count ∈ {2,3}.
-            // Default OFF — kept for A/B vs the exact pass.
             int frauds0 = 0;
             for (int i = 0; i < K; i++) if (topLab[i] != 0) frauds0++;
             if (frauds0 == 2 || frauds0 == 3)
             {
-                // Expand to FULL (3× FAST as in reference). Picks more cells from centDist.
                 int nFull = Math.Min(_nProbe * 3, nlist);
                 Span<int> fullCells = stackalloc int[nFull];
                 Span<float> fullCellsDist = stackalloc float[nFull];
@@ -193,8 +341,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                     int c = fullCells[i];
                     if (c < 0 || visitedF[c]) continue;
                     visitedF[c] = true;
-                    ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
-                        topDist, topLab, topIdx, ref worstIdx);
+                    ScanCellBlocks(c, effBlocks, blockOffs, effLabels, cellOffsPtr, qVecs,
+                        topDist, topLab, topIdx, ref worstIdx, effDcMin, centDist[c], partialDims);
                 }
             }
         }
@@ -210,7 +358,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         short* blocksPtr, int* blockOffs, byte* labelsPtr, int* cellOffsPtr,
         Span<Vector256<float>> qVecs,
         Span<float> topDist, Span<byte> topLab, Span<int> topIdx,
-        ref int worstIdx)
+        ref int worstIdx,
+        float* dcMinPtr, float centDistC, int partialDims)
     {
         int blockStart = blockOffs[cell];
         int blockEnd = blockOffs[cell + 1];
@@ -219,8 +368,24 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         var scale = Vector256.Create(1f / Dataset.Q16Scale); // 1e-4
         Span<float> distsBuf = stackalloc float[8];
 
+        // Sort+TI: precompute gate = sqrt(centDistC) + sqrt(worst). Refresh on worst change.
+        bool useTri = dcMinPtr != null;
+        float dQc = useTri ? MathF.Sqrt(centDistC) : 0f;
+        float lastWorstForGate = useTri ? topDist[worstIdx] : 0f;
+        float gate = useTri ? dQc + (float.IsPositiveInfinity(lastWorstForGate) ? float.PositiveInfinity : MathF.Sqrt(lastWorstForGate)) : 0f;
+
         for (int blockI = blockStart; blockI < blockEnd; blockI++)
         {
+            if (InstrumentationEnabled) CountBlocksConsidered++;
+
+            // Sort+TI early termination: blocks are sorted by ascending dc within cell, so once
+            // dc_min[b] > d_qc + sqrt(worst), every subsequent block is also outside the radius.
+            if (useTri && dcMinPtr[blockI] > gate)
+            {
+                if (InstrumentationEnabled) CountBlocksTriPruned += (blockEnd - blockI);
+                break;
+            }
+
             // Software prefetch the +8 block (2 lines covering head + midpoint of 224B).
             int prefetchBlock = blockI + 8;
             if (prefetchBlock < blockEnd)
@@ -238,25 +403,25 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
             var acc0 = Vector256<float>.Zero;
             var acc1 = Vector256<float>.Zero;
 
-            // First 4 pairs = 8 dims. After this we check for early-abort.
-            DimPair(bp, 0, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 2, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 4, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 6, qVecs, scale, ref acc0, ref acc1);
+            // First `partialDims` dims = partialDims/2 pairs. Then partial check.
+            int d = 0;
+            for (; d + 1 < partialDims; d += 2)
+                DimPair(bp, d, qVecs, scale, ref acc0, ref acc1);
 
             var partial = acc0 + acc1;
             // Partial L2² is monotonic non-decreasing → if all lanes ≥ worst, full ≥ worst, skip block.
             int partialMask = (int)Vector256.LessThan(partial, threshold).ExtractMostSignificantBits();
-            if (partialMask == 0) continue;
+            if (partialMask == 0) { if (InstrumentationEnabled) CountBlocksPartialPruned++; continue; }
+            if (InstrumentationEnabled && partialMask == 0xFF) CountBlocksAllPass++;
 
-            // Remaining 3 pairs = 6 dims (8..13).
-            DimPair(bp, 8, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 10, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 12, qVecs, scale, ref acc0, ref acc1);
+            // Remaining dims (partialDims..13) in pairs.
+            for (; d + 1 < Dimensions; d += 2)
+                DimPair(bp, d, qVecs, scale, ref acc0, ref acc1);
 
             var full = acc0 + acc1;
             int mask = (int)Vector256.LessThan(full, threshold).ExtractMostSignificantBits();
-            if (mask == 0) continue;
+            if (mask == 0) { if (InstrumentationEnabled) CountBlocksFullPruned++; continue; }
+            if (InstrumentationEnabled) CountBlocksAccepted++;
 
             // Extract candidate distances (only those passing mask) and merge into top-5.
             full.CopyTo(distsBuf);
@@ -287,6 +452,16 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                         if (v > wv || (v == wv && io > wIdxOrig)) { wv = v; wi = j; wIdxOrig = io; }
                     }
                     worstIdx = wi;
+                    // Refresh TI gate if the new worst is tighter than the cached one.
+                    if (useTri)
+                    {
+                        float nw = topDist[worstIdx];
+                        if (nw < lastWorstForGate)
+                        {
+                            lastWorstForGate = nw;
+                            gate = dQc + (float.IsPositiveInfinity(nw) ? float.PositiveInfinity : MathF.Sqrt(nw));
+                        }
+                    }
                 }
             }
         }
@@ -338,5 +513,12 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         var d1 = Vector256.Max(zero, Vector256.Max(d1a, d1b));
         var s = (d0 * d0) + (d1 * d1);
         return Vector256.Sum(s);
+    }
+
+    ~IvfBlockedScorer()
+    {
+        if (_sortedBlocks != null) System.Runtime.InteropServices.NativeMemory.AlignedFree(_sortedBlocks);
+        if (_sortedLabels != null) System.Runtime.InteropServices.NativeMemory.AlignedFree(_sortedLabels);
+        if (_blockDcMin != null) System.Runtime.InteropServices.NativeMemory.AlignedFree(_blockDcMin);
     }
 }
