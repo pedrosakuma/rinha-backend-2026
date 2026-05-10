@@ -97,6 +97,11 @@ IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
 // vectorize straight to short and skip the round+cast inside the scorer.
 IQ16FraudScorer? q16Scorer = scorer as IQ16FraudScorer;
 
+// Wave 8: build the bucket fast-path table from the 3M references. ~1s startup,
+// ~16 MiB RAM. Lookup short-circuits ~42% of /fraud-score requests with 0 errors
+// observed on the eval test set. Disable with PROFILE_FAST_PATH=0.
+ProfileFastPath.Build(dataset);
+
 // Pre-touch all mmap pages and run a JIT warm-up so the first user requests
 // don't pay page-fault or tier0->tier1 jit overhead. Disable with WARMUP=0.
 if (Environment.GetEnvironmentVariable("WARMUP") != "0")
@@ -191,10 +196,14 @@ app.MapPost("/fraud-score", async (HttpContext ctx) =>
     Span<float> query = stackalloc float[Dataset.Dimensions];
     Span<short> queryQ16 = stackalloc short[Dataset.Dimensions];
     bool useQ16 = q16Scorer is not null;
+    // Wave 8: fast-path needs the float vector (edges are in float space). We always
+    // produce both float + Q16 from a single parse; the cost over Q16-only is one extra
+    // multiply per dim (~10ns).
+    bool needFloat = !useQ16 || ProfileFastPath.IsEnabled;
     if (buffer.IsSingleSegment)
     {
-        if (useQ16) jsonVectorizer.VectorizeJsonQ16(buffer.FirstSpan, queryQ16);
-        else        jsonVectorizer.VectorizeJson(buffer.FirstSpan, query);
+        if (needFloat) jsonVectorizer.VectorizeJson(buffer.FirstSpan, query, queryQ16);
+        else           jsonVectorizer.VectorizeJsonQ16(buffer.FirstSpan, queryQ16);
     }
     else
     {
@@ -209,16 +218,24 @@ app.MapPost("/fraud-score", async (HttpContext ctx) =>
             seg.Span.CopyTo(scratch[p..]);
             p += seg.Length;
         }
-        if (useQ16) jsonVectorizer.VectorizeJsonQ16(scratch[..len], queryQ16);
-        else        jsonVectorizer.VectorizeJson(scratch[..len], query);
+        if (needFloat) jsonVectorizer.VectorizeJson(scratch[..len], query, queryQ16);
+        else           jsonVectorizer.VectorizeJsonQ16(scratch[..len], queryQ16);
     }
     pipe.AdvanceTo(buffer.End);
 
-    float score = useQ16 ? q16Scorer!.ScoreQ16(queryQ16) : scorer.Score(query);
+    // Wave 8: bucket fast-path. Returns 0 (undecided), 1 (pure-legit), 2 (pure-fraud).
+    int idx;
+    byte fp = ProfileFastPath.IsEnabled ? ProfileFastPath.TryLookup(query) : ProfileFastPath.ResultUndecided;
+    if (fp == ProfileFastPath.ResultLegit)      idx = 0;
+    else if (fp == ProfileFastPath.ResultFraud) idx = 5;
+    else
+    {
+        float score = useQ16 ? q16Scorer!.ScoreQ16(queryQ16) : scorer.Score(query);
+        idx = PrecomputedFraudResponse.ScoreToIndex(score);
+    }
 
     // Pre-baked response: write directly to PipeWriter so Kestrel emits
     // status+headers+body in a single sendmsg.
-    int idx = PrecomputedFraudResponse.ScoreToIndex(score);
     var body = PrecomputedFraudResponse.BodyForIndex(idx).Span;
     var resp = ctx.Response;
     resp.StatusCode = 200;

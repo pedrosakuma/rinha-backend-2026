@@ -268,10 +268,24 @@ internal static class RawHttpServer
             try
             {
                 var body = request.Slice(headerEnd + 4, contentLength);
-                Span<float> query = stackalloc float[Dataset.Dimensions];
-                vectorizer.VectorizeJson(body, query);
-                fraudCount = scorer.ScoreCount(query);
-                if ((uint)fraudCount > 5u) fraudCount = fraudCount < 0 ? 0 : 5;
+                Span<short> queryQ16 = stackalloc short[Dataset.Dimensions];
+                Span<float> queryFloat = stackalloc float[Dataset.Dimensions];
+                // Vectorize once; produce both float (for fast-path lookup) and Q16 (for
+                // the integer scorer fast-path). Cost over Q16-only is one extra multiply per dim.
+                bool fastEnabled = ProfileFastPath.IsEnabled;
+                if (fastEnabled)
+                    vectorizer.VectorizeJson(body, queryFloat, queryQ16);
+                else
+                    vectorizer.VectorizeJsonQ16(body, queryQ16);
+
+                byte fp = fastEnabled ? ProfileFastPath.TryLookup(queryFloat) : ProfileFastPath.ResultUndecided;
+                if      (fp == ProfileFastPath.ResultLegit) fraudCount = 0;
+                else if (fp == ProfileFastPath.ResultFraud) fraudCount = 5;
+                else
+                {
+                    fraudCount = scorer.ScoreCount(queryFloat);
+                    if ((uint)fraudCount > 5u) fraudCount = fraudCount < 0 ? 0 : 5;
+                }
             }
             catch
             {
