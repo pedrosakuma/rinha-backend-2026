@@ -96,7 +96,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         var pd = Environment.GetEnvironmentVariable("IVF_BLOCKED_PARTIAL_DIMS");
         _partialDims = (pd is not null && int.TryParse(pd, out var v) && v >= 2 && v <= 14 && (v & 1) == 0) ? v : 6;
         var mbc = Environment.GetEnvironmentVariable("IVF_BLOCKED_MAX_BBOX_CELLS");
-        _maxBboxCells = (mbc is not null && int.TryParse(mbc, out var vmbc) && vmbc >= 0) ? vmbc : 2;
+        _maxBboxCells = (mbc is not null && int.TryParse(mbc, out var vmbc) && vmbc >= 0) ? vmbc : 0;
         if (_sorted)
             BuildSortedLayout(out _sortedBlocks, out _sortedLabels, out _blockDcMin);
     }
