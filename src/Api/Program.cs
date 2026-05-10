@@ -125,6 +125,48 @@ if (Environment.GetEnvironmentVariable("WARMUP") != "0")
 
 var app = builder.Build();
 
+// RAW_HTTP=1: skip Kestrel/ASP.NET entirely. RawHttpServer takes over the same
+// UDS path Kestrel would have listened on, with manual HTTP/1.1 parsing,
+// pre-built response buffers and the IFraudScorer.ScoreCount integer fast path.
+// Built specifically to close the Kestrel-overhead gap to itagyba (#2781 = 5769 / p99 1.70ms).
+if (Environment.GetEnvironmentVariable("RAW_HTTP") == "1")
+{
+    var rawUds = Environment.GetEnvironmentVariable("UDS_PATH");
+    if (string.IsNullOrEmpty(rawUds))
+        throw new InvalidOperationException("RAW_HTTP=1 requires UDS_PATH to be set.");
+
+    // chmod is the LB-visible affordance; do it before Accept().
+    Action chmodUds = () =>
+    {
+        try
+        {
+            File.SetUnixFileMode(rawUds,
+                UnixFileMode.UserRead  | UnixFileMode.UserWrite  |
+                UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
+                UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"chmod uds failed: {ex.Message}"); }
+    };
+    // RawHttpServer.Run binds, then we chmod from a side thread once the file exists.
+    var chmodThread = new Thread(() =>
+    {
+        for (int i = 0; i < 50; i++)
+        {
+            if (File.Exists(rawUds)) { chmodUds(); return; }
+            Thread.Sleep(20);
+        }
+    }) { IsBackground = true };
+    chmodThread.Start();
+
+    var simd = System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated ? "AVX2"
+             : System.Runtime.Intrinsics.Vector128.IsHardwareAccelerated ? "SSE-only (slow)" : "scalar";
+    var ivf = dataset.HasIvf ? $" IVF: {dataset.NumCells} cells." : "";
+    Console.WriteLine($"Ready (raw-http). Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}. SIMD: {simd}.{ivf}");
+
+    Rinha.Api.RawHttpServer.Run(rawUds, scorer, jsonVectorizer);
+    return; // never reached, but lets the compiler see the method ends.
+}
+
 app.MapGet("/ready", () => Results.Ok());
 
 // Hot path: bypass model binding entirely. Read raw body bytes via PipeReader,

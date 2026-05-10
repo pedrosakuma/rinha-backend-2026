@@ -58,7 +58,9 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         _hasBbox = dataset.HasIvfBbox;
     }
 
-    public float Score(ReadOnlySpan<float> query)
+    public float Score(ReadOnlySpan<float> query) => ScoreCount(query) / (float)K;
+
+    public int ScoreCount(ReadOnlySpan<float> query)
     {
         if (query.Length < Dimensions)
             throw new ArgumentException("Query vector too small", nameof(query));
@@ -199,7 +201,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
 
         int totalFrauds = 0;
         for (int i = 0; i < K; i++) if (topLab[i] != 0) totalFrauds++;
-        return totalFrauds / (float)K;
+        return totalFrauds;
     }
 
     /// <summary>Scans all blocks of a single cell, updating top-5 in place.</summary>

@@ -6,6 +6,21 @@ public interface IFraudScorer
     /// Returns the fraud score in [0,1] for a 14-dim padded query vector.
     /// </summary>
     float Score(ReadOnlySpan<float> query);
+
+    /// <summary>
+    /// Returns the integer fraud count in [0,K] (K=5) — bypasses the
+    /// score = count/K float round-trip when callers will discretise back to int
+    /// (e.g. <see cref="PrecomputedFraudResponse"/> selecting a pre-built response).
+    /// Default implementation wraps <see cref="Score"/> and re-discretises.
+    /// </summary>
+    int ScoreCount(ReadOnlySpan<float> query)
+    {
+        float s = Score(query);
+        int n = (int)MathF.Round(s * 5f);
+        if (n < 0) n = 0;
+        else if (n > 5) n = 5;
+        return n;
+    }
 }
 
 /// <summary>Optional capability: scorer accepts an int16-quantized query directly,

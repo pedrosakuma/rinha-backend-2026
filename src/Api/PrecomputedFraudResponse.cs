@@ -26,6 +26,11 @@ public sealed class PrecomputedFraudResponse : IResult
     public const float ScoreStep = 0.2f;
 
     private static readonly byte[][] Bodies = BuildBodies();
+
+    /// <summary>JSON body bytes for fraud_count = 0..5 (count/5 = score).
+    /// Shared with <see cref="RawHttpServer"/> which embeds them in pre-built
+    /// HTTP responses.</summary>
+    internal static ReadOnlySpan<byte> BodyFor(int fraudCount) => Bodies[fraudCount];
     private static readonly PrecomputedFraudResponse[] Instances = BuildInstances();
 
     private readonly int _index;
