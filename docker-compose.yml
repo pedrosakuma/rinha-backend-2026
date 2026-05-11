@@ -14,7 +14,7 @@ name: rinha-backend-2026
 
 services:
   api1: &api
-    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave21-bits-2193e16
+    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave25-route-271abb5
     pull_policy: always
     cpuset: "0"
     security_opt:
