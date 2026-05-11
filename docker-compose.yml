@@ -14,8 +14,8 @@ name: rinha-backend-2026
 
 services:
   api1: &api
-    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:latest
-    pull_policy: always
+    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave13-tp64-1c9aec7
+    pull_policy: never
     cpuset: "0"
     security_opt:
       - seccomp=unconfined
@@ -23,8 +23,8 @@ services:
       UDS_PATH: "/run/uds/api1.sock"
       DOTNET_GCHeapCount: "1"
       DOTNET_PROCESSOR_COUNT: "1"
-      TP_MIN_WORKERS: "2"
-      TP_MAX_WORKERS: "2"
+      TP_MIN_WORKERS: "64"
+      TP_MAX_WORKERS: "64"
       SCORER: "ivf-blocked"
       IVF_NPROBE: "1"
       IVF_BLOCKED_NPROBE: "2"
@@ -60,8 +60,8 @@ services:
       UDS_PATH: "/run/uds/api2.sock"
       DOTNET_GCHeapCount: "1"
       DOTNET_PROCESSOR_COUNT: "1"
-      TP_MIN_WORKERS: "2"
-      TP_MAX_WORKERS: "2"
+      TP_MIN_WORKERS: "64"
+      TP_MAX_WORKERS: "64"
       SCORER: "ivf-blocked"
       IVF_NPROBE: "1"
       IVF_BLOCKED_NPROBE: "2"
@@ -84,7 +84,7 @@ services:
 
   lb:
     image: jrblatt/so-no-forevis:v0.0.2
-    pull_policy: always
+    pull_policy: never
     cpuset: "2,3"
     security_opt:
       - seccomp=unconfined

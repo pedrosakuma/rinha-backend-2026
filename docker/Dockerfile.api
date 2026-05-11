@@ -6,6 +6,8 @@ ARG ASPNET_VERSION=10.0
 # 1. Build the .NET projects (AOT for the API)
 ############################
 FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION}-noble AS build
+ARG API_STRIP_SYMBOLS=true
+ENV API_STRIP_SYMBOLS=${API_STRIP_SYMBOLS}
 RUN sed -i 's|http://archive.ubuntu.com|http://br.archive.ubuntu.com|g; s|http://security.ubuntu.com|http://br.archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true; \
     apt-get update \
  && apt-get install -y --no-install-recommends clang zlib1g-dev \
@@ -16,7 +18,7 @@ COPY src/Api/Api.csproj src/Api/
 COPY src/Preprocessor/Preprocessor.csproj src/Preprocessor/
 RUN dotnet restore src/Api/Api.csproj && dotnet restore src/Preprocessor/Preprocessor.csproj
 COPY src/ ./src/
-RUN dotnet publish src/Api/Api.csproj -c Release -o /publish/api --no-restore -r linux-x64 \
+RUN dotnet publish src/Api/Api.csproj -c Release -o /publish/api --no-restore -r linux-x64 -p:StripSymbols=${API_STRIP_SYMBOLS:-true} \
  && dotnet publish src/Preprocessor/Preprocessor.csproj -c Release -o /publish/preprocessor --no-restore
 
 ############################
@@ -49,6 +51,11 @@ RUN dotnet /preprocessor/Rinha.Preprocessor.dll \
         /work/references_q16.bin \
         /work/references_q16_soa.bin \
         ${IVF_NLIST_BUILD:-256} 15 42 ${IVF_BAL_SLACK_BUILD:-0.0} \
+ && dotnet /preprocessor/Rinha.Preprocessor.dll --block \
+        /work/references_q16.bin \
+        /work/ivf_offsets.bin \
+        /work/references_q16_blocked.bin \
+        /work/ivf_block_offsets.bin \
  && rm /work/references.json.gz
 
 ############################
@@ -71,6 +78,8 @@ ENV DOTNET_EnableDiagnostics=0 \
     VECTORS_Q8_SOA_PATH=/data/references_q8_soa.bin \
     VECTORS_Q16_PATH=/data/references_q16.bin \
     VECTORS_Q16_SOA_PATH=/data/references_q16_soa.bin \
+    VECTORS_Q16_BLOCKED_PATH=/data/references_q16_blocked.bin \
+    IVF_BLOCK_OFFSETS_PATH=/data/ivf_block_offsets.bin \
     IVF_CENTROIDS_PATH=/data/ivf_centroids.bin \
     IVF_OFFSETS_PATH=/data/ivf_offsets.bin \
     IVF_BBOX_MIN_PATH=/data/ivf_bbox_min.bin \
@@ -86,6 +95,8 @@ COPY --from=dataprep /work/references_q8.bin /data/references_q8.bin
 COPY --from=dataprep /work/references_q8_soa.bin /data/references_q8_soa.bin
 COPY --from=dataprep /work/references_q16.bin /data/references_q16.bin
 COPY --from=dataprep /work/references_q16_soa.bin /data/references_q16_soa.bin
+COPY --from=dataprep /work/references_q16_blocked.bin /data/references_q16_blocked.bin
+COPY --from=dataprep /work/ivf_block_offsets.bin /data/ivf_block_offsets.bin
 COPY --from=dataprep /work/ivf_centroids.bin /data/ivf_centroids.bin
 COPY --from=dataprep /work/ivf_offsets.bin /data/ivf_offsets.bin
 COPY --from=dataprep /work/ivf_bbox_min.bin /data/ivf_bbox_min.bin
