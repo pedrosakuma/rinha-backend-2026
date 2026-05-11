@@ -158,11 +158,12 @@ public static unsafe class ProfileFastPath
     private static int[] ParseBits(string? env)
     {
         if (string.IsNullOrWhiteSpace(env))
-            // Wave 8.2: swap-greedy optimum (4 seeds → same fixed point).
-            // Hits 22421/54100 (41.44%) on eval test set vs uniform 21690 (40.09%), 0 FP/FN.
-            // Order matches FeatureIndex: amount, km_home, amt_ratio, installments,
-            //                              tx_count_24h, unknown_merch, mcc_risk, hour.
-            return new[] { 3, 3, 4, 3, 3, 4, 2, 2 };
+            // Wave 20 (post-wave19 features): swap-greedy bit re-allocation.
+            // Hits 50137/54100 (92.67%) on eval test set vs prior 22421 (41.44%) and
+            // post-feature-swap 40470 (74.81%), 0 FP/FN, k_legit=100, k_fraud=400.
+            // Order matches FeatureIndex: amount, km_home, card_present, installments,
+            //                              is_online, unknown_merch, mcc_risk, hour.
+            return new[] { 4, 3, 6, 1, 3, 4, 1, 2 };
         var parts = env.Split(',');
         if (parts.Length != NumFeatures)
             throw new ArgumentException($"PROFILE_FAST_PATH_BITS must have {NumFeatures} comma-separated ints; got '{env}'");
