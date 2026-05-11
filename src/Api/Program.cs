@@ -172,14 +172,22 @@ if (Environment.GetEnvironmentVariable("RAW_HTTP") == "1")
     return; // never reached, but lets the compiler see the method ends.
 }
 
-app.MapGet("/ready", () => Results.Ok());
+// Use legacy path-branching (UseExtensions.Map, NOT IEndpointRouteBuilder.Map):
+// terminates the pipeline by path prefix without invoking EndpointRoutingMiddleware
+// or EndpointMiddleware. Profile (wave 22) showed those + RhpInterfaceDispatch1
+// at ~1.5% combined CPU; this branch dispatches directly.
+app.Map("/ready", branch => branch.Run(ctx =>
+{
+    ctx.Response.StatusCode = 200;
+    return Task.CompletedTask;
+}));
 
 // Hot path: bypass model binding entirely. Read raw body bytes via PipeReader,
 // parse straight into a Span<float>/Span<short>, then write the pre-baked response
 // directly to BodyWriter (PipeWriter) so Kestrel emits status+headers+body in one
 // chunk (one sendmsg). Combined with TCP_NODELAY this avoids both Nagle stalls
 // and split sends.
-app.MapPost("/fraud-score", async (HttpContext ctx) =>
+app.Map("/fraud-score", branch => branch.Run(async ctx =>
 {
     var pipe = ctx.Request.BodyReader;
     var contentLength = ctx.Request.ContentLength ?? 0;
@@ -249,7 +257,7 @@ app.MapPost("/fraud-score", async (HttpContext ctx) =>
     writer.Write(body);
     var ft = writer.FlushAsync();
     if (!ft.IsCompletedSuccessfully) await ft.ConfigureAwait(false);
-});
+}));
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
