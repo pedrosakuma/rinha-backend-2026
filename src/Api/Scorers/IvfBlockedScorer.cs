@@ -66,13 +66,27 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
             throw new ArgumentException("Query vector too small", nameof(query));
 
         int nlist = _dataset.NumCells;
-        Span<float> centDist = stackalloc float[512];
-        if (nlist > 512) centDist = new float[nlist];
+        // centDist only needed by the _fastGate branch (default off).
+        // Skip its 4KB array+population in the common path.
+        bool needCentDist = _fastGate;
+        Span<float> centDist = needCentDist ? stackalloc float[2048] : Span<float>.Empty;
+        if (needCentDist && nlist > 2048) centDist = new float[nlist];
         Span<float> qfPad = stackalloc float[PaddedDimensions];
         for (int i = 0; i < Dimensions; i++) qfPad[i] = query[i];
 
-        // 1) Centroid distances (AoS centroids: 16 floats per centroid).
+        // 1+2) Centroid distance pass MERGED with top-N FAST cell selection.
+        // Single sweep over centroids: compute squared L2 in SIMD, immediately
+        // insert into the top-N (typically N=1) tracker. Saves the second pass
+        // over centDist[] and lets us skip the centDist array entirely when the
+        // fast-gate cascade isn't active.
+        int n = _nProbe;
+        Span<int> cells = stackalloc int[n];
+        Span<float> cellsDist = stackalloc float[n];
+        for (int i = 0; i < n; i++) { cells[i] = -1; cellsDist[i] = float.PositiveInfinity; }
+        float cellsWorst = float.PositiveInfinity;
+
         fixed (float* qPtr = qfPad)
+        fixed (float* cdPtr = centDist)
         {
             var q0 = Vector256.Load(qPtr);
             var q1 = Vector256.Load(qPtr + 8);
@@ -85,27 +99,17 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                 var d0 = k0 - q0;
                 var d1 = k1 - q1;
                 var s = (d0 * d0) + (d1 * d1);
-                centDist[c] = Vector256.Sum(s);
-            }
-        }
-
-        // 2) Top-N FAST cells.
-        int n = _nProbe;
-        Span<int> cells = stackalloc int[n];
-        Span<float> cellsDist = stackalloc float[n];
-        for (int i = 0; i < n; i++) { cells[i] = -1; cellsDist[i] = float.PositiveInfinity; }
-        float cellsWorst = float.PositiveInfinity;
-        for (int c = 0; c < nlist; c++)
-        {
-            float d = centDist[c];
-            if (d < cellsWorst)
-            {
-                int pos = n - 1;
-                while (pos > 0 && cellsDist[pos - 1] > d) pos--;
-                for (int j = n - 1; j > pos; j--) { cellsDist[j] = cellsDist[j - 1]; cells[j] = cells[j - 1]; }
-                cellsDist[pos] = d;
-                cells[pos] = c;
-                cellsWorst = cellsDist[n - 1];
+                float d = Vector256.Sum(s);
+                if (needCentDist) cdPtr[c] = d;
+                if (d < cellsWorst)
+                {
+                    int pos = n - 1;
+                    while (pos > 0 && cellsDist[pos - 1] > d) pos--;
+                    for (int j = n - 1; j > pos; j--) { cellsDist[j] = cellsDist[j - 1]; cells[j] = cells[j - 1]; }
+                    cellsDist[pos] = d;
+                    cells[pos] = c;
+                    cellsWorst = cellsDist[n - 1];
+                }
             }
         }
 
