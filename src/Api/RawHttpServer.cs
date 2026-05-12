@@ -273,12 +273,15 @@ internal static class RawHttpServer
                 // Vectorize once; produce both float (for fast-path lookup) and Q16 (for
                 // the integer scorer fast-path). Cost over Q16-only is one extra multiply per dim.
                 bool fastEnabled = ProfileFastPath.IsEnabled;
-                if (fastEnabled)
+                bool fast2Enabled = ProfileFastPath2.IsEnabled;
+                if (fastEnabled || fast2Enabled)
                     vectorizer.VectorizeJson(body, queryFloat, queryQ16);
                 else
                     vectorizer.VectorizeJsonQ16(body, queryQ16);
 
                 byte fp = fastEnabled ? ProfileFastPath.TryLookup(queryFloat) : ProfileFastPath.ResultUndecided;
+                if (fp == ProfileFastPath.ResultUndecided && fast2Enabled)
+                    fp = ProfileFastPath2.TryLookup(queryFloat);
                 if      (fp == ProfileFastPath.ResultLegit) fraudCount = 0;
                 else if (fp == ProfileFastPath.ResultFraud) fraudCount = 5;
                 else

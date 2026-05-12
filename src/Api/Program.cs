@@ -102,6 +102,21 @@ IQ16FraudScorer? q16Scorer = scorer as IQ16FraudScorer;
 // observed on the eval test set. Disable with PROFILE_FAST_PATH=0.
 ProfileFastPath.Build(dataset);
 
+// Wave 29: 2nd-level fast-path. Attacks the residue (7.3%) that consumes 96% of
+// scorer CPU. Config in resources/profile_fastpath2.json (data-driven; no
+// thresholds in C#). Disable with PROFILE_FAST_PATH2=0.
+{
+    string fp2Cfg = Path.Combine(AppContext.BaseDirectory, "resources/profile_fastpath2.json");
+    if (!File.Exists(fp2Cfg))
+    {
+        // Walk up to repo root for dev runs.
+        string? r = AppContext.BaseDirectory;
+        while (r is not null && !File.Exists(Path.Combine(r, "Rinha.slnx"))) r = Path.GetDirectoryName(r);
+        if (r is not null) fp2Cfg = Path.Combine(r, "resources/profile_fastpath2.json");
+    }
+    ProfileFastPath2.Build(dataset, fp2Cfg);
+}
+
 // Pre-touch all mmap pages and run a JIT warm-up so the first user requests
 // don't pay page-fault or tier0->tier1 jit overhead. Disable with WARMUP=0.
 if (Environment.GetEnvironmentVariable("WARMUP") != "0")
@@ -207,7 +222,7 @@ app.Map("/fraud-score", branch => branch.Run(async ctx =>
     // Wave 8: fast-path needs the float vector (edges are in float space). We always
     // produce both float + Q16 from a single parse; the cost over Q16-only is one extra
     // multiply per dim (~10ns).
-    bool needFloat = !useQ16 || ProfileFastPath.IsEnabled;
+    bool needFloat = !useQ16 || ProfileFastPath.IsEnabled || ProfileFastPath2.IsEnabled;
     if (buffer.IsSingleSegment)
     {
         if (needFloat) jsonVectorizer.VectorizeJson(buffer.FirstSpan, query, queryQ16);
@@ -234,6 +249,8 @@ app.Map("/fraud-score", branch => branch.Run(async ctx =>
     // Wave 8: bucket fast-path. Returns 0 (undecided), 1 (pure-legit), 2 (pure-fraud).
     int idx;
     byte fp = ProfileFastPath.IsEnabled ? ProfileFastPath.TryLookup(query) : ProfileFastPath.ResultUndecided;
+    if (fp == ProfileFastPath.ResultUndecided && ProfileFastPath2.IsEnabled)
+        fp = ProfileFastPath2.TryLookup(query);
     if (fp == ProfileFastPath.ResultLegit)      idx = 0;
     else if (fp == ProfileFastPath.ResultFraud) idx = 5;
     else

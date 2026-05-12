@@ -26,6 +26,15 @@ if (args.Length > 0 && args[0] == "--sweep-fastpath")
 if (args.Length > 0 && args[0] == "--probe-fastpath-features")
     return Rinha.Bench.ProbeFastPathFeatures.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--perf-families")
+    return Rinha.Bench.PerfFamilies.Run(args[1..]);
+
+if (args.Length > 0 && args[0] == "--fraud-miss-analysis")
+    return Rinha.Bench.FraudMissAnalysis.Run(args[1..]);
+
+if (args.Length > 0 && args[0] == "--build-fastpath2")
+    return Rinha.Bench.BuildFastPath2.Run(args[1..]);
+
 if (args.Length > 0 && args[0] == "--http")
     return Rinha.Bench.HttpTiming.Run(args[1..]);
 
