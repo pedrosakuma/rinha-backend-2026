@@ -200,18 +200,29 @@ app.Map("/ready", branch => branch.Run(ctx =>
 // directly to BodyWriter (PipeWriter) so Kestrel emits status+headers+body in one
 // chunk (one sendmsg). Combined with TCP_NODELAY this avoids both Nagle stalls
 // and split sends.
-app.Map("/fraud-score", branch => branch.Run(async ctx =>
+//
+// No `async` on the outer handler — for ~500B bodies on UDS the PipeReader already
+// has data when the handler is invoked, so ReadAsync completes synchronously.
+// Keeping the hot path free of async avoids per-request state machine allocations.
+// The rare case (multi-read or async flush) falls through to an async local function.
+app.Map("/fraud-score", branch => branch.Run(ctx =>
 {
     var pipe = ctx.Request.BodyReader;
     var contentLength = ctx.Request.ContentLength ?? 0;
-    // Pull until we have the full body or the pipe completes.
-    ReadResult rr;
-    while (true)
+
+    // Fast path: body is already buffered in the pipe (single synchronous read).
+    var readVt = pipe.ReadAsync();
+    if (!readVt.IsCompletedSuccessfully)
+        return FraudScoreSlowAsync(ctx, pipe, contentLength);
+
+    var rr = readVt.Result;
+    if (rr.Buffer.Length < contentLength && !rr.IsCompleted)
     {
-        rr = await pipe.ReadAsync();
-        if (rr.Buffer.Length >= contentLength || rr.IsCompleted) break;
         pipe.AdvanceTo(rr.Buffer.Start, rr.Buffer.End);
+        return FraudScoreSlowAsync(ctx, pipe, contentLength);
     }
+
+    // Zero-alloc synchronous hot path — no state machine, no heap allocations.
     var buffer = rr.Buffer;
 
     Span<float> query = stackalloc float[Dataset.Dimensions];
@@ -272,7 +283,67 @@ app.Map("/fraud-score", branch => branch.Run(async ctx =>
     var writer = resp.BodyWriter;
     writer.Write(body);
     var ft = writer.FlushAsync();
-    if (!ft.IsCompletedSuccessfully) await ft.ConfigureAwait(false);
+    return ft.IsCompletedSuccessfully ? Task.CompletedTask : ft.AsTask();
+
+    // Slow path: body spans multiple pipe segments or ReadAsync didn't complete
+    // synchronously. Allocates a state machine, but this is rare in practice.
+    async Task FraudScoreSlowAsync(HttpContext slowCtx, PipeReader slowPipe, long slowContentLen)
+    {
+        ReadResult srr;
+        while (true)
+        {
+            srr = await slowPipe.ReadAsync();
+            if (srr.Buffer.Length >= slowContentLen || srr.IsCompleted) break;
+            slowPipe.AdvanceTo(srr.Buffer.Start, srr.Buffer.End);
+        }
+        var sbuffer = srr.Buffer;
+
+        // stackalloc is valid here: spans are created after the last ReadAsync await
+        // and consumed before the FlushAsync await, so they don't cross a suspension.
+        Span<float> squery = stackalloc float[Dataset.Dimensions];
+        Span<short> squeryQ16 = stackalloc short[Dataset.Dimensions];
+        bool suseQ16 = q16Scorer is not null;
+        bool sneedFloat = !suseQ16 || selectiveCascade.IsEnabled;
+        if (sbuffer.IsSingleSegment)
+        {
+            if (sneedFloat) jsonVectorizer.VectorizeJson(sbuffer.FirstSpan, squery, squeryQ16);
+            else            jsonVectorizer.VectorizeJsonQ16(sbuffer.FirstSpan, squeryQ16);
+        }
+        else
+        {
+            int slen = (int)sbuffer.Length;
+            if (slen > 8 * 1024) slen = 8 * 1024;
+            Span<byte> sscratch = stackalloc byte[8 * 1024];
+            var sslice = sbuffer.Slice(0, slen);
+            int sp = 0;
+            foreach (var seg in sslice) { seg.Span.CopyTo(sscratch[sp..]); sp += seg.Length; }
+            if (sneedFloat) jsonVectorizer.VectorizeJson(sscratch[..slen], squery, squeryQ16);
+            else            jsonVectorizer.VectorizeJsonQ16(sscratch[..slen], squeryQ16);
+        }
+        slowPipe.AdvanceTo(sbuffer.End);
+
+        int sidx;
+        byte sselective = selectiveCascade.IsEnabled
+            ? selectiveCascade.TryLookup(squery)
+            : SelectiveDecisionCascade.ResultUndecided;
+        if (sselective != SelectiveDecisionCascade.ResultUndecided)
+            sidx = sselective;
+        else
+        {
+            float sscore = suseQ16 ? q16Scorer!.ScoreQ16(squeryQ16) : scorer.Score(squery);
+            sidx = PrecomputedFraudResponse.ScoreToIndex(sscore);
+        }
+
+        var sbody = PrecomputedFraudResponse.BodyForIndex(sidx).Span;
+        var sresp = slowCtx.Response;
+        sresp.StatusCode = 200;
+        sresp.ContentType = "application/json";
+        sresp.ContentLength = sbody.Length;
+        sresp.Headers.Date = default;
+        var swriter = sresp.BodyWriter;
+        swriter.Write(sbody);
+        await swriter.FlushAsync();
+    }
 }));
 
 app.Lifetime.ApplicationStarted.Register(() =>
