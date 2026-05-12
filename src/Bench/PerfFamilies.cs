@@ -57,8 +57,8 @@ public static class PerfFamilies
             File.Exists(Path.Combine(dataDir, "ivf_block_offsets.bin")) ? Path.Combine(dataDir, "ivf_block_offsets.bin") : null);
         Console.WriteLine($"Loaded {ds.Count} refs.");
 
-        ProfileFastPath.Build(ds);
-        ProfileFastPath2.Build(ds, Path.Combine(root, "resources/profile_fastpath2.json"));
+        var cascade = SelectiveDecisionCascade.Build(ds, Path.Combine(root, "resources/selective_decision_tables.json"));
+        var stages = cascade.Stages;
 
         int nProbeOverride = 2;
         foreach (var a in args)
@@ -115,18 +115,14 @@ public static class PerfFamilies
         }
 
         // Categorize each query.
-        // a) FastPath stage: 0=miss, 1=FP1, 2=FP2.
-        var fpStage = new byte[total];
+        // a) Selective decision stage: -1=miss, otherwise index into cascade.Stages.
+        var fpStage = new int[total];
+        Array.Fill(fpStage, -1);
         for (int q = 0; q < total; q++)
         {
-            var fp = ProfileFastPath.TryLookup(vecs[q]);
-            if (fp != ProfileFastPath.ResultUndecided)
-            {
-                fpStage[q] = 1;
-                continue;
-            }
-            if (ProfileFastPath2.IsEnabled && ProfileFastPath2.TryLookup(vecs[q]) != ProfileFastPath2.ResultUndecided)
-                fpStage[q] = 2;
+            byte result = cascade.TryLookupWithStage(vecs[q], out int stageIndex);
+            if (result != SelectiveDecisionCascade.ResultUndecided)
+                fpStage[q] = stageIndex;
         }
 
         // b) GT score bucket: 0/0.2/0.4/0.6/0.8/1.0
@@ -140,18 +136,15 @@ public static class PerfFamilies
         float q95 = missDists[(int)(missDists.Count * 0.95)];
 
         // Time each query (best-of-`repeats` to reduce TP/jitter noise).
-        // MIRROR PRODUCTION PIPELINE: FP1 -> FP2 -> IVF.
-        Console.WriteLine($"Timing {total} queries × {repeats} repeats (best-of), production pipeline (FP1→FP2→IVF)...");
+        // MIRROR PRODUCTION PIPELINE: SelectiveDecisionCascade -> IVF.
+        Console.WriteLine($"Timing {total} queries × {repeats} repeats (best-of), production pipeline (selective-decision-cascade→IVF)...");
         var perQueryTicks = new long[total];
         var sw = new Stopwatch();
 
         // Warmup
         for (int q = 0; q < Math.Min(2000, total); q++)
         {
-            var fp = ProfileFastPath.TryLookup(vecs[q]);
-            if (fp == ProfileFastPath.ResultUndecided && ProfileFastPath2.IsEnabled)
-                fp = ProfileFastPath2.TryLookup(vecs[q]);
-            if (fp == ProfileFastPath.ResultUndecided)
+            if (cascade.TryLookup(vecs[q]) == SelectiveDecisionCascade.ResultUndecided)
                 scorer.Score(vecs[q]);
         }
 
@@ -161,10 +154,7 @@ public static class PerfFamilies
             for (int r = 0; r < repeats; r++)
             {
                 sw.Restart();
-                var fp = ProfileFastPath.TryLookup(vecs[q]);
-                if (fp == ProfileFastPath.ResultUndecided && ProfileFastPath2.IsEnabled)
-                    fp = ProfileFastPath2.TryLookup(vecs[q]);
-                if (fp == ProfileFastPath.ResultUndecided)
+                if (cascade.TryLookup(vecs[q]) == SelectiveDecisionCascade.ResultUndecided)
                     scorer.Score(vecs[q]);
                 sw.Stop();
                 long t = sw.ElapsedTicks;
@@ -175,13 +165,15 @@ public static class PerfFamilies
         double tickToUs = 1_000_000.0 / Stopwatch.Frequency;
 
         // Aggregate by category.
-        // Family 1: FastPath stage
-        ReportFamily("FastPath stage", new (string label, Func<int, bool> sel)[]
+        // Family 1: Selective decision stage
+        var stageGroups = new List<(string label, Func<int, bool> sel)>();
+        for (int i = 0; i < stages.Count; i++)
         {
-            ("FP1 hit", q => fpStage[q] == 1),
-            ("FP2 hit", q => fpStage[q] == 2),
-            ("miss",    q => fpStage[q] == 0),
-        }, perQueryTicks, tickToUs);
+            int stage = i;
+            stageGroups.Add(($"{stages[i].Name} hit", q => fpStage[q] == stage));
+        }
+        stageGroups.Add(("miss", q => fpStage[q] < 0));
+        ReportFamily("Selective decision stage", stageGroups.ToArray(), perQueryTicks, tickToUs);
 
         // Family 2: GT score bucket
         ReportFamily("GT score", new (string, Func<int, bool>)[]
@@ -197,22 +189,22 @@ public static class PerfFamilies
         // Family 3: nearest-centroid distance (only meaningful for misses; hits short-circuit)
         ReportFamily("Nearest centroid (miss-only)", new (string, Func<int, bool>)[]
         {
-            ("miss & d2≤Q25",       q => fpStage[q] == 0 && nearestDist[q] <= q25),
-            ("miss & Q25<d2≤Q50",   q => fpStage[q] == 0 && nearestDist[q] > q25 && nearestDist[q] <= q50),
-            ("miss & Q50<d2≤Q75",   q => fpStage[q] == 0 && nearestDist[q] > q50 && nearestDist[q] <= q75),
-            ("miss & Q75<d2≤Q95",   q => fpStage[q] == 0 && nearestDist[q] > q75 && nearestDist[q] <= q95),
-            ("miss & d2>Q95 (tail)", q => fpStage[q] == 0 && nearestDist[q] > q95),
+            ("miss & d2≤Q25",       q => fpStage[q] < 0 && nearestDist[q] <= q25),
+            ("miss & Q25<d2≤Q50",   q => fpStage[q] < 0 && nearestDist[q] > q25 && nearestDist[q] <= q50),
+            ("miss & Q50<d2≤Q75",   q => fpStage[q] < 0 && nearestDist[q] > q50 && nearestDist[q] <= q75),
+            ("miss & Q75<d2≤Q95",   q => fpStage[q] < 0 && nearestDist[q] > q75 && nearestDist[q] <= q95),
+            ("miss & d2>Q95 (tail)", q => fpStage[q] < 0 && nearestDist[q] > q95),
         }, perQueryTicks, tickToUs);
 
         // Family 4: GT score within MISS only (since hits dominate the "easy" buckets)
         ReportFamily("GT score (miss-only)", new (string, Func<int, bool>)[]
         {
-            ("miss & 0.0", q => fpStage[q] == 0 && gtScore[q] < 0.1f),
-            ("miss & 0.2", q => fpStage[q] == 0 && gtScore[q] >= 0.1f && gtScore[q] < 0.3f),
-            ("miss & 0.4", q => fpStage[q] == 0 && gtScore[q] >= 0.3f && gtScore[q] < 0.5f),
-            ("miss & 0.6", q => fpStage[q] == 0 && gtScore[q] >= 0.5f && gtScore[q] < 0.7f),
-            ("miss & 0.8", q => fpStage[q] == 0 && gtScore[q] >= 0.7f && gtScore[q] < 0.9f),
-            ("miss & 1.0", q => fpStage[q] == 0 && gtScore[q] >= 0.9f),
+            ("miss & 0.0", q => fpStage[q] < 0 && gtScore[q] < 0.1f),
+            ("miss & 0.2", q => fpStage[q] < 0 && gtScore[q] >= 0.1f && gtScore[q] < 0.3f),
+            ("miss & 0.4", q => fpStage[q] < 0 && gtScore[q] >= 0.3f && gtScore[q] < 0.5f),
+            ("miss & 0.6", q => fpStage[q] < 0 && gtScore[q] >= 0.5f && gtScore[q] < 0.7f),
+            ("miss & 0.8", q => fpStage[q] < 0 && gtScore[q] >= 0.7f && gtScore[q] < 0.9f),
+            ("miss & 1.0", q => fpStage[q] < 0 && gtScore[q] >= 0.9f),
         }, perQueryTicks, tickToUs);
 
         // Top 1% offenders — what's special about them?
@@ -224,7 +216,7 @@ public static class PerfFamilies
         for (int i = 0; i < topN; i++)
         {
             int q = sortedIdx[i];
-            if (fpStage[q] != 0) topHits++;
+            if (fpStage[q] >= 0) topHits++;
             topD2 += nearestDist[q];
             int b = (int)Math.Round(gtScore[q] * 5f);
             if (b >= 0 && b <= 5) topGt[b == 1 || b == 0 ? Math.Min(b, 5) : b]++;

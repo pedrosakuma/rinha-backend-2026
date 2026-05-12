@@ -24,6 +24,36 @@ Score n=10: **5708 σ=44 p99=1.96ms fn=0** em 1.00 vCPU / 350MB total
 | `IVF_Q16` | `1` | 0/1 | Rerank em int16 (AVX2 pmaddwd, 16 lanes). Default-on quando `references_q16.bin` existe. |
 | `SCORER` | `ivf` | `ivf`, `q8recheck`, `bruteforce` | Algoritmo. Histórico — `ivf` é o único usado em prod. |
 
+## Selective Decision Cascade
+
+Os antigos `ProfileFastPath`/`ProfileFastPath2` agora são tratados como
+**Selective Decision Tables**: tabelas de decisão com abstention. Cada stage
+retorna `fraud_count` apenas quando o bucket é considerado seguro; caso
+contrário cai para o próximo stage ou para o scorer IVF.
+
+| Env | Default | O que faz |
+|-----|--------:|---|
+| `SELECTIVE_DECISION_REFERENCE_1` (`PROFILE_FAST_PATH`) | `1` | Stage `reference-purity-1`, treinado em pureza de `references.bin/labels.bin`. |
+| `SELECTIVE_DECISION_REFERENCE_2` (`PROFILE_FAST_PATH2`) | `1` | Stage `reference-purity-2`, também treinado em pureza dos references. |
+| `SELECTIVE_DECISION_RESIDUAL_MODAL` (`PROFILE_FAST_PATH3`) | `0` | Stage experimental `residual-modal`, treinado em buckets do resíduo de queries. Opt-in por risco de overfit/transdutivo. |
+
+Config runtime: `resources/selective_decision_tables.json`.
+
+Retrain reprodutível:
+
+```bash
+dotnet src/Bench/bin/Release/net10.0/Rinha.Bench.dll \
+  --build-selective-tables \
+  --data-dir=/tmp/rinha-fp2-data \
+  --train-queries=/path/to/train-data.json \
+  --validation-queries=/path/to/validation-data.json \
+  --out=resources/selective_decision_tables.json
+```
+
+O output registra hashes de train/validation, parâmetros dos stages e métricas
+de validação. Se `--validation-queries` não for informado, o builder marca
+`validation_mode=same_set`; use apenas para reprodução/experimento.
+
 ## Knobs experimentais (toggles default OFF)
 
 Mantidos para reproduzir investigações; não habilitar em prod sem bench:
@@ -81,3 +111,24 @@ Mantidos para reproduzir investigações; não habilitar em prod sem bench:
 | `IVF_NLIST_BUILD` | `256` | nº de cells. Mexer requer rebuild. |
 | `IVF_HEAVY_SPLIT_MAX` | `0` | cap de rows/cell (split em sub-cells). Testado=20000 → -90 pts (rejeitado) |
 | `IVF_BAL_SLACK_BUILD` | `0.0` | balance constraint k-means. Não testado nesta sessão. |
+
+## Profiling com perf sidecar
+
+No Docker Desktop/WSL, os PIDs reais dos containers vivem na VM do Docker. Use
+o sidecar privilegiado para gravar samples no namespace de PIDs da VM:
+
+```bash
+BUILD_API_IMAGE=1 PROFILE_SECONDS=45 K6_DURATION=45s K6_TARGET=900 \
+  bench/profile-perf-sidecar.sh
+```
+
+O script gera `perf.data`, `perf-report.txt`, `perf-report-children.txt` e o
+resultado do k6 em `/tmp/rinha-prof/<timestamp>`. `BUILD_API_IMAGE=1` builda a
+API com `API_STRIP_SYMBOLS=false` e `IVF_NLIST_BUILD=1024` para ter símbolos e
+manter o layout do eval atual. Por padrão, o sidecar usa `--pid=host` e
+`--cgroupns=host` e captura `PERF_SCOPE=system`, porque no WSL/Docker Desktop o
+filtro por cgroup subconta threads do .NET. Além do report global, ele gera
+`perf-report-dotnet.txt`, `perf-report-rinha-dso.txt` e `perf-report-lb.txt`
+com filtros úteis. Também há `PERF_SCOPE=cgroup`, `PERF_SCOPE=tid`,
+`PERF_SCOPE=pid-system` e `PERF_SCOPE=pid` para investigações específicas; use
+`PERF_CGROUP=...` para apontar um cgroup único customizado.

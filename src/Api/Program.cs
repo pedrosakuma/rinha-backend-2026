@@ -97,25 +97,7 @@ IFraudScorer scorer = ScorerFactory.Create(scorerName, dataset);
 // vectorize straight to short and skip the round+cast inside the scorer.
 IQ16FraudScorer? q16Scorer = scorer as IQ16FraudScorer;
 
-// Wave 8: build the bucket fast-path table from the 3M references. ~1s startup,
-// ~16 MiB RAM. Lookup short-circuits ~42% of /fraud-score requests with 0 errors
-// observed on the eval test set. Disable with PROFILE_FAST_PATH=0.
-ProfileFastPath.Build(dataset);
-
-// Wave 29: 2nd-level fast-path. Attacks the residue (7.3%) that consumes 96% of
-// scorer CPU. Config in resources/profile_fastpath2.json (data-driven; no
-// thresholds in C#). Disable with PROFILE_FAST_PATH2=0.
-{
-    string fp2Cfg = Path.Combine(AppContext.BaseDirectory, "resources/profile_fastpath2.json");
-    if (!File.Exists(fp2Cfg))
-    {
-        // Walk up to repo root for dev runs.
-        string? r = AppContext.BaseDirectory;
-        while (r is not null && !File.Exists(Path.Combine(r, "Rinha.slnx"))) r = Path.GetDirectoryName(r);
-        if (r is not null) fp2Cfg = Path.Combine(r, "resources/profile_fastpath2.json");
-    }
-    ProfileFastPath2.Build(dataset, fp2Cfg);
-}
+var selectiveCascade = SelectiveDecisionCascade.Build(dataset, ResolveResourcePath("selective_decision_tables.json"));
 
 // Pre-touch all mmap pages and run a JIT warm-up so the first user requests
 // don't pay page-fault or tier0->tier1 jit overhead. Disable with WARMUP=0.
@@ -183,7 +165,7 @@ if (Environment.GetEnvironmentVariable("RAW_HTTP") == "1")
     var ivf = dataset.HasIvf ? $" IVF: {dataset.NumCells} cells." : "";
     Console.WriteLine($"Ready (raw-http). Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}. SIMD: {simd}.{ivf}");
 
-    Rinha.Api.RawHttpServer.Run(rawUds, scorer, jsonVectorizer);
+    Rinha.Api.RawHttpServer.Run(rawUds, scorer, jsonVectorizer, selectiveCascade);
     return; // never reached, but lets the compiler see the method ends.
 }
 
@@ -222,7 +204,7 @@ app.Map("/fraud-score", branch => branch.Run(async ctx =>
     // Wave 8: fast-path needs the float vector (edges are in float space). We always
     // produce both float + Q16 from a single parse; the cost over Q16-only is one extra
     // multiply per dim (~10ns).
-    bool needFloat = !useQ16 || ProfileFastPath.IsEnabled || ProfileFastPath2.IsEnabled;
+    bool needFloat = !useQ16 || selectiveCascade.IsEnabled;
     if (buffer.IsSingleSegment)
     {
         if (needFloat) jsonVectorizer.VectorizeJson(buffer.FirstSpan, query, queryQ16);
@@ -246,13 +228,14 @@ app.Map("/fraud-score", branch => branch.Run(async ctx =>
     }
     pipe.AdvanceTo(buffer.End);
 
-    // Wave 8: bucket fast-path. Returns 0 (undecided), 1 (pure-legit), 2 (pure-fraud).
     int idx;
-    byte fp = ProfileFastPath.IsEnabled ? ProfileFastPath.TryLookup(query) : ProfileFastPath.ResultUndecided;
-    if (fp == ProfileFastPath.ResultUndecided && ProfileFastPath2.IsEnabled)
-        fp = ProfileFastPath2.TryLookup(query);
-    if (fp == ProfileFastPath.ResultLegit)      idx = 0;
-    else if (fp == ProfileFastPath.ResultFraud) idx = 5;
+    byte selective = selectiveCascade.IsEnabled
+        ? selectiveCascade.TryLookup(query)
+        : SelectiveDecisionCascade.ResultUndecided;
+    if (selective != SelectiveDecisionCascade.ResultUndecided)
+    {
+        idx = selective;
+    }
     else
     {
         float score = useQ16 ? q16Scorer!.ScoreQ16(queryQ16) : scorer.Score(query);
@@ -299,3 +282,14 @@ app.Lifetime.ApplicationStarted.Register(() =>
 });
 
 app.Run();
+
+static string ResolveResourcePath(string fileName)
+{
+    string path = Path.Combine(AppContext.BaseDirectory, "resources", fileName);
+    if (File.Exists(path)) return path;
+
+    string? root = AppContext.BaseDirectory;
+    while (root is not null && !File.Exists(Path.Combine(root, "Rinha.slnx")))
+        root = Path.GetDirectoryName(root);
+    return root is null ? path : Path.Combine(root, "resources", fileName);
+}

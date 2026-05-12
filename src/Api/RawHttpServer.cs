@@ -55,7 +55,7 @@ internal static class RawHttpServer
     private static int _keepAliveMax;       // 0 = unlimited; otherwise close after N requests on the same conn.
     private static int _recvTimeoutMs;      // 0 = no timeout; otherwise SO_RCVTIMEO on accepted sockets.
 
-    public static void Run(string udsPath, IFraudScorer scorer, JsonVectorizer vectorizer)
+    public static void Run(string udsPath, IFraudScorer scorer, JsonVectorizer vectorizer, SelectiveDecisionCascade selectiveCascade)
     {
         if (File.Exists(udsPath)) File.Delete(udsPath);
         var dir = Path.GetDirectoryName(udsPath);
@@ -83,7 +83,7 @@ internal static class RawHttpServer
 
         Console.WriteLine($"RawHttpServer: listening on unix:{udsPath}, accept_threads={workers}, keepalive_max={_keepAliveMax}, recv_timeout_ms={_recvTimeoutMs}");
 
-        var ctx = new AcceptContext(listener, scorer, vectorizer);
+        var ctx = new AcceptContext(listener, scorer, vectorizer, selectiveCascade);
 
         for (int i = 1; i < workers; i++)
         {
@@ -103,7 +103,8 @@ internal static class RawHttpServer
         public readonly Socket Listener;
         public readonly IFraudScorer Scorer;
         public readonly JsonVectorizer Vectorizer;
-        public AcceptContext(Socket l, IFraudScorer s, JsonVectorizer v) { Listener = l; Scorer = s; Vectorizer = v; }
+        public readonly SelectiveDecisionCascade SelectiveCascade;
+        public AcceptContext(Socket l, IFraudScorer s, JsonVectorizer v, SelectiveDecisionCascade c) { Listener = l; Scorer = s; Vectorizer = v; SelectiveCascade = c; }
     }
 
     private sealed class ConnectionState
@@ -111,7 +112,8 @@ internal static class RawHttpServer
         public readonly Socket Socket;
         public readonly IFraudScorer Scorer;
         public readonly JsonVectorizer Vectorizer;
-        public ConnectionState(Socket s, IFraudScorer sc, JsonVectorizer v) { Socket = s; Scorer = sc; Vectorizer = v; }
+        public readonly SelectiveDecisionCascade SelectiveCascade;
+        public ConnectionState(Socket s, IFraudScorer sc, JsonVectorizer v, SelectiveDecisionCascade c) { Socket = s; Scorer = sc; Vectorizer = v; SelectiveCascade = c; }
     }
 
     private static readonly Action<ConnectionState> s_handleConnectionDelegate = HandleConnectionTp;
@@ -140,18 +142,18 @@ internal static class RawHttpServer
             // Hand the socket off to the CLR ThreadPool; accept thread loops back immediately.
             ThreadPool.UnsafeQueueUserWorkItem(
                 s_handleConnectionDelegate,
-                new ConnectionState(conn, ctx.Scorer, ctx.Vectorizer),
+                new ConnectionState(conn, ctx.Scorer, ctx.Vectorizer, ctx.SelectiveCascade),
                 preferLocal: false);
         }
     }
 
     private static void HandleConnectionTp(ConnectionState state)
-        => HandleConnection(state.Socket, state.Scorer, state.Vectorizer);
+        => HandleConnection(state.Socket, state.Scorer, state.Vectorizer, state.SelectiveCascade);
 
     private static int ParseInt(string? s, int fallback)
         => int.TryParse(s, out var v) ? v : fallback;
 
-    private static void HandleConnection(Socket socket, IFraudScorer scorer, JsonVectorizer vectorizer)
+    private static void HandleConnection(Socket socket, IFraudScorer scorer, JsonVectorizer vectorizer, SelectiveDecisionCascade selectiveCascade)
     {
         int keepAliveMax = _keepAliveMax;
         try
@@ -183,7 +185,7 @@ internal static class RawHttpServer
                 }
 
                 int reqLen = headerEnd + 4 + contentLength;
-                HandleRequest(s, buf[..reqLen], headerEnd, contentLength, scorer, vectorizer);
+                HandleRequest(s, buf[..reqLen], headerEnd, contentLength, scorer, vectorizer, selectiveCascade);
                 requestCount++;
 
                 // Pipeline: shift any bytes belonging to the next request to the front.
@@ -259,7 +261,8 @@ internal static class RawHttpServer
         int headerEnd,
         int contentLength,
         IFraudScorer scorer,
-        JsonVectorizer vectorizer)
+        JsonVectorizer vectorizer,
+        SelectiveDecisionCascade selectiveCascade)
     {
         // Happy path: POST /fraud-score (with or without space/?/HTTP-version after).
         if (request.StartsWith("POST /fraud-score"u8))
@@ -270,20 +273,21 @@ internal static class RawHttpServer
                 var body = request.Slice(headerEnd + 4, contentLength);
                 Span<short> queryQ16 = stackalloc short[Dataset.Dimensions];
                 Span<float> queryFloat = stackalloc float[Dataset.Dimensions];
-                // Vectorize once; produce both float (for fast-path lookup) and Q16 (for
+                // Vectorize once; produce both float (for selective table lookup) and Q16 (for
                 // the integer scorer fast-path). Cost over Q16-only is one extra multiply per dim.
-                bool fastEnabled = ProfileFastPath.IsEnabled;
-                bool fast2Enabled = ProfileFastPath2.IsEnabled;
-                if (fastEnabled || fast2Enabled)
+                bool selectiveEnabled = selectiveCascade.IsEnabled;
+                if (selectiveEnabled)
                     vectorizer.VectorizeJson(body, queryFloat, queryQ16);
                 else
                     vectorizer.VectorizeJsonQ16(body, queryQ16);
 
-                byte fp = fastEnabled ? ProfileFastPath.TryLookup(queryFloat) : ProfileFastPath.ResultUndecided;
-                if (fp == ProfileFastPath.ResultUndecided && fast2Enabled)
-                    fp = ProfileFastPath2.TryLookup(queryFloat);
-                if      (fp == ProfileFastPath.ResultLegit) fraudCount = 0;
-                else if (fp == ProfileFastPath.ResultFraud) fraudCount = 5;
+                byte selective = selectiveEnabled
+                    ? selectiveCascade.TryLookup(queryFloat)
+                    : SelectiveDecisionCascade.ResultUndecided;
+                if (selective != SelectiveDecisionCascade.ResultUndecided)
+                {
+                    fraudCount = selective;
+                }
                 else
                 {
                     fraudCount = scorer.ScoreCount(queryFloat);

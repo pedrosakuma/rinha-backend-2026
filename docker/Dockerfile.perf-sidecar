@@ -1,0 +1,14 @@
+FROM ubuntu:24.04
+
+ARG PERF_TOOLS_VERSION=6.8.0-111
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      linux-tools-${PERF_TOOLS_VERSION}-generic \
+      procps \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PERF_BIN=/usr/lib/linux-tools-${PERF_TOOLS_VERSION}/perf
+
+ENTRYPOINT ["/bin/bash", "-lc"]
