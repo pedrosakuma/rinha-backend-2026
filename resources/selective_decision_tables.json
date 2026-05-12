@@ -1,7 +1,7 @@
 {
   "version": 1,
   "training_set_id": "wave29-fp2-current",
-  "description": "Selective decision cascade: reference-purity stages are enabled by default; residual-modal is experimental and opt-in.",
+  "description": "Selective decision cascade: reference-purity stages are enabled by default; residual-modal is research-only, experimental, and not a supported performance path.",
   "artifacts": {
     "data_dir": "image:/data (IVF_NLIST_BUILD=1024)",
     "train_queries": "/tmp/rinha-eval/test/test-data.json",
@@ -49,6 +49,8 @@
       "enabled_by_default": false,
       "env_flags": ["SELECTIVE_DECISION_RESIDUAL_MODAL", "PROFILE_FAST_PATH3"],
       "risk_level": "high",
+      "performance_status": "not_recommended",
+      "performance_notes": "Azure A/B 2026-05-12: p50/p90 unchanged, p99 within noise, max tail worse; keep disabled for submissions.",
       "source": "FP1->FP2 residual query buckets over test-data.json (no request ids)",
       "feature_indices": [2, 0, 1, 12, 3],
       "feature_names": ["amt_ratio", "amt", "installments", "mcc_risk", "hour"],

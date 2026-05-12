@@ -35,7 +35,7 @@ contrário cai para o próximo stage ou para o scorer IVF.
 |-----|--------:|---|
 | `SELECTIVE_DECISION_REFERENCE_1` (`PROFILE_FAST_PATH`) | `1` | Stage `reference-purity-1`, treinado em pureza de `references.bin/labels.bin`. |
 | `SELECTIVE_DECISION_REFERENCE_2` (`PROFILE_FAST_PATH2`) | `1` | Stage `reference-purity-2`, também treinado em pureza dos references. |
-| `SELECTIVE_DECISION_RESIDUAL_MODAL` (`PROFILE_FAST_PATH3`) | `0` | Stage experimental `residual-modal`, treinado em buckets do resíduo de queries. Opt-in por risco de overfit/transdutivo. |
+| `SELECTIVE_DECISION_RESIDUAL_MODAL` (`PROFILE_FAST_PATH3`) | `0` | Stage experimental `residual-modal`, treinado em buckets do resíduo de queries. Research-only: opt-in por risco de overfit/transdutivo e sem ganho de perf material. |
 
 Config runtime: `resources/selective_decision_tables.json`.
 
@@ -53,6 +53,15 @@ dotnet src/Bench/bin/Release/net10.0/Rinha.Bench.dll \
 O output registra hashes de train/validation, parâmetros dos stages e métricas
 de validação. Se `--validation-queries` não for informado, o builder marca
 `validation_mode=same_set`; use apenas para reprodução/experimento.
+
+### Status do `residual-modal` / FP3
+
+O `residual-modal` não deve ser tratado como caminho de performance para
+submissão. No A/B da VM Azure (`/tmp/rinha-azure-fp3-ab-20260512T205458Z`),
+com 3 rounds official-like (~54k requests/round), ligar o stage manteve p50/p90
+iguais, reduziu p99 médio apenas de 0,69ms para 0,64ms (score local já saturado
+em 6000 nos dois casos) e piorou o `max` médio de 9,64ms para 12,68ms. Ele fica
+default-off para pesquisa/reprodutibilidade, não como otimização de produção.
 
 ## Knobs experimentais (toggles default OFF)
 
