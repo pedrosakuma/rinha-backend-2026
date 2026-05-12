@@ -135,7 +135,7 @@ if (int.TryParse(Environment.GetEnvironmentVariable("NO_GC_REGION"), out int noG
 {
     GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
     long budget = (long)noGcMb * 1024 * 1024;
-    bool entered = GC.TryStartNoGCRegion(budget, budget, induceCollection: false);
+    bool entered = GC.TryStartNoGCRegion(budget, budget);
     Console.WriteLine(entered
         ? $"GC: no-GC region entered ({noGcMb} MiB SOH + {noGcMb} MiB LOH). Effective only with zero-alloc hot path (RAW_HTTP=1)."
         : $"GC: TryStartNoGCRegion({noGcMb} MiB) failed — insufficient free heap; running under SustainedLowLatency instead.");
