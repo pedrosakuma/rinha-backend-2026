@@ -6,9 +6,9 @@ using Rinha.Api;
 namespace Rinha.Bench;
 
 /// <summary>
-/// Standalone audit: runs JsonVectorizer + ProfileFastPath against test-data.json
-/// using the EXACT production code path, reports FP/FN attributable to the fast-path,
-/// and prints the offending entries. Usage: --audit-fastpath [--min-count=100]
+/// Standalone audit: runs JsonVectorizer + ProfileFastPath/2 against test-data.json
+/// using the exact production fast-path order, reports FP/FN attributable to the
+/// fast-paths, and prints the offending entries. Usage: --audit-fastpath [--min-count=100]
 /// </summary>
 public static class AuditFastPath
 {
@@ -63,6 +63,11 @@ public static class AuditFastPath
         ProfileFastPath.Build(ds);
         Console.WriteLine($"FastPath: used={ProfileFastPath.UsedBuckets} legit={ProfileFastPath.DecidedLegit} fraud={ProfileFastPath.DecidedFraud}");
 
+        var fp2ConfigPath = Path.Combine(root, "resources/profile_fastpath2.json");
+        ProfileFastPath2.Build(ds, fp2ConfigPath);
+        if (ProfileFastPath2.IsEnabled)
+            Console.WriteLine($"FastPath2: used={ProfileFastPath2.UsedBuckets} legit={ProfileFastPath2.DecidedLegit} fraud={ProfileFastPath2.DecidedFraud}");
+
         var bytes = File.ReadAllBytes(testData);
         using var doc = JsonDocument.Parse(bytes);
         var entries = doc.RootElement.GetProperty("entries");
@@ -70,8 +75,8 @@ public static class AuditFastPath
         Console.WriteLine($"Auditing {total} entries...");
 
         var qBuf = new float[Dataset.Dimensions];
-        int hits = 0, fpFastPath = 0, fnFastPath = 0;
-        int fpDecidedFraud = 0, fnDecidedLegit = 0;
+        int hits = 0, fp1Hits = 0, fp2Hits = 0, fpFastPath = 0, fnFastPath = 0;
+        int fp1Errors = 0, fp2Errors = 0;
         int idx = 0;
         foreach (var entry in entries.EnumerateArray())
         {
@@ -82,28 +87,39 @@ public static class AuditFastPath
             bool expectedFraud = expectedFc >= 3; // approved threshold = score < 0.6 ⇒ score ≥ 0.6 = fraud
 
             byte fp = ProfileFastPath.TryLookup(qBuf);
+            bool fp2Hit = false;
+            if (fp != ProfileFastPath.ResultUndecided)
+            {
+                fp1Hits++;
+            }
+            else if (ProfileFastPath2.IsEnabled)
+            {
+                fp = ProfileFastPath2.TryLookup(qBuf);
+                fp2Hit = fp != ProfileFastPath2.ResultUndecided;
+                if (fp2Hit) fp2Hits++;
+            }
             if (fp == ProfileFastPath.ResultUndecided) { idx++; continue; }
             hits++;
             bool predFraud = fp == ProfileFastPath.ResultFraud;
             if (predFraud && !expectedFraud)
             {
                 fpFastPath++;
-                fpDecidedFraud++;
+                if (fp2Hit) fp2Errors++; else fp1Errors++;
                 var id = req.GetProperty("id").GetString();
-                Console.WriteLine($"FP @ idx={idx} id={id} expected={expectedFc} pred=fraud(5)");
+                Console.WriteLine($"FP @ idx={idx} id={id} source={(fp2Hit ? "fp2" : "fp1")} expected={expectedFc} pred=fraud(5)");
             }
             else if (!predFraud && expectedFraud)
             {
                 fnFastPath++;
-                fnDecidedLegit++;
+                if (fp2Hit) fp2Errors++; else fp1Errors++;
                 var id = req.GetProperty("id").GetString();
-                Console.WriteLine($"FN @ idx={idx} id={id} expected={expectedFc} pred=legit(0)");
+                Console.WriteLine($"FN @ idx={idx} id={id} source={(fp2Hit ? "fp2" : "fp1")} expected={expectedFc} pred=legit(0)");
             }
             idx++;
         }
 
         Console.WriteLine($"--- summary (min_count={minCount}, computed by Build) ---");
-        Console.WriteLine($"hits={hits}/{total} ({100.0*hits/total:F2}%)  FP={fpFastPath}  FN={fnFastPath}");
+        Console.WriteLine($"hits={hits}/{total} ({100.0*hits/total:F2}%)  fp1={fp1Hits}  fp2={fp2Hits}  FP={fpFastPath}  FN={fnFastPath}  fp1_errors={fp1Errors}  fp2_errors={fp2Errors}");
         return (fpFastPath + fnFastPath) > 0 ? 1 : 0;
     }
 }

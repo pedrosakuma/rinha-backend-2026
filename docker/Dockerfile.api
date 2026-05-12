@@ -89,6 +89,7 @@ ENV DOTNET_EnableDiagnostics=0 \
 COPY --from=build /publish/api/Rinha.Api /app/Rinha.Api
 COPY resources/mcc_risk.json /app/resources/mcc_risk.json
 COPY resources/normalization.json /app/resources/normalization.json
+COPY resources/profile_fastpath2.json /app/resources/profile_fastpath2.json
 COPY --from=dataprep /work/references.bin /data/references.bin
 COPY --from=dataprep /work/labels.bin /data/labels.bin
 COPY --from=dataprep /work/references_q8.bin /data/references_q8.bin

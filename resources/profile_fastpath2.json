@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "feature_indices": [5, 13, 6, 1, 12],
+  "feature_names": ["min_since_last", "merch_avg", "km_from_last", "installments", "mcc_risk"],
+  "bits": [4, 4, 4, 4, 4],
+  "k_fraud": 200,
+  "k_legit": 150,
+  "trained_on": "references.bin",
+  "validated_decided": 1006,
+  "validated_correct_fraud": 776,
+  "validated_correct_legit": 230,
+  "validated_wrong_fraud": 0,
+  "validated_wrong_legit": 0
+}
