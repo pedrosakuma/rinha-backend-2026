@@ -60,12 +60,53 @@ O `residual-modal` não deve ser tratado como caminho de performance para
 submissão. No A/B da VM Azure (`/tmp/rinha-azure-fp3-ab-20260512T205458Z`),
 com 3 rounds official-like (~54k requests/round), ligar o stage manteve p50/p90
 iguais, reduziu p99 médio apenas de 0,69ms para 0,64ms (score local já saturado
-em 6000 nos dois casos) e piorou o `max` médio de 9,64ms para 12,68ms. Ele fica
-default-off para pesquisa/reprodutibilidade, não como otimização de produção.
+em 6000 nos dois casos) e piorou o `max` médio de 9,64ms para 12,68ms. O max
+alto do round fp3-3 (17,75ms) foi concluído como **ruído de infraestrutura** —
+o round fp3-1 teve max=6,74ms (melhor de todos os 6 rounds), as rounds eram
+interleaved, e o warmup 60s antes do fp3-3 mostrou max=9,44ms normal (ver #12
+para análise completa).
+
+### Stage `reference-modal` (substituto experimental do FP3)
+
+Alternativa ao `residual-modal` treinada nos **dados de referência** (não nas
+queries de eval), eliminando o risco transdutivo. Para cada bucket FP1
+não-decidido (mixed), amostra reference points, roda o scorer IVF e toma o
+modal `fraud_count`; aceita o bucket se confiança ≥ threshold.
+
+| Env | Default | O que faz |
+|-----|--------:|---|
+| `SELECTIVE_DECISION_REFERENCE_MODAL` | `0` | Stage `reference-modal`, opt-in. Treinado em reference data, não em queries. |
+
+Geração (requer dataset + scorer disponíveis):
+
+```bash
+dotnet src/Bench/bin/Release/net10.0/Rinha.Bench.dll \
+  --build-reference-modal \
+  --data-dir=/path/to/data \
+  --scorer=ivf-blocked \
+  --sample=20 \
+  --confidence=0.80 \
+  --min-bucket=5 \
+  --test-data=bench/k6/test-data.json \
+  --out=resources/selective_decision_tables.json
+```
+
+O tool atualiza `selective_decision_tables.json` substituindo qualquer stage
+`residual-modal` ou `reference-modal` existente. Use `--standalone` para gerar
+apenas o fragmento JSON do novo stage. Após gerar, rode `--audit-fastpath` para
+verificar FP/FN/count_mismatches antes de habilitar em prod.
+
+**Risco**: o scorer IVF tem ~1% de recall loss; buckets de referência amostrados
+podem receber `fraud_count` levemente errado. Isso pode introduzir count
+mismatches. Avaliar com `--audit-fastpath` antes de ligar `enabled_by_default`.
 
 ## Knobs experimentais (toggles default OFF)
 
 Mantidos para reproduzir investigações; não habilitar em prod sem bench:
+
+| Env | Default | O que faz | Status |
+|-----|--------:|---|---|
+| `NO_GC_REGION` | `0` | MiB a reservar em `GC.TryStartNoGCRegion` após warmup. **Só eficaz com `RAW_HTTP=1`** (hot path zero-alloc via stackalloc). Com Kestrel (`RAW_HTTP=0`), async machinery aloca ~800B/request → ~43 MB em 120s, excede qualquer budget razoável e o runtime silenciosamente retorna ao GC normal. Exemplo: `NO_GC_REGION=20`. | Opt-in, RAW_HTTP=1 only |
 
 | Env | Default | O que faz | Status |
 |-----|--------:|---|---|

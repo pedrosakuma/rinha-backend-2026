@@ -125,6 +125,22 @@ if (Environment.GetEnvironmentVariable("WARMUP") != "0")
                       $"mlocked={dataset.LastMlockedBytes / (1024 * 1024)}MiB.");
 }
 
+// NO_GC_REGION=<megabytes>: after warmup, enter a no-GC region so the GC does not
+// interrupt requests during the eval window. Only safe with RAW_HTTP=1 (zero-alloc
+// hot path). With Kestrel (RAW_HTTP=0) the async machinery allocates ~800B/request
+// (~43 MB over 120s / 54k requests), which would exceed any practical budget and
+// silently fall back to normal GC anyway.
+// Example: NO_GC_REGION=20  (20 MiB is ample for the RAW_HTTP zero-alloc path)
+if (int.TryParse(Environment.GetEnvironmentVariable("NO_GC_REGION"), out int noGcMb) && noGcMb > 0)
+{
+    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+    long budget = (long)noGcMb * 1024 * 1024;
+    bool entered = GC.TryStartNoGCRegion(budget, budget, induceCollection: false);
+    Console.WriteLine(entered
+        ? $"GC: no-GC region entered ({noGcMb} MiB SOH + {noGcMb} MiB LOH). Effective only with zero-alloc hot path (RAW_HTTP=1)."
+        : $"GC: TryStartNoGCRegion({noGcMb} MiB) failed — insufficient free heap; running under SustainedLowLatency instead.");
+}
+
 var app = builder.Build();
 
 // RAW_HTTP=1: skip Kestrel/ASP.NET entirely. RawHttpServer takes over the same

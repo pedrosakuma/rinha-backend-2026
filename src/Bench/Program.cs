@@ -38,6 +38,9 @@ if (args.Length > 0 && args[0] == "--build-fastpath2")
 if (args.Length > 0 && args[0] == "--build-selective-tables")
     return Rinha.Bench.BuildSelectiveDecisionTables.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--build-reference-modal")
+    return Rinha.Bench.BuildReferenceModalTable.Run(args[1..]);
+
 if (args.Length > 0 && args[0] == "--http")
     return Rinha.Bench.HttpTiming.Run(args[1..]);
 
