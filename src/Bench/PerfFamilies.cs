@@ -22,11 +22,13 @@ public static class PerfFamilies
         string testData = "/tmp/rinha-eval/test/test-data.json";
         int repeats = 3;
         string? csvPath = null;
+        string? dataDirArg = null;
         foreach (var a in args)
         {
             if (a.StartsWith("--test-data=")) testData = a[12..];
             else if (a.StartsWith("--repeats=")) repeats = int.Parse(a[10..], CultureInfo.InvariantCulture);
             else if (a.StartsWith("--csv=")) csvPath = a[6..];
+            else if (a.StartsWith("--data-dir=")) dataDirArg = a[11..];
         }
 
         string root = AppContext.BaseDirectory;
@@ -38,7 +40,7 @@ public static class PerfFamilies
         var mcc = MccRiskTable.Load(Path.Combine(root, "resources/mcc_risk.json"));
         var jvec = new JsonVectorizer(norm, mcc);
 
-        var dataDir = Path.Combine(root, "data");
+        var dataDir = dataDirArg ?? Path.Combine(root, "data");
         Console.WriteLine($"Loading dataset from {dataDir}...");
         using var ds = Dataset.Open(
             Path.Combine(dataDir, "references.bin"),
@@ -56,6 +58,7 @@ public static class PerfFamilies
         Console.WriteLine($"Loaded {ds.Count} refs.");
 
         ProfileFastPath.Build(ds);
+        ProfileFastPath2.Build(ds, Path.Combine(root, "resources/profile_fastpath2.json"));
 
         int nProbeOverride = 2;
         foreach (var a in args)
@@ -112,15 +115,24 @@ public static class PerfFamilies
         }
 
         // Categorize each query.
-        // a) FastPath hit (boolean: did the cache decide it pre-IVF?)
-        var fpHit = new bool[total];
+        // a) FastPath stage: 0=miss, 1=FP1, 2=FP2.
+        var fpStage = new byte[total];
         for (int q = 0; q < total; q++)
-            fpHit[q] = ProfileFastPath.TryLookup(vecs[q]) != ProfileFastPath.ResultUndecided;
+        {
+            var fp = ProfileFastPath.TryLookup(vecs[q]);
+            if (fp != ProfileFastPath.ResultUndecided)
+            {
+                fpStage[q] = 1;
+                continue;
+            }
+            if (ProfileFastPath2.IsEnabled && ProfileFastPath2.TryLookup(vecs[q]) != ProfileFastPath2.ResultUndecided)
+                fpStage[q] = 2;
+        }
 
         // b) GT score bucket: 0/0.2/0.4/0.6/0.8/1.0
         // c) Nearest-centroid quartile (over MISS-only set, since hits don't run IVF)
         var missDists = new List<float>();
-        for (int q = 0; q < total; q++) if (!fpHit[q]) missDists.Add(nearestDist[q]);
+        for (int q = 0; q < total; q++) if (fpStage[q] == 0) missDists.Add(nearestDist[q]);
         missDists.Sort();
         float q25 = missDists[(int)(missDists.Count * 0.25)];
         float q50 = missDists[(int)(missDists.Count * 0.50)];
@@ -128,15 +140,18 @@ public static class PerfFamilies
         float q95 = missDists[(int)(missDists.Count * 0.95)];
 
         // Time each query (best-of-`repeats` to reduce TP/jitter noise).
-        // MIRROR PRODUCTION PIPELINE: TryLookup first; only run IVF on miss.
-        Console.WriteLine($"Timing {total} queries × {repeats} repeats (best-of), production pipeline (FP→IVF)...");
+        // MIRROR PRODUCTION PIPELINE: FP1 -> FP2 -> IVF.
+        Console.WriteLine($"Timing {total} queries × {repeats} repeats (best-of), production pipeline (FP1→FP2→IVF)...");
         var perQueryTicks = new long[total];
         var sw = new Stopwatch();
 
         // Warmup
         for (int q = 0; q < Math.Min(2000, total); q++)
         {
-            if (ProfileFastPath.TryLookup(vecs[q]) == ProfileFastPath.ResultUndecided)
+            var fp = ProfileFastPath.TryLookup(vecs[q]);
+            if (fp == ProfileFastPath.ResultUndecided && ProfileFastPath2.IsEnabled)
+                fp = ProfileFastPath2.TryLookup(vecs[q]);
+            if (fp == ProfileFastPath.ResultUndecided)
                 scorer.Score(vecs[q]);
         }
 
@@ -147,6 +162,8 @@ public static class PerfFamilies
             {
                 sw.Restart();
                 var fp = ProfileFastPath.TryLookup(vecs[q]);
+                if (fp == ProfileFastPath.ResultUndecided && ProfileFastPath2.IsEnabled)
+                    fp = ProfileFastPath2.TryLookup(vecs[q]);
                 if (fp == ProfileFastPath.ResultUndecided)
                     scorer.Score(vecs[q]);
                 sw.Stop();
@@ -158,11 +175,12 @@ public static class PerfFamilies
         double tickToUs = 1_000_000.0 / Stopwatch.Frequency;
 
         // Aggregate by category.
-        // Family 1: FastPath hit vs miss
-        ReportFamily("FastPath", new (string label, Func<int, bool> sel)[]
+        // Family 1: FastPath stage
+        ReportFamily("FastPath stage", new (string label, Func<int, bool> sel)[]
         {
-            ("hit",  q => fpHit[q]),
-            ("miss", q => !fpHit[q]),
+            ("FP1 hit", q => fpStage[q] == 1),
+            ("FP2 hit", q => fpStage[q] == 2),
+            ("miss",    q => fpStage[q] == 0),
         }, perQueryTicks, tickToUs);
 
         // Family 2: GT score bucket
@@ -179,22 +197,22 @@ public static class PerfFamilies
         // Family 3: nearest-centroid distance (only meaningful for misses; hits short-circuit)
         ReportFamily("Nearest centroid (miss-only)", new (string, Func<int, bool>)[]
         {
-            ("miss & d2≤Q25",       q => !fpHit[q] && nearestDist[q] <= q25),
-            ("miss & Q25<d2≤Q50",   q => !fpHit[q] && nearestDist[q] > q25 && nearestDist[q] <= q50),
-            ("miss & Q50<d2≤Q75",   q => !fpHit[q] && nearestDist[q] > q50 && nearestDist[q] <= q75),
-            ("miss & Q75<d2≤Q95",   q => !fpHit[q] && nearestDist[q] > q75 && nearestDist[q] <= q95),
-            ("miss & d2>Q95 (tail)", q => !fpHit[q] && nearestDist[q] > q95),
+            ("miss & d2≤Q25",       q => fpStage[q] == 0 && nearestDist[q] <= q25),
+            ("miss & Q25<d2≤Q50",   q => fpStage[q] == 0 && nearestDist[q] > q25 && nearestDist[q] <= q50),
+            ("miss & Q50<d2≤Q75",   q => fpStage[q] == 0 && nearestDist[q] > q50 && nearestDist[q] <= q75),
+            ("miss & Q75<d2≤Q95",   q => fpStage[q] == 0 && nearestDist[q] > q75 && nearestDist[q] <= q95),
+            ("miss & d2>Q95 (tail)", q => fpStage[q] == 0 && nearestDist[q] > q95),
         }, perQueryTicks, tickToUs);
 
         // Family 4: GT score within MISS only (since hits dominate the "easy" buckets)
         ReportFamily("GT score (miss-only)", new (string, Func<int, bool>)[]
         {
-            ("miss & 0.0", q => !fpHit[q] && gtScore[q] < 0.1f),
-            ("miss & 0.2", q => !fpHit[q] && gtScore[q] >= 0.1f && gtScore[q] < 0.3f),
-            ("miss & 0.4", q => !fpHit[q] && gtScore[q] >= 0.3f && gtScore[q] < 0.5f),
-            ("miss & 0.6", q => !fpHit[q] && gtScore[q] >= 0.5f && gtScore[q] < 0.7f),
-            ("miss & 0.8", q => !fpHit[q] && gtScore[q] >= 0.7f && gtScore[q] < 0.9f),
-            ("miss & 1.0", q => !fpHit[q] && gtScore[q] >= 0.9f),
+            ("miss & 0.0", q => fpStage[q] == 0 && gtScore[q] < 0.1f),
+            ("miss & 0.2", q => fpStage[q] == 0 && gtScore[q] >= 0.1f && gtScore[q] < 0.3f),
+            ("miss & 0.4", q => fpStage[q] == 0 && gtScore[q] >= 0.3f && gtScore[q] < 0.5f),
+            ("miss & 0.6", q => fpStage[q] == 0 && gtScore[q] >= 0.5f && gtScore[q] < 0.7f),
+            ("miss & 0.8", q => fpStage[q] == 0 && gtScore[q] >= 0.7f && gtScore[q] < 0.9f),
+            ("miss & 1.0", q => fpStage[q] == 0 && gtScore[q] >= 0.9f),
         }, perQueryTicks, tickToUs);
 
         // Top 1% offenders — what's special about them?
@@ -206,7 +224,7 @@ public static class PerfFamilies
         for (int i = 0; i < topN; i++)
         {
             int q = sortedIdx[i];
-            if (fpHit[q]) topHits++;
+            if (fpStage[q] != 0) topHits++;
             topD2 += nearestDist[q];
             int b = (int)Math.Round(gtScore[q] * 5f);
             if (b >= 0 && b <= 5) topGt[b == 1 || b == 0 ? Math.Min(b, 5) : b]++;
@@ -221,9 +239,9 @@ public static class PerfFamilies
         if (csvPath is not null)
         {
             using var sw2 = new StreamWriter(csvPath);
-            sw2.WriteLine("idx,latency_us,fastpath_hit,gt_score,nearest_d2");
+            sw2.WriteLine("idx,latency_us,fastpath_stage,gt_score,nearest_d2");
             for (int q = 0; q < total; q++)
-                sw2.WriteLine($"{q},{perQueryTicks[q]*tickToUs:F2},{(fpHit[q]?1:0)},{gtScore[q]:F2},{nearestDist[q]:F6}");
+                sw2.WriteLine($"{q},{perQueryTicks[q]*tickToUs:F2},{fpStage[q]},{gtScore[q]:F2},{nearestDist[q]:F6}");
             Console.WriteLine($"CSV written to {csvPath}");
         }
 
