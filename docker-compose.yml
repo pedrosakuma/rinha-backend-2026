@@ -85,7 +85,7 @@ services:
       - api1
 
   lb:
-    image: jrblatt/so-no-forevis:v1.0.0
+    image: jrblatt/so-no-forevis:v0.0.2
     pull_policy: always
     cpuset: "2,3"
     security_opt:
