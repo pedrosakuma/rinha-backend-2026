@@ -83,7 +83,7 @@ services:
       - api1
 
   lb:
-    image: jrblatt/so-no-forevis:v0.0.2
+    image: jrblatt/so-no-forevis:v1.0.0
     pull_policy: always
     cpuset: "2,3"
     security_opt:
@@ -91,7 +91,6 @@ services:
     environment:
       PORT: "9999"
       UPSTREAMS: "/run/uds/api1.sock,/run/uds/api2.sock"
-      BUF_SIZE: "4096"
       WORKERS: "1"
     ports:
       - "9999:9999"
