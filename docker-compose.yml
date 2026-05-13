@@ -4,7 +4,7 @@ name: rinha-backend-2026
 # Dataset (~192MB) é baked dentro da imagem; ambas as réplicas compartilham
 # a mesma layer overlayfs → kernel page cache é único.
 #
-# Recursos: 2× api (0.42 vCPU / 150MB) + lb (0.16 vCPU / 30MB).
+# Recursos: 2× api (0.37 vCPU / 150MB) + lb nginx (0.26 vCPU / 50MB).
 # Total: 1.00 vCPU + 350 MB.
 #
 # Eval-2026-05: lb e api comunicam via Unix Domain Socket em tmpfs (sem TCP
@@ -14,7 +14,7 @@ name: rinha-backend-2026
 
 services:
   api1: &api
-    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave31-nosm-3eb1fe6
+    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave30-selective-f56b9f9
     pull_policy: always
     cpuset: "0"
     security_opt:
@@ -23,7 +23,6 @@ services:
       UDS_PATH: "/run/uds/api1.sock"
       DOTNET_GCHeapCount: "1"
       DOTNET_PROCESSOR_COUNT: "1"
-      DOTNET_ThreadPool_UnfairSemaphoreSpinLimit: "16"
       TP_MIN_WORKERS: "16"
       TP_MAX_WORKERS: "16"
       SCORER: "ivf-blocked"
@@ -61,7 +60,6 @@ services:
       UDS_PATH: "/run/uds/api2.sock"
       DOTNET_GCHeapCount: "1"
       DOTNET_PROCESSOR_COUNT: "1"
-      DOTNET_ThreadPool_UnfairSemaphoreSpinLimit: "16"
       TP_MIN_WORKERS: "16"
       TP_MAX_WORKERS: "16"
       SCORER: "ivf-blocked"
