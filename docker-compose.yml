@@ -14,7 +14,7 @@ name: rinha-backend-2026
 
 services:
   api1: &api
-    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave32-socktune
+    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave33-thp
     pull_policy: always
     cpuset: "0,1"
     security_opt:
@@ -42,6 +42,7 @@ services:
       IO_URING_ENABLED: "0"
       IO_URING_SIZE: "4096"
       IO_URING_MAX_CONN: "1024"
+      DATASET_HUGE_ANON: "1"
     networks: [app]
     volumes:
       - uds:/run/uds
@@ -79,6 +80,7 @@ services:
       IO_URING_ENABLED: "0"
       IO_URING_SIZE: "4096"
       IO_URING_MAX_CONN: "1024"
+      DATASET_HUGE_ANON: "1"
     depends_on:
       - api1
 
