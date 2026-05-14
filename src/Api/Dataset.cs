@@ -44,16 +44,16 @@ public sealed unsafe class Dataset : IDisposable
     private readonly MemoryMappedFile? _bboxMaxMmf;
     private readonly MemoryMappedViewAccessor? _bboxMaxView;
     private readonly float* _vectorsPtr;
-    private byte* _labelsPtr;
+    private readonly byte* _labelsPtr;
     private readonly sbyte* _q8Ptr;
     private readonly sbyte* _q8SoaPtr;
     private readonly short* _q16Ptr;
-    private short* _q16BlockedPtr;
-    private int* _blockOffsetsPtr;
-    private float* _centroidsPtr;
-    private int* _offsetsPtr;
-    private float* _bboxMinPtr;
-    private float* _bboxMaxPtr;
+    private readonly short* _q16BlockedPtr;
+    private readonly int* _blockOffsetsPtr;
+    private readonly float* _centroidsPtr;
+    private readonly int* _offsetsPtr;
+    private readonly float* _bboxMinPtr;
+    private readonly float* _bboxMaxPtr;
     // Column-major (SoA) transposed Q16 layout: Dimensions columns of Count shorts each.
     // Either pre-mmapped from a file (built at image-build time) or allocated lazily in
     // Prefetch() from the row-major Q16 mmap. Layout: _q16SoaPtr[d * Count + i].
@@ -351,84 +351,8 @@ public sealed unsafe class Dataset : IDisposable
         GC.KeepAlive(sink);
         LastHugepageAdvisedBytes = hpTotal;
         LastMlockedBytes = mlTotal;
-        if (s_hugeAnonEnabled)
-            LastAnonHugeBytes = PromoteHotPathToAnonHuge(scorerHint);
         return total;
     }
-
-    /// <summary>L4: replaces file-backed (r--s) mmap pointers for the active scorer's hot
-    /// data with anonymous-mapped copies eligible for THP collapse. Targets the regions that
-    /// are randomly accessed during scoring (where TLB misses hurt most). Returns total bytes
-    /// successfully promoted; on partial failure the original mmap pointer is kept.</summary>
-    private long PromoteHotPathToAnonHuge(string? scorerHint)
-    {
-        long promoted = 0;
-        bool isBrute = scorerHint == "brute";
-        bool isBlocked = scorerHint == "ivf-blocked";
-
-        // labels (always touched on top-K insert) — small but hot.
-        if (_labelsPtr != null)
-        {
-            byte* anon = CopyToHugeAnon(_labelsPtr, Count);
-            if (anon != null) { _labelsPtr = anon; promoted += Count; }
-        }
-
-        // ivf-blocked hot path: q16_blocked + block_offsets + centroids + bbox_min/max.
-        if (isBlocked)
-        {
-            if (_blockOffsetsPtr != null)
-            {
-                long boBytes = (long)(NumCells + 1) * sizeof(int);
-                byte* anon = CopyToHugeAnon((byte*)_blockOffsetsPtr, boBytes);
-                if (anon != null) { _blockOffsetsPtr = (int*)anon; promoted += boBytes; }
-            }
-            if (_q16BlockedPtr != null && _blockOffsetsPtr != null)
-            {
-                int totalBlocks = _blockOffsetsPtr[NumCells];
-                long bbBytes = (long)totalBlocks * 8 * Dimensions * sizeof(short);
-                byte* anon = CopyToHugeAnon((byte*)_q16BlockedPtr, bbBytes);
-                if (anon != null) { _q16BlockedPtr = (short*)anon; promoted += bbBytes; }
-            }
-            if (_centroidsPtr != null)
-            {
-                long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
-                byte* anon = CopyToHugeAnon((byte*)_centroidsPtr, bytes);
-                if (anon != null) { _centroidsPtr = (float*)anon; promoted += bytes; }
-            }
-            if (_offsetsPtr != null)
-            {
-                long bytes = (long)(NumCells + 1) * sizeof(int);
-                byte* anon = CopyToHugeAnon((byte*)_offsetsPtr, bytes);
-                if (anon != null) { _offsetsPtr = (int*)anon; promoted += bytes; }
-            }
-            if (_bboxMinPtr != null)
-            {
-                long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
-                byte* anon = CopyToHugeAnon((byte*)_bboxMinPtr, bytes);
-                if (anon != null) { _bboxMinPtr = (float*)anon; promoted += bytes; }
-            }
-            if (_bboxMaxPtr != null)
-            {
-                long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
-                byte* anon = CopyToHugeAnon((byte*)_bboxMaxPtr, bytes);
-                if (anon != null) { _bboxMaxPtr = (float*)anon; promoted += bytes; }
-            }
-        }
-
-        // Brute-force hot path: q16_soa.
-        if (isBrute && _q16SoaPtr != null)
-        {
-            long soaBytes = (long)Dimensions * Count * sizeof(short);
-            byte* anon = CopyToHugeAnon((byte*)_q16SoaPtr, soaBytes);
-            if (anon != null) { _q16SoaPtr = (short*)anon; promoted += soaBytes; }
-        }
-
-        return promoted;
-    }
-
-    /// <summary>Bytes successfully copied into hugepage-eligible anon memory on the last
-    /// Prefetch call. 0 on non-Linux or when DATASET_HUGE_ANON != 1.</summary>
-    public long LastAnonHugeBytes { get; private set; }
 
     /// <summary>Total bytes successfully advised with MADV_HUGEPAGE on the last Prefetch call. 0 on non-Linux or if disabled.</summary>
     public long LastHugepageAdvisedBytes { get; private set; }
@@ -437,57 +361,9 @@ public sealed unsafe class Dataset : IDisposable
     private static extern int LinuxMadvise(IntPtr addr, UIntPtr length, int advice);
     [DllImport("libc", EntryPoint = "mlock", SetLastError = true)]
     private static extern int LinuxMlock(IntPtr addr, UIntPtr length);
-    [DllImport("libc", EntryPoint = "mmap", SetLastError = true)]
-    private static extern IntPtr LinuxMmap(IntPtr addr, UIntPtr length, int prot, int flags, int fd, IntPtr offset);
-    [DllImport("libc", EntryPoint = "munmap", SetLastError = true)]
-    private static extern int LinuxMunmap(IntPtr addr, UIntPtr length);
     private const int MADV_HUGEPAGE = 14;
-    private const int MADV_DONTNEED = 4;
-    private const int PROT_READ = 1, PROT_WRITE = 2;
-    private const int MAP_PRIVATE = 0x02, MAP_ANONYMOUS = 0x20;
-    private const long HugePageSize = 2L * 1024 * 1024;
-    private static readonly IntPtr MAP_FAILED = new IntPtr(-1);
     private static readonly bool s_thpEnabled = OperatingSystem.IsLinux();
     private static readonly bool s_mlockEnabled = false;
-    private static readonly bool s_hugeAnonEnabled =
-        OperatingSystem.IsLinux() && Environment.GetEnvironmentVariable("DATASET_HUGE_ANON") == "1";
-
-    /// <summary>L4: allocate a 2MB-aligned anonymous mapping and call madvise(MADV_HUGEPAGE)
-    /// so khugepaged can collapse the 4KB pages into 2MB hugepages. Returns null on failure.
-    /// File-backed shared mmaps (r--s) are silently ignored by THP on most kernels because
-    /// READ_ONLY_THP_FOR_FS isn't enabled — copying the dataset bytes into anon memory is
-    /// the only portable way to actually get hugepages for our reference vectors.</summary>
-    private static byte* MmapAnonHugeAligned(long bytes)
-    {
-        if (!OperatingSystem.IsLinux() || bytes <= 0) return null;
-        // Over-allocate by HugePageSize to guarantee we can find a 2MB-aligned start.
-        long total = bytes + HugePageSize;
-        IntPtr raw = LinuxMmap(IntPtr.Zero, (UIntPtr)total, PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS, -1, IntPtr.Zero);
-        if (raw == MAP_FAILED) return null;
-        long rawAddr = raw.ToInt64();
-        long alignedAddr = (rawAddr + HugePageSize - 1) & ~(HugePageSize - 1);
-        long headWaste = alignedAddr - rawAddr;
-        long tailStart = alignedAddr + bytes;
-        long tailWaste = (rawAddr + total) - tailStart;
-        // Trim the unaligned head and tail back to the kernel.
-        if (headWaste > 0) LinuxMunmap(raw, (UIntPtr)headWaste);
-        if (tailWaste > 0) LinuxMunmap(new IntPtr(tailStart), (UIntPtr)tailWaste);
-        // Hint THP on the aligned region so khugepaged collapses 4KB → 2MB.
-        LinuxMadvise(new IntPtr(alignedAddr), (UIntPtr)bytes, MADV_HUGEPAGE);
-        return (byte*)alignedAddr;
-    }
-
-    /// <summary>L4: copy <paramref name="bytes"/> from <paramref name="src"/> into a fresh
-    /// hugepage-eligible anonymous region. Returns null on failure (caller keeps the original
-    /// mmap pointer).</summary>
-    private static byte* CopyToHugeAnon(byte* src, long bytes)
-    {
-        byte* dst = MmapAnonHugeAligned(bytes);
-        if (dst == null) return null;
-        Buffer.MemoryCopy(src, dst, bytes, bytes);
-        return dst;
-    }
 
     private static long AdviseHuge(byte* p, long bytes)
     {

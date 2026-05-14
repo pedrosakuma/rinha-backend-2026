@@ -122,7 +122,6 @@ if (Environment.GetEnvironmentVariable("WARMUP") != "0")
     Console.WriteLine($"Warm-up: prefetch={touched / (1024 * 1024)}MiB in {swPre.ElapsedMilliseconds}ms, " +
                       $"jit={warmupIters} iters in {swJit.ElapsedMilliseconds}ms, " +
                       $"thp_advised={dataset.LastHugepageAdvisedBytes / (1024 * 1024)}MiB, " +
-                      $"anon_huge={dataset.LastAnonHugeBytes / (1024 * 1024)}MiB, " +
                       $"mlocked={dataset.LastMlockedBytes / (1024 * 1024)}MiB.");
 }
 
