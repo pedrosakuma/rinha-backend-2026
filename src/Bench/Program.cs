@@ -17,6 +17,12 @@ if (args.Length > 0 && args[0] == "--dump-fn")
 if (args.Length > 0 && args[0] == "--dump-features")
     return Rinha.Bench.DumpFeatures.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--dump-residual")
+    return Rinha.Bench.DumpResidual.Run(args[1..]);
+
+if (args.Length > 0 && args[0] == "--build-residual-purity")
+    return Rinha.Bench.BuildResidualPurity.Run(args[1..]);
+
 if (args.Length > 0 && args[0] == "--audit-fastpath")
     return Rinha.Bench.AuditFastPath.Run(args[1..]);
 

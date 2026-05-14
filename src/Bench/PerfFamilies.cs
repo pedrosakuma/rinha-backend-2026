@@ -227,13 +227,74 @@ public static class PerfFamilies
         for (int b = 0; b <= 5; b++) Console.Write($"{b/5.0:F1}={topGt[b]:F0} ");
         Console.WriteLine();
 
+        // ===== Instrumentation: per-query scanned candidate count =====
+        // Mirror IvfBlockedScorer's cell selection: pick top-nProbe cells by
+        // centroid distance, sum vec_count of selected cells (using CellOffsetsPtr).
+        Console.WriteLine($"Computing per-query scanned-vec count (nProbe={nProbeOverride})...");
+        var scannedVecs = new int[total];
+        unsafe
+        {
+            float* cents = ds.CentroidsPtr;
+            int* offs = ds.CellOffsetsPtr;
+            int nlist = ds.NumCells;
+            int n = nProbeOverride;
+            Span<int> cells = stackalloc int[n];
+            Span<float> cellsDist = stackalloc float[n];
+            for (int q = 0; q < total; q++)
+            {
+                var v = vecs[q];
+                for (int i = 0; i < n; i++) { cells[i] = -1; cellsDist[i] = float.MaxValue; }
+                float worst = float.MaxValue;
+                for (int c = 0; c < nlist; c++)
+                {
+                    float* cp = cents + (long)c * Dataset.PaddedDimensions;
+                    float d = 0f;
+                    for (int k = 0; k < Dataset.Dimensions; k++) { float diff = v[k] - cp[k]; d += diff * diff; }
+                    if (d < worst)
+                    {
+                        int pos = n - 1;
+                        while (pos > 0 && cellsDist[pos - 1] > d) pos--;
+                        for (int j = n - 1; j > pos; j--) { cellsDist[j] = cellsDist[j - 1]; cells[j] = cells[j - 1]; }
+                        cellsDist[pos] = d; cells[pos] = c; worst = cellsDist[n - 1];
+                    }
+                }
+                int sumVec = 0;
+                for (int i = 0; i < n; i++) if (cells[i] >= 0) sumVec += offs[cells[i] + 1] - offs[cells[i]];
+                scannedVecs[q] = sumVec;
+            }
+        }
+
+        // Family 5: scanned-vec quartile (only meaningful for misses since hits skip IVF).
+        var missScans = new List<int>();
+        for (int q = 0; q < total; q++) if (fpStage[q] < 0) missScans.Add(scannedVecs[q]);
+        missScans.Sort();
+        int sQ25 = missScans[(int)(missScans.Count * 0.25)];
+        int sQ50 = missScans[(int)(missScans.Count * 0.50)];
+        int sQ75 = missScans[(int)(missScans.Count * 0.75)];
+        int sQ95 = missScans[(int)(missScans.Count * 0.95)];
+        Console.WriteLine($"Scanned-vec percentiles (miss-only): Q25={sQ25} Q50={sQ50} Q75={sQ75} Q95={sQ95} max={missScans[^1]}");
+        ReportFamily("Scanned vectors (miss-only)", new (string, Func<int, bool>)[]
+        {
+            ("miss & scan≤Q25",       q => fpStage[q] < 0 && scannedVecs[q] <= sQ25),
+            ("miss & Q25<scan≤Q50",   q => fpStage[q] < 0 && scannedVecs[q] > sQ25 && scannedVecs[q] <= sQ50),
+            ("miss & Q50<scan≤Q75",   q => fpStage[q] < 0 && scannedVecs[q] > sQ50 && scannedVecs[q] <= sQ75),
+            ("miss & Q75<scan≤Q95",   q => fpStage[q] < 0 && scannedVecs[q] > sQ75 && scannedVecs[q] <= sQ95),
+            ("miss & scan>Q95 (heavy)", q => fpStage[q] < 0 && scannedVecs[q] > sQ95),
+        }, perQueryTicks, tickToUs);
+
+        // Top 1% by latency: average scanned-vec count
+        double topAvgScan = 0; double overallAvgScan = scannedVecs.Where((_, i) => fpStage[i] < 0).Average();
+        for (int i = 0; i < topN; i++) topAvgScan += scannedVecs[sortedIdx[i]];
+        topAvgScan /= topN;
+        Console.WriteLine($"avg scanned_vecs in top1%: {topAvgScan:F0} (vs miss-overall {overallAvgScan:F0}, ratio {topAvgScan/overallAvgScan:F2}x)");
+
         // Optional CSV dump.
         if (csvPath is not null)
         {
             using var sw2 = new StreamWriter(csvPath);
-            sw2.WriteLine("idx,latency_us,fastpath_stage,gt_score,nearest_d2");
+            sw2.WriteLine("idx,latency_us,fastpath_stage,gt_score,nearest_d2,scanned_vecs");
             for (int q = 0; q < total; q++)
-                sw2.WriteLine($"{q},{perQueryTicks[q]*tickToUs:F2},{fpStage[q]},{gtScore[q]:F2},{nearestDist[q]:F6}");
+                sw2.WriteLine($"{q},{perQueryTicks[q]*tickToUs:F2},{fpStage[q]},{gtScore[q]:F2},{nearestDist[q]:F6},{scannedVecs[q]}");
             Console.WriteLine($"CSV written to {csvPath}");
         }
 
