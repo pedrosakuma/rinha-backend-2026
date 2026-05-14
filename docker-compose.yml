@@ -16,7 +16,7 @@ services:
   api1: &api
     image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave32-socktune
     pull_policy: always
-    cpuset: "0"
+    cpuset: "0,1"
     security_opt:
       - seccomp=unconfined
     environment:
@@ -50,12 +50,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.425"
           memory: "150MB"
 
   api2:
     <<: *api
-    cpuset: "1"
+    cpuset: "2,3"
     environment:
       UDS_PATH: "/run/uds/api2.sock"
       DOTNET_GCHeapCount: "1"
@@ -85,7 +85,7 @@ services:
   lb:
     image: jrblatt/so-no-forevis:v0.0.2
     pull_policy: always
-    cpuset: "2,3"
+    cpuset: "0,2"
     security_opt:
       - seccomp=unconfined
     environment:
@@ -104,7 +104,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.15"
           memory: "30MB"
 
 volumes:
