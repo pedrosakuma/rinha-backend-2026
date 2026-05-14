@@ -85,39 +85,6 @@ internal static class RawHttpServer
 
         var ctx = new AcceptContext(listener, scorer, vectorizer, selectiveCascade);
 
-        // FD-passing listener: enabled by default whenever RAW_HTTP=1, lets us
-        // work behind so-no-forevis:v1.0.0 (LB sends TCP FDs via SCM_RIGHTS over
-        // {udsPath}.ctrl). Set RAW_HTTP_FD_PASSING=0 to opt out (kept as a kill
-        // switch in case we revert to v0.0.2-style data-proxy LBs).
-        var fdPassEnv = Environment.GetEnvironmentVariable("RAW_HTTP_FD_PASSING");
-        bool fdPassingEnabled = fdPassEnv != "0";
-        if (fdPassingEnabled)
-        {
-            string ctrlPath = udsPath + ".ctrl";
-            var fdThread = new Thread(() =>
-            {
-                try
-                {
-                    FdPassingListener.Run(ctrlPath, sock =>
-                    {
-                        if (_recvTimeoutMs > 0)
-                        {
-                            try { sock.ReceiveTimeout = _recvTimeoutMs; } catch { /* best-effort */ }
-                        }
-                        ThreadPool.UnsafeQueueUserWorkItem(
-                            s_handleConnectionDelegate,
-                            new ConnectionState(sock, ctx.Scorer, ctx.Vectorizer, ctx.SelectiveCascade),
-                            preferLocal: false);
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"FdPassingListener crashed: {ex}");
-                }
-            }) { IsBackground = true, Name = "raw-http-fd-listener" };
-            fdThread.Start();
-        }
-
         for (int i = 1; i < workers; i++)
         {
             var t = new Thread(AcceptLoop)

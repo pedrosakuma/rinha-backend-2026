@@ -42,10 +42,6 @@ public static class BuildSelectiveDecisionTables
         int[] residualFeatures = { 2, 0, 1, 12, 3 };
         int[] residualBits = { 5, 4, 4, 4, 3 };
 
-        int[] ref1Features = Reference1Features;
-        int[] ref1Bits = Reference1Bits;
-        string[] ref1Names = Reference1Names;
-
         foreach (var a in args)
         {
             if (a.StartsWith("--data-dir=")) dataDirArg = a[11..];
@@ -58,14 +54,6 @@ public static class BuildSelectiveDecisionTables
             else if (a.StartsWith("--min-query-support=")) minQuerySupport = int.Parse(a[20..], CultureInfo.InvariantCulture);
             else if (a.StartsWith("--residual-features=")) residualFeatures = a[20..].Split(',').Select(int.Parse).ToArray();
             else if (a.StartsWith("--residual-bits=")) residualBits = a[16..].Split(',').Select(int.Parse).ToArray();
-            else if (a.StartsWith("--ref1-features="))
-            {
-                ref1Features = a[16..].Split(',').Select(int.Parse).ToArray();
-                // rebuild names from AllFeatureNames
-                ref1Names = ref1Features.Select(i => AllFeatureNames[i]).ToArray();
-            }
-            else if (a.StartsWith("--ref1-bits="))
-                ref1Bits = a[12..].Split(',').Select(int.Parse).ToArray();
         }
 
         string root = FindRepoRoot();
@@ -107,7 +95,7 @@ public static class BuildSelectiveDecisionTables
         }
 
         var sb = new StringBuilder();
-        WriteConfig(sb, dataDir, trainQueries, validationFull, sameSetValidation, stage2, residual, stage2Full, ref1Features, ref1Names, ref1Bits);
+        WriteConfig(sb, dataDir, trainQueries, validationFull, sameSetValidation, stage2, residual, stage2Full);
         File.WriteAllText(outFull, sb.ToString());
         Console.WriteLine($"Wrote {outFull}");
         return 0;
@@ -242,10 +230,7 @@ public static class BuildSelectiveDecisionTables
         bool sameSetValidation,
         ProfileFastPath2.Config stage2,
         ResidualStage? residual,
-        string stage2Config,
-        int[] ref1Features,
-        string[] ref1Names,
-        int[] ref1Bits)
+        string stage2Config)
     {
         sb.AppendLine("{");
         sb.AppendLine("  \"version\": 1,");
@@ -263,7 +248,7 @@ public static class BuildSelectiveDecisionTables
         sb.AppendLine("  },");
         sb.AppendLine("  \"stages\": [");
 
-        WriteReferenceStage(sb, "reference-purity-1", ref1Features, ref1Names, ref1Bits, 100, 400, isLast: false);
+        WriteReferenceStage(sb, "reference-purity-1", Reference1Features, Reference1Names, Reference1Bits, 100, 400, isLast: false);
         WriteReferenceStage(sb, "reference-purity-2", stage2.FeatureIndices, NamesFor(stage2.FeatureIndices), stage2.Bits, stage2.KLegit, stage2.KFraud, isLast: residual is null);
         if (residual is not null)
             WriteResidualStage(sb, residual, isLast: true);
