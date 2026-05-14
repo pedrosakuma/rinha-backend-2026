@@ -91,7 +91,7 @@ services:
     environment:
       PORT: "9999"
       UPSTREAMS: "/run/uds/api1.sock,/run/uds/api2.sock"
-      WORKERS: "4"
+      WORKERS: "1"
     ports:
       - "9999:9999"
     volumes:
