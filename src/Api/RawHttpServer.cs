@@ -139,6 +139,22 @@ internal static class RawHttpServer
                 try { conn.ReceiveTimeout = _recvTimeoutMs; } catch { /* best-effort */ }
             }
 
+            // Socket-layer tuning on accepted connections. All best-effort:
+            // - LingerState (true, 0): on close, send RST instead of FIN; FD freed
+            //   immediately, no TIME_WAIT-equivalent for AF_UNIX. Helps under
+            //   keep-alive cap turnover (we close after _keepAliveMax requests).
+            // - SendBufferSize / ReceiveBufferSize: bump kernel socket buffers so
+            //   the LB->API and API->LB messages fit in a single syscall pair
+            //   without partial reads/writes (typical msg ~500B, response ~120B,
+            //   but pipelining and bursts can stack several).
+            // - NoDelay: harmless on AF_UNIX (no Nagle); will throw on UDS so
+            //   wrapped in try/catch. Kept so the same code path works if the
+            //   listener ever moves back to TCP.
+            try { conn.LingerState = new LingerOption(true, 0); } catch { }
+            try { conn.SendBufferSize = 16 * 1024; }    catch { }
+            try { conn.ReceiveBufferSize = 16 * 1024; } catch { }
+            try { conn.NoDelay = true; }                catch { /* not TCP */ }
+
             // Hand the socket off to the CLR ThreadPool; accept thread loops back immediately.
             ThreadPool.UnsafeQueueUserWorkItem(
                 s_handleConnectionDelegate,
