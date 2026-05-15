@@ -152,13 +152,29 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
 
             fixed (float* qPtr = qfPad)
             {
+                // Precompute lb for all non-seed cells, then iteratively pick the cell with
+                // the smallest lb (most promising) and scan it. After each scan, the worst-top-5
+                // tightens and more cells become prunable. Exact: lb is a true lower bound.
+                Span<float> cellLbs = stackalloc float[nlist];
                 for (int c = 0; c < nlist; c++)
                 {
-                    if (isSeed[c]) continue;
+                    cellLbs[c] = isSeed[c]
+                        ? float.PositiveInfinity
+                        : BboxLowerBoundSquared(qPtr, bbMin, bbMax, c);
+                }
+                while (true)
+                {
                     float worst = topDist[worstIdx];
-                    float lb = BboxLowerBoundSquared(qPtr, bbMin, bbMax, c);
-                    if (lb >= worst) continue; // exact: cluster cannot beat top-5
-                    ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
+                    int bestC = -1;
+                    float bestLb = worst;
+                    for (int c = 0; c < nlist; c++)
+                    {
+                        float lb = cellLbs[c];
+                        if (lb < bestLb) { bestLb = lb; bestC = c; }
+                    }
+                    if (bestC < 0) break; // no remaining cell can beat top-5
+                    cellLbs[bestC] = float.PositiveInfinity;
+                    ScanCellBlocks(bestC, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
                         topDist, topLab, topIdx, ref worstIdx);
                 }
             }
