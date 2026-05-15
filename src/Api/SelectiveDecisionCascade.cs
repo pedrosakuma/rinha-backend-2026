@@ -90,18 +90,28 @@ public sealed unsafe class SelectiveDecisionTable
     public const int MaxTotalBits = 24;
     public const int MaxBitsPerFeature = 12;
 
+    // Empty slot sentinel: keys are at most 2^24-1, so high byte 0xFF cannot collide.
+    private const uint EmptySlot = 0xFFFFFFFFu;
+
     private readonly int[] _featureIndices;
     private readonly int[] _bits;
     private readonly int[] _shifts;
     private readonly float[][] _edges;
-    private readonly byte[] _table;
+    // Open-addressing hash table replacing the dense byte[2^totalBits] direct-addressing table.
+    // Each slot encodes key (low 24 bits) and result count (bits 24-26); EmptySlot marks vacant.
+    // Sized to next power of two with load factor ~0.6 → fits in L2 cache for typical stages.
+    private readonly uint[] _hashTable;
+    private readonly int _hashMask;
+    private readonly long _denseSlots;
     private readonly int _numFeatures;
 
     private SelectiveDecisionTable(
         SelectiveDecisionStageConfig config,
         int[] shifts,
         float[][] edges,
-        byte[] table,
+        uint[] hashTable,
+        int hashMask,
+        long denseSlots,
         int usedBuckets,
         int[] decidedByCount)
     {
@@ -115,12 +125,14 @@ public sealed unsafe class SelectiveDecisionTable
         _bits = config.Bits;
         _shifts = shifts;
         _edges = edges;
-        _table = table;
+        _hashTable = hashTable;
+        _hashMask = hashMask;
+        _denseSlots = denseSlots;
         _numFeatures = config.FeatureIndices.Length;
         UsedBuckets = usedBuckets;
         DecidedByCount = decidedByCount;
         TotalBits = config.Bits.Sum();
-        TableSize = table.LongLength;
+        TableSize = (long)hashTable.Length * sizeof(uint);
     }
 
     public string Name { get; }
@@ -143,7 +155,7 @@ public sealed unsafe class SelectiveDecisionTable
         var edges = BuildEdges(ds, config.FeatureIndices, config.Bits);
         var counts = CountReferenceLabels(ds, config.FeatureIndices, config.Bits, shifts, edges);
 
-        var table = NewUndecidedTable(slots);
+        var entries = new List<(uint key, byte value)>();
         var decided = new int[6];
         foreach (var kv in counts)
         {
@@ -151,17 +163,18 @@ public sealed unsafe class SelectiveDecisionTable
             int positives = (int)(uint)kv.Value;
             if (positives == 0 && total >= config.KLegit)
             {
-                table[kv.Key] = 0;
+                entries.Add(((uint)kv.Key, 0));
                 decided[0]++;
             }
             else if (positives == total && total >= config.KFraud)
             {
-                table[kv.Key] = 5;
+                entries.Add(((uint)kv.Key, 5));
                 decided[5]++;
             }
         }
 
-        var built = new SelectiveDecisionTable(config, shifts, edges, table, counts.Count, decided);
+        var (hashTable, hashMask) = BuildHashTable(entries);
+        var built = new SelectiveDecisionTable(config, shifts, edges, hashTable, hashMask, slots, counts.Count, decided);
         built.LogBuilt();
         return built;
     }
@@ -206,7 +219,8 @@ public sealed unsafe class SelectiveDecisionTable
         var (shifts, totalBits) = BuildShifts(config.Bits);
         long slots = 1L << totalBits;
         var edges = BuildEdges(ds, config.FeatureIndices, config.Bits);
-        var table = NewUndecidedTable(slots);
+        var entries = new List<(uint key, byte value)>();
+        var seen = new Dictionary<uint, byte>();
         var decided = new int[6];
 
         for (int count = 0; count <= 5; count++)
@@ -215,19 +229,21 @@ public sealed unsafe class SelectiveDecisionTable
             {
                 if (key >= slots)
                     throw new InvalidOperationException($"Stage '{config.Name}' count{count} key {key} outside table size {slots}");
-                if (table[key] == SelectiveDecisionCascade.ResultUndecided)
+                if (!seen.ContainsKey(key))
                 {
-                    table[key] = (byte)count;
+                    seen[key] = (byte)count;
+                    entries.Add((key, (byte)count));
                     decided[count]++;
                 }
-                else if (table[key] != count)
+                else if (seen[key] != count)
                 {
                     throw new InvalidOperationException($"Stage '{config.Name}' duplicate key {key} with conflicting result");
                 }
             }
         }
 
-        var built = new SelectiveDecisionTable(config, shifts, edges, table, decided.Sum(), decided);
+        var (hashTable, hashMask) = BuildHashTable(entries);
+        var built = new SelectiveDecisionTable(config, shifts, edges, hashTable, hashMask, slots, decided.Sum(), decided);
         built.LogBuilt();
         return built;
     }
@@ -243,24 +259,57 @@ public sealed unsafe class SelectiveDecisionTable
             int bin = FindBin(_edges[f], v);
             key |= (uint)bin << _shifts[f];
         }
-        return _table[key];
+        var ht = _hashTable;
+        uint mask = (uint)_hashMask;
+        uint h = Mix(key) & mask;
+        while (true)
+        {
+            uint slot = ht[h];
+            if (slot == EmptySlot) return SelectiveDecisionCascade.ResultUndecided;
+            if ((slot & 0x00FFFFFFu) == key) return (byte)(slot >> 24);
+            h = (h + 1) & mask;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint Mix(uint x)
+    {
+        // splitmix32 finaliser; good avalanche, 4 ALU ops, ~3 cycles.
+        x ^= x >> 16;
+        x *= 0x7feb352du;
+        x ^= x >> 15;
+        x *= 0x846ca68bu;
+        x ^= x >> 16;
+        return x;
     }
 
     private void LogBuilt()
     {
         Console.WriteLine($"SelectiveDecisionTable[{Name}]: built. mode={Mode} risk={RiskLevel} " +
                           $"features=[{string.Join(",", _featureIndices)}] bits=[{string.Join(",", _bits)}] " +
-                          $"total={TotalBits} slots={_table.LongLength:N0} used={UsedBuckets:N0} " +
-                          $"decided_counts=[{string.Join(",", DecidedByCount)}] table_bytes={_table.LongLength:N0}");
+                          $"total={TotalBits} dense_slots={_denseSlots:N0} hash_slots={_hashTable.Length:N0} " +
+                          $"used={UsedBuckets:N0} decided_counts=[{string.Join(",", DecidedByCount)}] " +
+                          $"hash_bytes={(long)_hashTable.Length * sizeof(uint):N0}");
     }
 
-    private static byte[] NewUndecidedTable(long slots)
+    private static (uint[] table, int mask) BuildHashTable(List<(uint key, byte value)> entries)
     {
-        if (slots > int.MaxValue)
-            throw new InvalidOperationException($"Selective decision table too large: {slots} slots");
-        var table = new byte[slots];
-        Array.Fill(table, SelectiveDecisionCascade.ResultUndecided);
-        return table;
+        // Capacity = next pow2 >= entries / 0.6, min 8 slots.
+        int target = Math.Max(8, (int)Math.Ceiling(entries.Count / 0.6));
+        int capacity = 1;
+        while (capacity < target) capacity <<= 1;
+        int mask = capacity - 1;
+        var table = new uint[capacity];
+        for (int i = 0; i < table.Length; i++) table[i] = EmptySlot;
+        foreach (var (key, value) in entries)
+        {
+            if (key > 0x00FFFFFFu)
+                throw new InvalidOperationException($"key {key} exceeds 24-bit limit for hash slot encoding");
+            uint h = Mix(key) & (uint)mask;
+            while (table[h] != EmptySlot) h = (h + 1) & (uint)mask;
+            table[h] = key | ((uint)value << 24);
+        }
+        return (table, mask);
     }
 
     private static (int[] shifts, int totalBits) BuildShifts(int[] bits)
