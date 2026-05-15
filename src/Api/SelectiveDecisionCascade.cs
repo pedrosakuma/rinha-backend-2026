@@ -88,7 +88,7 @@ public sealed unsafe class SelectiveDecisionCascade
 public sealed unsafe class SelectiveDecisionTable
 {
     public const int MaxTotalBits = 24;
-    public const int MaxBitsPerFeature = 6;
+    public const int MaxBitsPerFeature = 12;
 
     private readonly int[] _featureIndices;
     private readonly int[] _bits;
