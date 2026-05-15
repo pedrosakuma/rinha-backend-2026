@@ -190,7 +190,7 @@
     {
       "name": "borderline-residual-purity",
       "mode": "residual_modal_sparse",
-      "enabled_by_default": true,
+      "enabled_by_default": false,
       "env_flags": [
         "SELECTIVE_DECISION_BORDERLINE_PURITY"
       ],
@@ -1214,7 +1214,7 @@
     {
       "name": "tail-residual-purity",
       "mode": "residual_modal_sparse",
-      "enabled_by_default": true,
+      "enabled_by_default": false,
       "env_flags": [
         "SELECTIVE_DECISION_BORDERLINE_PURITY"
       ],
@@ -2790,7 +2790,7 @@
     {
       "name": "final-residual-purity",
       "mode": "residual_modal_sparse",
-      "enabled_by_default": true,
+      "enabled_by_default": false,
       "env_flags": [
         "SELECTIVE_DECISION_BORDERLINE_PURITY"
       ],
