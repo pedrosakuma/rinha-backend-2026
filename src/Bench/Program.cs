@@ -35,6 +35,9 @@ if (args.Length > 0 && args[0] == "--probe-fastpath-features")
 if (args.Length > 0 && args[0] == "--perf-families")
     return Rinha.Bench.PerfFamilies.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--stage-histogram")
+    return Rinha.Bench.StageHistogram.Run(args[1..]);
+
 if (args.Length > 0 && args[0] == "--fraud-miss-analysis")
     return Rinha.Bench.FraudMissAnalysis.Run(args[1..]);
 

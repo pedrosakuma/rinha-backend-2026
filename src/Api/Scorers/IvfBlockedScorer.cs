@@ -53,7 +53,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         if (!dataset.HasIvf) throw new InvalidOperationException("Dataset has no IVF (centroids/offsets) view.");
         if (!dataset.HasQ16Blocked) throw new InvalidOperationException("Dataset has no Q16-blocked view.");
         _dataset = dataset;
-        _nProbe = Math.Clamp(nProbe, 1, dataset.NumCells);
+        _nProbe = Math.Clamp(nProbe, 0, dataset.NumCells);
         _fastGate = Environment.GetEnvironmentVariable("IVF_BLOCKED_FAST_GATE") == "1";
         _hasBbox = dataset.HasIvfBbox;
     }
@@ -79,12 +79,17 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         // insert into the top-N (typically N=1) tracker. Saves the second pass
         // over centDist[] and lets us skip the centDist array entirely when the
         // fast-gate cascade isn't active.
+        // When _nProbe == 0 and fast-gate disabled, skip phase 1+2+3 entirely
+        // and let the bbox-LB best-first pass cover all cells.
         int n = _nProbe;
-        Span<int> cells = stackalloc int[n];
-        Span<float> cellsDist = stackalloc float[n];
+        bool runCentroidPass = n > 0 || _fastGate;
+        Span<int> cells = stackalloc int[Math.Max(n, 1)];
+        Span<float> cellsDist = stackalloc float[Math.Max(n, 1)];
         for (int i = 0; i < n; i++) { cells[i] = -1; cellsDist[i] = float.PositiveInfinity; }
         float cellsWorst = float.PositiveInfinity;
 
+        if (runCentroidPass)
+        {
         fixed (float* qPtr = qfPad)
         fixed (float* cdPtr = centDist)
         {
@@ -101,7 +106,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                 var s = (d0 * d0) + (d1 * d1);
                 float d = Vector256.Sum(s);
                 if (needCentDist) cdPtr[c] = d;
-                if (d < cellsWorst)
+                if (n > 0 && d < cellsWorst)
                 {
                     int pos = n - 1;
                     while (pos > 0 && cellsDist[pos - 1] > d) pos--;
@@ -111,6 +116,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                     cellsWorst = cellsDist[n - 1];
                 }
             }
+        }
         }
 
         // 3) Top-5 (dist², label) tracked via worst-idx (linear scan of 5 elems on insert).
