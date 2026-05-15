@@ -161,6 +161,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                 // Precompute lb for all non-seed cells, then iteratively pick the cell with
                 // the smallest lb (most promising) and scan it. After each scan, the worst-top-5
                 // tightens and more cells become prunable. Exact: lb is a true lower bound.
+                // nlist is a multiple of 8 (256 by config); allocate aligned span on stack.
                 Span<float> cellLbs = stackalloc float[nlist];
                 for (int c = 0; c < nlist; c++)
                 {
@@ -168,20 +169,17 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                         ? float.PositiveInfinity
                         : BboxLowerBoundSquared(qPtr, bbMin, bbMax, c);
                 }
-                while (true)
+                fixed (float* lbsPtr = cellLbs)
                 {
-                    float worst = topDist[worstIdx];
-                    int bestC = -1;
-                    float bestLb = worst;
-                    for (int c = 0; c < nlist; c++)
+                    while (true)
                     {
-                        float lb = cellLbs[c];
-                        if (lb < bestLb) { bestLb = lb; bestC = c; }
+                        float worst = topDist[worstIdx];
+                        int bestC = ArgminBelowThreshold(lbsPtr, nlist, worst);
+                        if (bestC < 0) break; // no remaining cell can beat top-5
+                        lbsPtr[bestC] = float.PositiveInfinity;
+                        ScanCellBlocks(bestC, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
+                            topDist, topLab, topIdx, ref worstIdx);
                     }
-                    if (bestC < 0) break; // no remaining cell can beat top-5
-                    cellLbs[bestC] = float.PositiveInfinity;
-                    ScanCellBlocks(bestC, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
-                        topDist, topLab, topIdx, ref worstIdx);
                 }
             }
         }
@@ -364,5 +362,40 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         var d1 = Vector256.Max(zero, Vector256.Max(d1a, d1b));
         var s = (d0 * d0) + (d1 * d1);
         return Vector256.Sum(s);
+    }
+
+    /// <summary>
+    /// SIMD AVX2 argmin over <paramref name="lbs"/> returning the index of the smallest element
+    /// strictly less than <paramref name="threshold"/>, or -1 if none qualifies.
+    /// nlist must be a multiple of 8 (enforced by build pipeline; default 256).
+    /// Replaces a scalar O(n) per-iter loop in the best-first inner loop, where the same
+    /// 256-element span is rescanned k times (k can reach ~150 for tail queries).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ArgminBelowThreshold(float* lbs, int nlist, float threshold)
+    {
+        var bestVals = Vector256.Create(threshold);
+        var bestIdx = Vector256.Create(-1);
+        var step = Vector256.Create(8);
+        var idx = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7);
+
+        for (int c = 0; c < nlist; c += 8)
+        {
+            var v = Vector256.Load(lbs + c);
+            var lt = Vector256.LessThan(v, bestVals);
+            bestVals = Vector256.ConditionalSelect(lt, v, bestVals);
+            bestIdx = Vector256.ConditionalSelect(lt.AsInt32(), idx, bestIdx);
+            idx += step;
+        }
+
+        // Horizontal reduce 8 lanes → scalar argmin.
+        float minVal = threshold;
+        int minIdx = -1;
+        for (int j = 0; j < 8; j++)
+        {
+            float v = bestVals.GetElement(j);
+            if (v < minVal) { minVal = v; minIdx = bestIdx.GetElement(j); }
+        }
+        return minIdx;
     }
 }
