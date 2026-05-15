@@ -21,27 +21,15 @@ services:
       - seccomp=unconfined
     environment:
       UDS_PATH: "/run/uds/api1.sock"
-      DOTNET_GCHeapCount: "1"
       DOTNET_PROCESSOR_COUNT: "1"
       TP_MIN_WORKERS: "64"
       TP_MAX_WORKERS: "64"
       SCORER: "ivf-blocked"
-      IVF_NPROBE: "1"
       IVF_BLOCKED_NPROBE: "1"
       RAW_HTTP: "1"
       RAW_HTTP_WORKERS: "1"
       RAW_HTTP_KEEPALIVE_MAX: "0"
-      RAW_HTTP_RECV_TIMEOUT_MS: "0"
-      IVF_RERANK: "48"
-      IVF_EARLY_STOP: "1"
-      IVF_EARLY_STOP_PCT: "25"
-      IVF_BORDERLINE_NPROBE: "32"
-      IVF_BORDERLINE_RERANK: "128"
-      IVF_BBOX_GUIDED: "0"
-      IVF_BBOX_REPAIR: "1"
       IO_URING_ENABLED: "0"
-      IO_URING_SIZE: "4096"
-      IO_URING_MAX_CONN: "1024"
     networks: [app]
     volumes:
       - uds:/run/uds
@@ -58,27 +46,15 @@ services:
     cpuset: "2,3"
     environment:
       UDS_PATH: "/run/uds/api2.sock"
-      DOTNET_GCHeapCount: "1"
       DOTNET_PROCESSOR_COUNT: "1"
       TP_MIN_WORKERS: "64"
       TP_MAX_WORKERS: "64"
       SCORER: "ivf-blocked"
-      IVF_NPROBE: "1"
       IVF_BLOCKED_NPROBE: "1"
       RAW_HTTP: "1"
       RAW_HTTP_WORKERS: "1"
       RAW_HTTP_KEEPALIVE_MAX: "0"
-      RAW_HTTP_RECV_TIMEOUT_MS: "0"
-      IVF_RERANK: "48"
-      IVF_EARLY_STOP: "1"
-      IVF_EARLY_STOP_PCT: "25"
-      IVF_BORDERLINE_NPROBE: "32"
-      IVF_BORDERLINE_RERANK: "128"
-      IVF_BBOX_GUIDED: "0"
-      IVF_BBOX_REPAIR: "1"
       IO_URING_ENABLED: "0"
-      IO_URING_SIZE: "4096"
-      IO_URING_MAX_CONN: "1024"
     depends_on:
       - api1
 

@@ -276,6 +276,7 @@ public sealed unsafe class Dataset : IDisposable
                 long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
                 hpTotal += AdviseHuge((byte*)_bboxMinPtr, bytes);
                 sink += TouchPages((byte*)_bboxMinPtr, bytes, PageSize);
+                mlTotal += MlockRegion((byte*)_bboxMinPtr, bytes);
                 total += bytes;
             }
             if (_bboxMaxPtr != null)
@@ -283,6 +284,7 @@ public sealed unsafe class Dataset : IDisposable
                 long bytes = (long)NumCells * PaddedDimensions * sizeof(float);
                 hpTotal += AdviseHuge((byte*)_bboxMaxPtr, bytes);
                 sink += TouchPages((byte*)_bboxMaxPtr, bytes, PageSize);
+                mlTotal += MlockRegion((byte*)_bboxMaxPtr, bytes);
                 total += bytes;
             }
         }

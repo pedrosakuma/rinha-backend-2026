@@ -292,10 +292,10 @@ internal static class RawHttpServer
                 // Vectorize once; produce both float (for selective table lookup) and Q16 (for
                 // the integer scorer fast-path). Cost over Q16-only is one extra multiply per dim.
                 bool selectiveEnabled = selectiveCascade.IsEnabled;
-                if (selectiveEnabled)
-                    vectorizer.VectorizeJson(body, queryFloat, queryQ16);
-                else
-                    vectorizer.VectorizeJsonQ16(body, queryQ16);
+                // Always populate queryFloat — scorer needs it on cascade miss AND when cascade is
+                // disabled entirely (otherwise scorer would receive a zeroed span and silently
+                // return count=0 for every request).
+                vectorizer.VectorizeJson(body, queryFloat, queryQ16);
 
                 byte selective = selectiveEnabled
                     ? selectiveCascade.TryLookup(queryFloat)
