@@ -534,12 +534,14 @@ public sealed class JsonVectorizer
             int h = D2(s, 11);
             int mi = D2(s, 14);
             int se = D2(s, 17);
-            // Build via DateTime and convert to ticks.
-            // DateTime ctor is cheap (no parsing/culture).
-            var dt = new DateTime(y, mo, d, h, mi, se, DateTimeKind.Utc);
-            ticks = dt.Ticks;
+            long days = DaysSince0001(y, mo, d);
+            ticks = days * TicksPerDay
+                  + h * TicksPerHour
+                  + mi * TicksPerMinute
+                  + se * TicksPerSecond;
             hour = h;
-            dow = dt.DayOfWeek;
+            // 0001-01-01 was Monday; DayOfWeek: Sunday=0..Saturday=6.
+            dow = (DayOfWeek)((int)((days + 1) % 7));
             return;
         }
         // Fallback.
@@ -557,6 +559,29 @@ public sealed class JsonVectorizer
     private static int D4(ReadOnlySpan<byte> s, int o)
         => (s[o] - '0') * 1000 + (s[o + 1] - '0') * 100 + (s[o + 2] - '0') * 10 + (s[o + 3] - '0');
 
+    private const long TicksPerSecond = 10_000_000L;
+    private const long TicksPerMinute = 60L * TicksPerSecond;
+    private const long TicksPerHour = 60L * TicksPerMinute;
+    private const long TicksPerDay = 24L * TicksPerHour;
+
+    // Cumulative days from Jan 1 to start of each month (non-leap year).
+    private static ReadOnlySpan<int> DaysToMonth => new[] { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long DaysSince0001(int y, int m, int d)
+    {
+        int yy = y - 1;
+        int days = yy * 365 + yy / 4 - yy / 100 + yy / 400;
+        days += DaysToMonth[m - 1];
+        if (m > 2)
+        {
+            bool leap = (y & 3) == 0 && (y % 100 != 0 || y % 400 == 0);
+            if (leap) days += 1;
+        }
+        days += d - 1;
+        return days;
+    }
+
     /// <summary>
     /// Walk a JSON array literal "[ "a", "b", ... ]" comparing each string entry's bytes
     /// (between the surrounding quotes) against <paramref name="needle"/>.
@@ -566,14 +591,30 @@ public sealed class JsonVectorizer
     /// </summary>
     private static bool ScanKnownMerchants(ReadOnlySpan<byte> arr, ReadOnlySpan<byte> needle)
     {
+        // Fast path: 8-byte needle (e.g., "MERC-XXX") and well-formed array
+        // ["MERC-XXX","MERC-XXX",...] of 2-5 entries (lengths 23/34/45/56).
+        // Each entry sits at offset 2 + i*11 (i = 0..count-1).
+        int n = arr.Length;
+        if (needle.Length == 8 && (n == 23 || n == 34 || n == 45 || n == 56))
+        {
+            ref byte b = ref MemoryMarshal.GetReference(arr);
+            ulong nl = Unsafe.ReadUnaligned<ulong>(ref MemoryMarshal.GetReference(needle));
+            if (Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 2)) == nl) return true;
+            if (Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 13)) == nl) return true;
+            if (n == 23) return false;
+            if (Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 24)) == nl) return true;
+            if (n == 34) return false;
+            if (Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 35)) == nl) return true;
+            if (n == 45) return false;
+            return Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, 46)) == nl;
+        }
+
         int i = 0;
         while (i < arr.Length)
         {
-            // Find next quote.
             while (i < arr.Length && arr[i] != (byte)'"') i++;
             if (i >= arr.Length) return false;
             int start = ++i;
-            // Find closing quote (no escape support — conservative).
             while (i < arr.Length && arr[i] != (byte)'"')
             {
                 if (arr[i] == (byte)'\\') return false;

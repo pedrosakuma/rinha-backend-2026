@@ -19,7 +19,7 @@ namespace Rinha.Api;
 /// rounded result by IEEE 754; any sub-ULP drift is absorbed by the Q16 round
 /// downstream (1/10000 quantum &gt; 1e-12 ULP).
 /// </summary>
-internal static class FastNumberParse
+public static class FastNumberParse
 {
     // 1e-d for d in [0..18]. All are exactly representable in double
     // up to 10^22 per Clinger; we cap at 18 (max field has 10 decimal digits).
