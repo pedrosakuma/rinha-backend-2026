@@ -81,6 +81,8 @@ docker push ghcr.io/pedrosakuma/rinha-backend-2026-api:<wave>
 - ❌ `nlist=1536` (regrediu).
 - ❌ `TP=12/14`, `RAW_HTTP_WORKERS>1`, `WORKERS=1` no LB (regrediram).
 - ❌ Stages residual_modal_sparse com origem em test-data.json (compliance).
+- ❌ FP16 storage para refs (wave38 PoC: 16 fraud-count divergences em 54100, precisão ~10⁻³ insuficiente vs Q16 5×10⁻⁵).
+- ❌ VPMADDWD path no IVF block scan: widen per-par (Vector256&lt;long&gt; via vpmovsxdq×2) regrediu -8% p50/p99; sem widen (Vector256&lt;int&gt; acc + widen-at-end) é perf-neutro mas tem 1 FP/54100 por wrap int32 (true sum &gt; 4.3e9 em queries patológicas). Float fmadd é o ótimo local pra esse hot path no Zen3.
 
 ## Estado atual (referência)
 

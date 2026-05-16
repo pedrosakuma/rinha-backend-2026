@@ -22,55 +22,6 @@ var tpMax = int.TryParse(Environment.GetEnvironmentVariable("TP_MAX_WORKERS"), o
 ThreadPool.SetMinThreads(workerThreads: tpMin, completionPortThreads: 1);
 ThreadPool.SetMaxThreads(workerThreads: tpMax, completionPortThreads: 2);
 
-var builder = WebApplication.CreateSlimBuilder(args);
-
-builder.Logging.ClearProviders();
-
-// IO_URING_ENABLED=1: replace Kestrel's default Sockets transport with io_uring.
-// Linux 5.1+ required; auto-falls back to sockets on unsupported systems.
-if (Environment.GetEnvironmentVariable("IO_URING_ENABLED") == "1")
-{
-    builder.WebHost.UseIoUring(opts =>
-    {
-        var ringSize = int.TryParse(Environment.GetEnvironmentVariable("IO_URING_SIZE"), out var rs) && rs > 0 ? rs : 256;
-        var maxConn = int.TryParse(Environment.GetEnvironmentVariable("IO_URING_MAX_CONN"), out var mc) && mc > 0 ? mc : 1024;
-        opts.RingSize = ringSize;
-        opts.MaxConnections = maxConn;
-    });
-}
-
-builder.WebHost.ConfigureKestrel(options =>
-{
-    options.AddServerHeader = false;
-    options.AllowSynchronousIO = false;
-    // Body is ~400 bytes; cap to skip large-body code paths.
-    options.Limits.MaxRequestBodySize = 8 * 1024;
-    options.Limits.MaxRequestHeadersTotalSize = 4 * 1024;
-    options.Limits.MaxRequestLineSize = 1 * 1024;
-    options.Limits.MaxConcurrentUpgradedConnections = 0;
-    options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(5);
-    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(5);
-
-    var udsPath = Environment.GetEnvironmentVariable("UDS_PATH");
-    if (!string.IsNullOrEmpty(udsPath))
-    {
-        // Listen on a Unix Domain Socket so the LB upstream is local FS, not TCP loopback.
-        // Saves ~30-50us per request (no TCP/IP stack, no port allocation, no Nagle delays).
-        if (File.Exists(udsPath)) File.Delete(udsPath);
-        options.ListenUnixSocket(udsPath, lo => lo.Protocols = HttpProtocols.Http1);
-    }
-    else
-    {
-        var port = int.Parse(Environment.GetEnvironmentVariable("PORT") ?? "9999");
-        options.ListenAnyIP(port, lo => lo.Protocols = HttpProtocols.Http1);
-    }
-});
-
-builder.Services.ConfigureHttpJsonOptions(o =>
-{
-    o.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default);
-});
-
 var vectorsPath = Environment.GetEnvironmentVariable("VECTORS_PATH") ?? "/data/references.bin";
 var labelsPath = Environment.GetEnvironmentVariable("LABELS_PATH") ?? "/data/labels.bin";
 var vectorsQ8Path = Environment.GetEnvironmentVariable("VECTORS_Q8_PATH"); // optional
@@ -125,12 +76,12 @@ if (Environment.GetEnvironmentVariable("WARMUP") != "0")
                       $"mlocked={dataset.LastMlockedBytes / (1024 * 1024)}MiB.");
 }
 
-var app = builder.Build();
-
 // RAW_HTTP=1: skip Kestrel/ASP.NET entirely. RawHttpServer takes over the same
 // UDS path Kestrel would have listened on, with manual HTTP/1.1 parsing,
 // pre-built response buffers and the IFraudScorer.ScoreCount integer fast path.
 // Built specifically to close the Kestrel-overhead gap to itagyba (#2781 = 5769 / p99 1.70ms).
+// Branch placed BEFORE WebApplication build so the ASP.NET pipeline is never
+// materialized (saves DI container, middleware chain and Kestrel listener wiring).
 if (Environment.GetEnvironmentVariable("RAW_HTTP") == "1")
 {
     var rawUds = Environment.GetEnvironmentVariable("UDS_PATH");
@@ -168,6 +119,57 @@ if (Environment.GetEnvironmentVariable("RAW_HTTP") == "1")
     Rinha.Api.RawHttpServer.Run(rawUds, scorer, jsonVectorizer, selectiveCascade);
     return; // never reached, but lets the compiler see the method ends.
 }
+
+var builder = WebApplication.CreateSlimBuilder(args);
+
+builder.Logging.ClearProviders();
+
+// IO_URING_ENABLED=1: replace Kestrel's default Sockets transport with io_uring.
+// Linux 5.1+ required; auto-falls back to sockets on unsupported systems.
+if (Environment.GetEnvironmentVariable("IO_URING_ENABLED") == "1")
+{
+    builder.WebHost.UseIoUring(opts =>
+    {
+        var ringSize = int.TryParse(Environment.GetEnvironmentVariable("IO_URING_SIZE"), out var rs) && rs > 0 ? rs : 256;
+        var maxConn = int.TryParse(Environment.GetEnvironmentVariable("IO_URING_MAX_CONN"), out var mc) && mc > 0 ? mc : 1024;
+        opts.RingSize = ringSize;
+        opts.MaxConnections = maxConn;
+    });
+}
+
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.AddServerHeader = false;
+    options.AllowSynchronousIO = false;
+    // Body is ~400 bytes; cap to skip large-body code paths.
+    options.Limits.MaxRequestBodySize = 8 * 1024;
+    options.Limits.MaxRequestHeadersTotalSize = 4 * 1024;
+    options.Limits.MaxRequestLineSize = 1 * 1024;
+    options.Limits.MaxConcurrentUpgradedConnections = 0;
+    options.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(5);
+    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(5);
+
+    var udsPath = Environment.GetEnvironmentVariable("UDS_PATH");
+    if (!string.IsNullOrEmpty(udsPath))
+    {
+        // Listen on a Unix Domain Socket so the LB upstream is local FS, not TCP loopback.
+        // Saves ~30-50us per request (no TCP/IP stack, no port allocation, no Nagle delays).
+        if (File.Exists(udsPath)) File.Delete(udsPath);
+        options.ListenUnixSocket(udsPath, lo => lo.Protocols = HttpProtocols.Http1);
+    }
+    else
+    {
+        var port = int.Parse(Environment.GetEnvironmentVariable("PORT") ?? "9999");
+        options.ListenAnyIP(port, lo => lo.Protocols = HttpProtocols.Http1);
+    }
+});
+
+builder.Services.ConfigureHttpJsonOptions(o =>
+{
+    o.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default);
+});
+
+var app = builder.Build();
 
 // Use legacy path-branching (UseExtensions.Map, NOT IEndpointRouteBuilder.Map):
 // terminates the pipeline by path prefix without invoking EndpointRoutingMiddleware
