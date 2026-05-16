@@ -282,30 +282,63 @@ public sealed class JsonVectorizer
     {
         ref short d0 = ref MemoryMarshal.GetReference(dst);
         var n = _norm;
-        Unsafe.Add(ref d0, 0) = Q16(Clamp01((float)(txAmount * n.InvMaxAmount)));
-        Unsafe.Add(ref d0, 1) = Q16(Clamp01(installments * n.InvMaxInstallments));
+
         var avg = (float)custAvg;
         var ratio = avg > 0f ? (float)(txAmount / avg) * n.InvAmountVsAvgRatio : 1f;
-        Unsafe.Add(ref d0, 2) = Q16(Clamp01(ratio));
+
+        long deltaTicks = requestedAtTicksUtc - lastTimestampTicksUtc;
+        if (deltaTicks < 0) deltaTicks = 0;
+        double minutes = deltaTicks * (1.0 / 600_000_000.0);
+
+        // Batch the 8 homogeneous Q16(Clamp01(x*const)) lanes through AVX.
+        // Lane order: [d0, d1, d2, d5, d6, d7, d8, d13].
+        Span<short> q = stackalloc short[8];
+        if (Avx2.IsSupported)
+        {
+            var num = Vector256.Create(
+                (float)txAmount, installments, ratio,
+                (float)minutes, (float)lastKm, (float)kmHome,
+                txCount24h, (float)merchAvg);
+            var mul = Vector256.Create(
+                n.InvMaxAmount, n.InvMaxInstallments, 1f,
+                n.InvMaxMinutes, n.InvMaxKm, n.InvMaxKm,
+                n.InvMaxTxCount24h, n.InvMaxMerchantAvgAmount);
+            var scaled = Avx.Multiply(num, mul);
+            var clamped = Avx.Min(Avx.Max(scaled, Vector256<float>.Zero), Vector256.Create(1f));
+            var qf = Avx.Multiply(clamped, Vector256.Create((float)Dataset.Q16Scale));
+            var qi = Avx.ConvertToVector256Int32(qf); // round-to-nearest-even (MXCSR default)
+            var packed = Sse2.PackSignedSaturate(qi.GetLower(), qi.GetUpper());
+            Unsafe.WriteUnaligned(ref Unsafe.As<short, byte>(ref MemoryMarshal.GetReference(q)), packed);
+        }
+        else
+        {
+            q[0] = Q16(Clamp01((float)(txAmount * n.InvMaxAmount)));
+            q[1] = Q16(Clamp01(installments * n.InvMaxInstallments));
+            q[2] = Q16(Clamp01(ratio));
+            q[3] = Q16(Clamp01((float)(minutes * n.InvMaxMinutes)));
+            q[4] = Q16(Clamp01((float)(lastKm * n.InvMaxKm)));
+            q[5] = Q16(Clamp01((float)(kmHome * n.InvMaxKm)));
+            q[6] = Q16(Clamp01(txCount24h * n.InvMaxTxCount24h));
+            q[7] = Q16(Clamp01((float)(merchAvg * n.InvMaxMerchantAvgAmount)));
+        }
+
+        Unsafe.Add(ref d0, 0) = q[0];
+        Unsafe.Add(ref d0, 1) = q[1];
+        Unsafe.Add(ref d0, 2) = q[2];
         Unsafe.Add(ref d0, 3) = Q16(requestedHour * (1f / 23f));
         Unsafe.Add(ref d0, 4) = Q16(MondayZero(requestedDow) * (1f / 6f));
-
         if (hasLast)
         {
-            long deltaTicks = requestedAtTicksUtc - lastTimestampTicksUtc;
-            if (deltaTicks < 0) deltaTicks = 0;
-            double minutes = deltaTicks * (1.0 / 600_000_000.0);
-            Unsafe.Add(ref d0, 5) = Q16(Clamp01((float)(minutes * n.InvMaxMinutes)));
-            Unsafe.Add(ref d0, 6) = Q16(Clamp01((float)(lastKm * n.InvMaxKm)));
+            Unsafe.Add(ref d0, 5) = q[3];
+            Unsafe.Add(ref d0, 6) = q[4];
         }
         else
         {
             Unsafe.Add(ref d0, 5) = -10000;
             Unsafe.Add(ref d0, 6) = -10000;
         }
-
-        Unsafe.Add(ref d0, 7) = Q16(Clamp01((float)(kmHome * n.InvMaxKm)));
-        Unsafe.Add(ref d0, 8) = Q16(Clamp01(txCount24h * n.InvMaxTxCount24h));
+        Unsafe.Add(ref d0, 7) = q[5];
+        Unsafe.Add(ref d0, 8) = q[6];
         Unsafe.Add(ref d0, 9) = (short)(isOnline ? 10000 : 0);
         Unsafe.Add(ref d0, 10) = (short)(cardPresent ? 10000 : 0);
 
@@ -319,7 +352,7 @@ public sealed class JsonVectorizer
         Unsafe.Add(ref d0, 12) = mccEnd > mccStart
             ? _mcc.GetQ16(body.Slice(mccStart, mccEnd - mccStart))
             : MccRiskTable.DefaultQ16;
-        Unsafe.Add(ref d0, 13) = Q16(Clamp01((float)(merchAvg * n.InvMaxMerchantAvgAmount)));
+        Unsafe.Add(ref d0, 13) = q[7];
     }
 
     /// <summary>Single canonical quantization: <c>(short)Round(v * Q16Scale)</c>.
