@@ -215,12 +215,12 @@ public sealed class JsonVectorizer
             if (Equals(ref r, KAmount))
             {
                 r.Read();
-                amount = r.GetDouble();
+                amount = FastNumberParse.ParseDouble(r.ValueSpan);
             }
             else if (Equals(ref r, KInstallments))
             {
                 r.Read();
-                installments = r.GetInt32();
+                installments = FastNumberParse.ParseInt32(r.ValueSpan);
             }
             else if (Equals(ref r, KRequestedAt))
             {
@@ -249,12 +249,12 @@ public sealed class JsonVectorizer
             if (Equals(ref r, KAvgAmount))
             {
                 r.Read();
-                avgAmount = r.GetDouble();
+                avgAmount = FastNumberParse.ParseDouble(r.ValueSpan);
             }
             else if (Equals(ref r, KTxCount24h))
             {
                 r.Read();
-                txCount24h = r.GetInt32();
+                txCount24h = FastNumberParse.ParseInt32(r.ValueSpan);
             }
             else if (Equals(ref r, KKnownMerchants))
             {
@@ -289,7 +289,7 @@ public sealed class JsonVectorizer
             if (Equals(ref r, KAvgAmount))
             {
                 r.Read();
-                avgAmount = r.GetDouble();
+                avgAmount = FastNumberParse.ParseDouble(r.ValueSpan);
             }
             else if (Equals(ref r, KId))
             {
@@ -350,7 +350,7 @@ public sealed class JsonVectorizer
             else if (Equals(ref r, KKmFromHome))
             {
                 r.Read();
-                kmHome = r.GetDouble();
+                kmHome = FastNumberParse.ParseDouble(r.ValueSpan);
             }
             else
             {
@@ -378,7 +378,7 @@ public sealed class JsonVectorizer
             else if (Equals(ref r, KKmFromCurrent))
             {
                 r.Read();
-                kmCurrent = r.GetDouble();
+                kmCurrent = FastNumberParse.ParseDouble(r.ValueSpan);
             }
             else
             {
