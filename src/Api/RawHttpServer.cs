@@ -127,6 +127,14 @@ internal static class RawHttpServer
     private static void AcceptLoop(AcceptContext ctx)
     {
         var listener = ctx.Listener;
+        // Detect listener family ONCE — applying TCP-only setters (NoDelay, LingerState)
+        // on AF_UNIX accepted sockets throws SocketException every accept. In NativeAOT,
+        // every throw unwinds the DWARF eh_frame via libunwind (~10-100µs each), which
+        // dominated >80% of CPU under load (profile 2026-05-16: AcceptLoop -> Socket.Accept
+        // -> RhpThrowEx -> libunwind = 81% self+children). Skip the throwing setters
+        // upfront based on AddressFamily.
+        bool isTcp = listener.AddressFamily == AddressFamily.InterNetwork
+                  || listener.AddressFamily == AddressFamily.InterNetworkV6;
         while (true)
         {
             Socket conn;
@@ -136,24 +144,19 @@ internal static class RawHttpServer
 
             if (_recvTimeoutMs > 0)
             {
-                try { conn.ReceiveTimeout = _recvTimeoutMs; } catch { /* best-effort */ }
+                conn.ReceiveTimeout = _recvTimeoutMs;
             }
 
-            // Socket-layer tuning on accepted connections. All best-effort:
-            // - LingerState (true, 0): on close, send RST instead of FIN; FD freed
-            //   immediately, no TIME_WAIT-equivalent for AF_UNIX. Helps under
-            //   keep-alive cap turnover (we close after _keepAliveMax requests).
-            // - SendBufferSize / ReceiveBufferSize: bump kernel socket buffers so
-            //   the LB->API and API->LB messages fit in a single syscall pair
-            //   without partial reads/writes (typical msg ~500B, response ~120B,
-            //   but pipelining and bursts can stack several).
-            // - NoDelay: harmless on AF_UNIX (no Nagle); will throw on UDS so
-            //   wrapped in try/catch. Kept so the same code path works if the
-            //   listener ever moves back to TCP.
-            try { conn.LingerState = new LingerOption(true, 0); } catch { }
-            try { conn.SendBufferSize = 16 * 1024; }    catch { }
-            try { conn.ReceiveBufferSize = 16 * 1024; } catch { }
-            try { conn.NoDelay = true; }                catch { /* not TCP */ }
+            // Socket-layer tuning on accepted connections.
+            // - LingerState/NoDelay: TCP-only; throw on AF_UNIX.
+            // - SendBufferSize/ReceiveBufferSize: supported on UDS, never throw.
+            conn.SendBufferSize = 16 * 1024;
+            conn.ReceiveBufferSize = 16 * 1024;
+            if (isTcp)
+            {
+                conn.LingerState = new LingerOption(true, 0);
+                conn.NoDelay = true;
+            }
 
             // Hand the socket off to the CLR ThreadPool; accept thread loops back immediately.
             ThreadPool.UnsafeQueueUserWorkItem(
