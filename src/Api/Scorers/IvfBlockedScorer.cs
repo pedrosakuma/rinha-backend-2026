@@ -126,10 +126,15 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         Span<int> topIdx = stackalloc int[K]; // tiebreak by smaller orig_id (post-IVF reorder index)
         for (int i = 0; i < K; i++) { topDist[i] = float.PositiveInfinity; topLab[i] = 0; topIdx[i] = int.MaxValue; }
         int worstIdx = 0;
+        ref float topDistRef = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(topDist);
+        ref byte  topLabRef  = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(topLab);
+        ref int   topIdxRef  = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(topIdx);
 
-        // Broadcast each query dim once for fmadd reuse.
-        Span<Vector256<float>> qVecs = stackalloc Vector256<float>[Dimensions];
-        for (int d = 0; d < Dimensions; d++) qVecs[d] = Vector256.Create(query[d]);
+        // Broadcast each query dim once for fmadd reuse. Use a ref (not Span) so the JIT
+        // can elide the per-access bound check inside the inlined DimPair hot loop.
+        Vector256<float>* qVecsBuf = stackalloc Vector256<float>[Dimensions];
+        ref Vector256<float> qVecs = ref qVecsBuf[0];
+        for (int d = 0; d < Dimensions; d++) Unsafe.Add(ref qVecs, d) = Vector256.Create(query[d]);
 
         var blocksPtr = _dataset.Q16BlockedPtr;
         var blockOffs = _dataset.BlockOffsetsPtr;
@@ -141,8 +146,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         {
             int c = cells[i];
             if (c < 0) continue;
-            ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
-                topDist, topLab, topIdx, ref worstIdx);
+            ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, ref qVecs,
+                ref topDistRef, ref topLabRef, ref topIdxRef, ref worstIdx);
         }
 
         // 4) Exact bbox-LB pass over remaining cells (when bbox available and fast-gate disabled).
@@ -177,8 +182,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                         int bestC = ArgminBelowThreshold(lbsPtr, nlist, worst);
                         if (bestC < 0) break; // no remaining cell can beat top-5
                         lbsPtr[bestC] = float.PositiveInfinity;
-                        ScanCellBlocks(bestC, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
-                            topDist, topLab, topIdx, ref worstIdx);
+                        ScanCellBlocks(bestC, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, ref qVecs,
+                            ref topDistRef, ref topLabRef, ref topIdxRef, ref worstIdx);
                     }
                 }
             }
@@ -217,8 +222,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
                     int c = fullCells[i];
                     if (c < 0 || visitedF[c]) continue;
                     visitedF[c] = true;
-                    ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, qVecs,
-                        topDist, topLab, topIdx, ref worstIdx);
+                    ScanCellBlocks(c, blocksPtr, blockOffs, labelsPtr, cellOffsPtr, ref qVecs,
+                        ref topDistRef, ref topLabRef, ref topIdxRef, ref worstIdx);
                 }
             }
         }
@@ -232,8 +237,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ScanCellBlocks(int cell,
         short* blocksPtr, int* blockOffs, byte* labelsPtr, int* cellOffsPtr,
-        Span<Vector256<float>> qVecs,
-        Span<float> topDist, Span<byte> topLab, Span<int> topIdx,
+        ref Vector256<float> qVecs,
+        ref float topDist, ref byte topLab, ref int topIdx,
         ref int worstIdx)
     {
         int blockStart = blockOffs[cell];
@@ -241,7 +246,8 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
         int rowStart = cellOffsPtr[cell]; // first row of cell (matches block_i*8 offset within cell)
 
         var scale = Vector256.Create(1f / Dataset.Q16Scale); // 1e-4
-        Span<float> distsBuf = stackalloc float[8];
+        Vector256<float> distsBuf = default;
+        ref float distsBufRef = ref Unsafe.As<Vector256<float>, float>(ref distsBuf);
 
         for (int blockI = blockStart; blockI < blockEnd; blockI++)
         {
@@ -255,7 +261,7 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
             }
 
             short* bp = blocksPtr + (long)blockI * BlockShorts;
-            float worst = topDist[worstIdx];
+            float worst = Unsafe.Add(ref topDist, worstIdx);
             var threshold = Vector256.Create(worst);
 
             // Process dims in pairs (acc0 / acc1) to break dependency chains.
@@ -263,10 +269,10 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
             var acc1 = Vector256<float>.Zero;
 
             // First 4 pairs = 8 dims. After this we check for early-abort.
-            DimPair(bp, 0, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 2, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 4, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 6, qVecs, scale, ref acc0, ref acc1);
+            DimPair(bp, 0, ref qVecs, scale, ref acc0, ref acc1);
+            DimPair(bp, 2, ref qVecs, scale, ref acc0, ref acc1);
+            DimPair(bp, 4, ref qVecs, scale, ref acc0, ref acc1);
+            DimPair(bp, 6, ref qVecs, scale, ref acc0, ref acc1);
 
             var partial = acc0 + acc1;
             // Partial L2² is monotonic non-decreasing → if all lanes ≥ worst, full ≥ worst, skip block.
@@ -274,39 +280,39 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
             if (partialMask == 0) continue;
 
             // Remaining 3 pairs = 6 dims (8..13).
-            DimPair(bp, 8, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 10, qVecs, scale, ref acc0, ref acc1);
-            DimPair(bp, 12, qVecs, scale, ref acc0, ref acc1);
+            DimPair(bp, 8, ref qVecs, scale, ref acc0, ref acc1);
+            DimPair(bp, 10, ref qVecs, scale, ref acc0, ref acc1);
+            DimPair(bp, 12, ref qVecs, scale, ref acc0, ref acc1);
 
             var full = acc0 + acc1;
             int mask = (int)Vector256.LessThan(full, threshold).ExtractMostSignificantBits();
             if (mask == 0) continue;
 
             // Extract candidate distances (only those passing mask) and merge into top-5.
-            full.CopyTo(distsBuf);
+            distsBuf = full;
             int labelBase = rowStart + (blockI - blockStart) * BlockSize;
             int m = mask;
             while (m != 0)
             {
                 int slot = System.Numerics.BitOperations.TrailingZeroCount(m);
                 m &= m - 1;
-                float di = distsBuf[slot];
+                float di = Unsafe.Add(ref distsBufRef, slot);
                 int origIdx = labelBase + slot;
                 // Re-fetch worst (may have been updated this iteration).
-                float curWorst = topDist[worstIdx];
-                if (di < curWorst || (di == curWorst && origIdx < topIdx[worstIdx]))
+                float curWorst = Unsafe.Add(ref topDist, worstIdx);
+                if (di < curWorst || (di == curWorst && origIdx < Unsafe.Add(ref topIdx, worstIdx)))
                 {
-                    topDist[worstIdx] = di;
-                    topLab[worstIdx] = labelsPtr[origIdx];
-                    topIdx[worstIdx] = origIdx;
+                    Unsafe.Add(ref topDist, worstIdx) = di;
+                    Unsafe.Add(ref topLab, worstIdx) = labelsPtr[origIdx];
+                    Unsafe.Add(ref topIdx, worstIdx) = origIdx;
                     // Recompute worst-idx via linear scan of 5 slots.
                     int wi = 0;
-                    float wv = topDist[0];
-                    int wIdxOrig = topIdx[0];
+                    float wv = topDist;
+                    int wIdxOrig = topIdx;
                     for (int j = 1; j < K; j++)
                     {
-                        float v = topDist[j];
-                        int io = topIdx[j];
+                        float v = Unsafe.Add(ref topDist, j);
+                        int io = Unsafe.Add(ref topIdx, j);
                         // worst = larger dist; tiebreak by larger orig_id (so we evict it last).
                         if (v > wv || (v == wv && io > wIdxOrig)) { wv = v; wi = j; wIdxOrig = io; }
                     }
@@ -320,15 +326,15 @@ public sealed unsafe class IvfBlockedScorer : IFraudScorer
     /// bp is the base of the block; dim d's lane row is at bp + d*8.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void DimPair(short* bp, int d,
-        Span<Vector256<float>> qVecs, Vector256<float> scale,
+        ref Vector256<float> qVecs, Vector256<float> scale,
         ref Vector256<float> acc0, ref Vector256<float> acc1)
     {
         var r0 = Sse2.LoadVector128((short*)(bp + d * BlockSize));
         var r1 = Sse2.LoadVector128((short*)(bp + (d + 1) * BlockSize));
         var v0 = Avx2.ConvertToVector256Single(Avx2.ConvertToVector256Int32(r0)) * scale;
         var v1 = Avx2.ConvertToVector256Single(Avx2.ConvertToVector256Int32(r1)) * scale;
-        var diff0 = v0 - qVecs[d];
-        var diff1 = v1 - qVecs[d + 1];
+        var diff0 = v0 - Unsafe.Add(ref qVecs, d);
+        var diff1 = v1 - Unsafe.Add(ref qVecs, d + 1);
         // Use FMA for diff*diff + acc when available; falls back to separate mul+add.
         if (Fma.IsSupported)
         {
