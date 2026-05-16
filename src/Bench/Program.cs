@@ -47,6 +47,9 @@ if (args.Length > 0 && args[0] == "--build-selective-tables")
 if (args.Length > 0 && args[0] == "--http")
     return Rinha.Bench.HttpTiming.Run(args[1..]);
 
+if (args.Length > 0 && args[0] == "--parse-bench")
+    return Rinha.Bench.ParseBench.Run(args[1..]);
+
 if (args.Length > 0 && args[0] == "--fp16-poc")
     return Rinha.Bench.Fp16Poc.Run(args[1..]);
 
