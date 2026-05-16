@@ -35,6 +35,7 @@ services:
       - uds:/run/uds
     ulimits:
       memlock: -1
+      nofile: 65536
     deploy:
       resources:
         limits:
