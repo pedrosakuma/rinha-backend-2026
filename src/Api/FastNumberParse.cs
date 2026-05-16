@@ -69,4 +69,62 @@ internal static class FastNumberParse
             v = v * 10 + (s[i] - (byte)'0');
         return v;
     }
+
+    /// <summary>
+    /// Streaming double parser: scans <paramref name="body"/> starting at <paramref name="pos"/>
+    /// consuming digits + optional single '.', advancing <paramref name="pos"/> to the first
+    /// non-numeric byte (which will be the JSON delimiter ',' or '}'). Single pass — eliminates
+    /// the prior <c>IndexOf(delim) + ParseDouble(slice)</c> two-pass scan over the same bytes.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double ParseDouble(ReadOnlySpan<byte> body, ref int pos)
+    {
+        int i = pos;
+        ulong mantissa = 0;
+        // Integer digits.
+        while (true)
+        {
+            byte b = body[i];
+            uint d = (uint)(b - (byte)'0');
+            if (d > 9) break;
+            mantissa = mantissa * 10 + d;
+            i++;
+        }
+        if (body[i] != (byte)'.')
+        {
+            pos = i;
+            return mantissa;
+        }
+        i++; // skip '.'
+        int fracStart = i;
+        while (true)
+        {
+            byte b = body[i];
+            uint d = (uint)(b - (byte)'0');
+            if (d > 9) break;
+            mantissa = mantissa * 10 + d;
+            i++;
+        }
+        int fracDigits = i - fracStart;
+        pos = i;
+        return mantissa * NegPow10[fracDigits];
+    }
+
+    /// <summary>Streaming int parser; advances <paramref name="pos"/> past the digits.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int ParseInt32(ReadOnlySpan<byte> body, ref int pos)
+    {
+        int i = pos;
+        int v = 0;
+        while (true)
+        {
+            byte b = body[i];
+            uint d = (uint)(b - (byte)'0');
+            if (d > 9) break;
+            v = v * 10 + (int)d;
+            i++;
+        }
+        pos = i;
+        return v;
+    }
 }

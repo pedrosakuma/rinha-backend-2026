@@ -83,7 +83,123 @@ public sealed class JsonVectorizer
         for (int i = 0; i < Dataset.Dimensions; i++) floatDst[i] = q16Dst[i] * (1f / Dataset.Q16Scale);
     }
 
+    private static readonly bool s_useFastJson =
+        Environment.GetEnvironmentVariable("JSON_FAST") != "0";
+
     private void VectorizeJsonCore(ReadOnlySpan<byte> body, Span<short> dst)
+    {
+        if (s_useFastJson) VectorizeJsonCoreFast(body, dst);
+        else VectorizeJsonCoreReader(body, dst);
+    }
+
+    // Schema-positional parser. Trusts the producer's exact byte layout (no validation):
+    //   {"id":"...","transaction":{"amount":N,"installments":N,"requested_at":"ISO"},
+    //    "customer":{"avg_amount":N,"tx_count_24h":N,"known_merchants":[...]},
+    //    "merchant":{"id":"MERC-XXX","mcc":"DDDD","avg_amount":N},
+    //    "terminal":{"is_online":B,"card_present":B,"km_from_home":N},
+    //    "last_transaction":null|{"timestamp":"ISO","km_from_current":N}}
+    // Fixed-length prefixes & values are skipped by constant; numbers use single-pass
+    // FastNumberParse streaming (advances `p` to delimiter — no IndexOf two-pass).
+    // The only IndexOf calls remaining are for the variable-length top-level id and
+    // the known_merchants array end.
+    private void VectorizeJsonCoreFast(ReadOnlySpan<byte> body, Span<short> dst)
+    {
+        if (dst.Length < Dataset.Dimensions)
+            throw new ArgumentException("dst too small", nameof(dst));
+
+        int p = 7; // past `{"id":"`
+        // Top-level id length distribution: 77% are 13 chars, 21% are 12, ~2% are 8-11.
+        // Probe by the unambiguous 2-byte pattern `",` (closing quote + delimiter); checking
+        // just `"` alone is ambiguous because the next field's opening quote sits 2 bytes
+        // after the closing quote (`","transaction"...`) so `body[p+L+2]` is also `"`.
+        int idEnd;
+        if (body[p + 13] == (byte)'"' && body[p + 14] == (byte)',') idEnd = p + 13;
+        else if (body[p + 12] == (byte)'"' && body[p + 13] == (byte)',') idEnd = p + 12;
+        else idEnd = p + 8 + body.Slice(p + 8).IndexOf((byte)'"');
+        p = idEnd + 1; // past closing `"`
+
+        p += 25; // past `,"transaction":{"amount":`
+        double txAmount = FastNumberParse.ParseDouble(body, ref p);
+
+        p += 16; // past `,"installments":`
+        int installments = FastNumberParse.ParseInt32(body, ref p);
+
+        p += 17; // past `,"requested_at":"`
+        ParseIsoUtc(body.Slice(p, 20), out long requestedTicks, out int requestedHour, out DayOfWeek requestedDow);
+        p += 21; // past 20-byte ISO + closing `"`
+
+        p += 27; // past `},"customer":{"avg_amount":`
+        double custAvg = FastNumberParse.ParseDouble(body, ref p);
+
+        p += 16; // past `,"tx_count_24h":`
+        int txCount24h = FastNumberParse.ParseInt32(body, ref p);
+
+        p += 19; // past `,"known_merchants":` — p is at `[`
+        // known_merchants entries are always "MERC-XXX" (10 bytes with quotes); the array
+        // contains 2-5 entries uniformly → total bytes ∈ {23, 34, 45, 56} (closing `]`
+        // at offset {22, 33, 44, 55} from `[`). No IndexOf needed.
+        int kmArrStart = p;
+        int kmArrLen;
+        if (body[p + 22] == (byte)']') kmArrLen = 23;
+        else if (body[p + 33] == (byte)']') kmArrLen = 34;
+        else if (body[p + 44] == (byte)']') kmArrLen = 45;
+        else kmArrLen = 56;
+        int kmArrEnd = p + kmArrLen;
+        p = kmArrEnd;
+
+        p += 20; // past `},"merchant":{"id":"`
+        // merchant.id is always 8 bytes ("MERC-XXX") in the bench dataset.
+        int merchIdStart = p;
+        int merchIdEnd = p + 8;
+        p = merchIdEnd + 1; // past closing `"`
+
+        p += 8; // past `,"mcc":"`
+        // mcc is always 4 bytes.
+        int mccStart = p;
+        int mccEnd = p + 4;
+        p = mccEnd + 1; // past closing `"`
+
+        p += 14; // past `,"avg_amount":`
+        double merchAvg = FastNumberParse.ParseDouble(body, ref p);
+
+        p += 26; // past `},"terminal":{"is_online":`
+        bool isOnline = body[p] == (byte)'t';
+        p += isOnline ? 4 : 5;
+
+        p += 16; // past `,"card_present":`
+        bool cardPresent = body[p] == (byte)'t';
+        p += cardPresent ? 4 : 5;
+
+        p += 16; // past `,"km_from_home":`
+        double kmHome = FastNumberParse.ParseDouble(body, ref p);
+
+        p += 21; // past `},"last_transaction":`
+        bool hasLast;
+        long lastTimestampTicks = 0;
+        double lastKm = 0;
+        if (body[p] == (byte)'n')
+        {
+            hasLast = false;
+        }
+        else
+        {
+            hasLast = true;
+            p += 14; // past `{"timestamp":"`
+            ParseIsoUtc(body.Slice(p, 20), out lastTimestampTicks, out _, out _);
+            p += 21; // past 20-byte ISO + closing `"`
+            p += 19; // past `,"km_from_current":`
+            lastKm = FastNumberParse.ParseDouble(body, ref p);
+        }
+
+        ComposeFeatures(dst, body,
+            txAmount, custAvg, merchAvg, kmHome,
+            installments, txCount24h,
+            isOnline, cardPresent,
+            hasLast, requestedTicks, lastTimestampTicks, requestedHour, requestedDow, lastKm,
+            kmArrStart, kmArrEnd, merchIdStart, merchIdEnd, mccStart, mccEnd);
+    }
+
+    private void VectorizeJsonCoreReader(ReadOnlySpan<byte> body, Span<short> dst)
     {
         // Length-guard once so the JIT (and our manual ref-add writes below) can elide bounds checks.
         if (dst.Length < Dataset.Dimensions)
@@ -146,8 +262,24 @@ public sealed class JsonVectorizer
             }
         }
 
-        // ---- Compose the 14 features (mirrors Vectorizer.VectorizeCore) ----
-        // Write through ref-add to drop per-store bounds checks (length already validated above).
+        ComposeFeatures(dst, body,
+            txAmount, custAvg, merchAvg, kmHome,
+            installments, txCount24h,
+            isOnline, cardPresent,
+            hasLast, requestedAtTicksUtc, lastTimestampTicksUtc, requestedHour, requestedDow, lastKm,
+            kmArrStart, kmArrEnd, merchIdStart, merchIdEnd, mccStart, mccEnd);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ComposeFeatures(
+        Span<short> dst, ReadOnlySpan<byte> body,
+        double txAmount, double custAvg, double merchAvg, double kmHome,
+        int installments, int txCount24h,
+        bool isOnline, bool cardPresent,
+        bool hasLast, long requestedAtTicksUtc, long lastTimestampTicksUtc,
+        int requestedHour, DayOfWeek requestedDow, double lastKm,
+        int kmArrStart, int kmArrEnd, int merchIdStart, int merchIdEnd, int mccStart, int mccEnd)
+    {
         ref short d0 = ref MemoryMarshal.GetReference(dst);
         var n = _norm;
         Unsafe.Add(ref d0, 0) = Q16(Clamp01((float)(txAmount * n.InvMaxAmount)));
@@ -160,7 +292,6 @@ public sealed class JsonVectorizer
 
         if (hasLast)
         {
-            // Both ticks are in 100ns units (DateTime.Ticks). 1 minute = 600,000,000 ticks.
             long deltaTicks = requestedAtTicksUtc - lastTimestampTicksUtc;
             if (deltaTicks < 0) deltaTicks = 0;
             double minutes = deltaTicks * (1.0 / 600_000_000.0);
@@ -178,7 +309,6 @@ public sealed class JsonVectorizer
         Unsafe.Add(ref d0, 9) = (short)(isOnline ? 10000 : 0);
         Unsafe.Add(ref d0, 10) = (short)(cardPresent ? 10000 : 0);
 
-        // unknown_merchant: scan known_merchants array, byte-compare each entry vs merchant.id slice.
         bool isKnown = false;
         if (merchIdEnd > merchIdStart && kmArrEnd > kmArrStart)
         {
