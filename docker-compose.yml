@@ -14,7 +14,7 @@ name: rinha-backend-2026
 
 services:
   api1: &api
-    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave40-refscan-2b7b4cb
+    image: ghcr.io/pedrosakuma/rinha-backend-2026-api:wave42-fdpass-f48807d
     pull_policy: always
     cpuset: "0,1"
     security_opt:
