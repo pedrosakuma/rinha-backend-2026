@@ -64,7 +64,7 @@ services:
   lb:
     image: jrblatt/so-no-forevis:v1.0.0
     pull_policy: always
-    cpuset: "0,2"
+    cpuset: "0,1,2,3"
     security_opt:
       - seccomp=unconfined
     environment:
