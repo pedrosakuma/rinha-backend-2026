@@ -27,6 +27,7 @@ services:
       SCORER: "ivf-blocked"
       IVF_BLOCKED_NPROBE: "1"
       RAW_HTTP: "1"
+      RAW_HTTP_FDPASS: "1"
       RAW_HTTP_WORKERS: "1"
       RAW_HTTP_KEEPALIVE_MAX: "0"
       IO_URING_ENABLED: "0"
@@ -53,6 +54,7 @@ services:
       SCORER: "ivf-blocked"
       IVF_BLOCKED_NPROBE: "1"
       RAW_HTTP: "1"
+      RAW_HTTP_FDPASS: "1"
       RAW_HTTP_WORKERS: "1"
       RAW_HTTP_KEEPALIVE_MAX: "0"
       IO_URING_ENABLED: "0"
@@ -60,7 +62,7 @@ services:
       - api1
 
   lb:
-    image: jrblatt/so-no-forevis:v0.0.2
+    image: jrblatt/so-no-forevis:v1.0.0
     pull_policy: always
     cpuset: "0,2"
     security_opt:

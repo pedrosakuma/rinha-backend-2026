@@ -116,7 +116,18 @@ if (Environment.GetEnvironmentVariable("RAW_HTTP") == "1")
     var ivf = dataset.HasIvf ? $" IVF: {dataset.NumCells} cells." : "";
     Console.WriteLine($"Ready (raw-http). Dataset: {dataset.Count:N0} vectors. Scorer: {scorerName}. SIMD: {simd}.{ivf}");
 
-    Rinha.Api.RawHttpServer.Run(rawUds, scorer, jsonVectorizer, selectiveCascade);
+    if (Environment.GetEnvironmentVariable("RAW_HTTP_FDPASS") == "1")
+    {
+        Rinha.Api.FdPassServer.Run(rawUds, scorer, jsonVectorizer, selectiveCascade);
+    }
+    else if (Environment.GetEnvironmentVariable("RAW_HTTP_EPOLL") == "1")
+    {
+        Rinha.Api.EpollHttpServer.Run(rawUds, scorer, jsonVectorizer, selectiveCascade);
+    }
+    else
+    {
+        Rinha.Api.RawHttpServer.Run(rawUds, scorer, jsonVectorizer, selectiveCascade);
+    }
     return; // never reached, but lets the compiler see the method ends.
 }
 

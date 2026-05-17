@@ -223,6 +223,29 @@ internal static class RawHttpServer
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool TryParseRequestPublic(ReadOnlySpan<byte> buf, out int headerEnd, out int contentLength)
+        => TryParseRequest(buf, out headerEnd, out contentLength);
+
+    internal static void HandleRequestPublic(
+        Socket s,
+        ReadOnlySpan<byte> request,
+        int headerEnd,
+        int contentLength,
+        IFraudScorer scorer,
+        JsonVectorizer vectorizer,
+        SelectiveDecisionCascade selectiveCascade)
+        => HandleRequest(s, request, headerEnd, contentLength, scorer, vectorizer, selectiveCascade);
+
+    internal static void SendBadRequest(Socket s) => TrySend(s, BadRequestResponse);
+
+    internal static void HandleConnectionPublic(
+        Socket socket,
+        IFraudScorer scorer,
+        JsonVectorizer vectorizer,
+        SelectiveDecisionCascade selectiveCascade)
+        => HandleConnection(socket, scorer, vectorizer, selectiveCascade);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool TryParseRequest(ReadOnlySpan<byte> buf, out int headerEnd, out int contentLength)
     {
         headerEnd = buf.IndexOf("\r\n\r\n"u8);
